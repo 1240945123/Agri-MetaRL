@@ -19,3 +19,13 @@ jit_*.c
 *.bbl
 *.blg
 *.spl
+
+# Paper files and figures (not needed for training)
+images/
+plots/
+visual/
+visualisations/
+processing/
+*.tex
+*.bib
+refe.bib
