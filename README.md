@@ -5,7 +5,7 @@ Agricultural Meta-Reinforcement Learning for Greenhouse Climate Control
 Agri-MetaRL is a meta-reinforcement learning algorithm that improves advantage estimation for greenhouse climate control. It introduces **MetaAdvantageHead** on Recurrent PPO, performing task-adaptive advantage correction through support-query partitioning. Experiments show that Agri-MetaRL achieves higher training return and EPI than PPO and Recurrent PPO baselines.
 
 <p align="center">
-  <img src="./visual/Figure_1.png" alt="Agri-MetaRL Architecture" width="600"/>
+  <img src="./visual/Figure_1.png" alt="System Architecture (Figure 1)" width="600"/>
 </p>
 
 ## Table of Contents

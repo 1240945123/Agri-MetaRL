@@ -23,7 +23,9 @@ jit_*.c
 # Paper files and figures (not needed for training)
 images/
 plots/
-visual/
+visual/*
+!visual/Figure_1.pdf
+!visual/Figure_1.png
 visualisations/
 processing/
 *.tex
