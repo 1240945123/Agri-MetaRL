@@ -1,6 +1,8 @@
-# GreenLight-Gym 2.0
+# Agri-MetaRL
 
-## Reinforcement learning benchmark environment for control of greenhouse production systems 
+Agricultural Meta-RL for Greenhouse Climate Control
+
+This repository extends [GreenLight-Gym 2.0](https://github.com/BartvLaatum/GreenLight-Gym2), a reinforcement learning benchmark environment for control of greenhouse production systems. 
 
 <p align="center">
   <img src="./images/GLGymArchitecture2.svg" alt="GreenLight" width="700"/>
