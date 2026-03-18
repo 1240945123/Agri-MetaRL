@@ -1,0 +1,41 @@
+# Agri-MetaRL: Recurrent PPO + MetaAdvantageHead (paper settings)
+TomatoEnv:
+  n_envs: 8
+  total_timesteps: 2_000_000
+  policy: MlpLstmPolicy
+  n_steps: 2048
+  batch_size: 512
+  n_epochs: 8
+  gamma: 0.9631
+  gae_lambda: 0.9666
+  clip_range: 0.2
+  normalize_advantage: True
+  ent_coef: 0.00006002718320795429
+  vf_coef: 0.2599
+  max_grad_norm: 0.3
+  use_sde: False
+  sde_sample_freq: 8
+  target_kl: null
+  learning_rate: 0.0001161
+
+  policy_kwargs:
+    net_arch: { pi: [1024, 1024], vf: [128, 128] }
+    optimizer_class: adam
+    optimizer_kwargs: { amsgrad: true }
+    activation_fn: silu
+    log_std_init: np.log(1)
+    lstm_hidden_size: 256
+    n_lstm_layers: 1
+    shared_lstm: false
+    enable_critic_lstm: true
+
+  # Meta head (paper: support 0.5, min_support 256, beta 0.05, clip [-2,2])
+  meta_support_ratio: 0.5
+  meta_min_support_steps: 256
+  meta_beta: 0.05
+  meta_advantage_clip: 2.0
+  meta_context_dim: 64
+  meta_use_batch_norm: true
+  meta_use_output_clip: true
+  meta_use_obs_in_correction: true
+  meta_use_advantage_in_correction: true

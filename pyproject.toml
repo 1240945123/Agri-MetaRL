@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gl_gym"
+version = "0.2.0"
+description = "GreenLight-Gym environment with Python-native models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Bart van Laatum" }]
+keywords = ["reinforcement learning", "greenhouse", "control", "gymnasium"]
+dependencies = [
+  "casadi==3.6.7",
+  "numpy<2.0",
+  "scipy==1.16.1",
+  "pandas==2.3.1",
+  "geopy==2.4.1",
+  "gymnasium==0.29.1",
+  "matplotlib==3.10.5",
+  "torch>=2.0.0",
+  "tqdm==4.67.1",
+  "wandb==0.19.11",
+  "PyYAML>=6.0.2",
+  "requests>=2.32.4",
+  "stable-baselines3==2.1.0",
+  "sb3_contrib==2.1.0",
+  "pytz>=2019.3",
+  "tensorboard==2.18.0",
+]
+
+[project.optional-dependencies]
+timezone = ["timezonefinder==8.0.0"]   # users install with: pip install .[timezone]
+
+[project.urls]
+Homepage = "https://github.com/BartvLaatum/GreenLight-Gym2"
+Documentation = "https://github.com/BartvLaatum/GreenLight-Gym2#readme"
+Changelog = "https://github.com/BartvLaatum/GreenLight-Gym2/releases"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gl_gym*"]
