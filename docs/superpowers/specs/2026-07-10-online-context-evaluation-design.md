@@ -134,7 +134,7 @@ The diagnostic is directional and mechanistic, not a significance test.
 Continue training to an intermediate target near 500,000 steps only when all of the following hold:
 
 1. Online context changes actions after the support set becomes ready for both seeds.
-2. Mean paired return delta across the six non-fixed diagnostic tasks is positive.
+2. Mean paired return delta across the seven non-fixed diagnostic tasks is positive.
 3. Neither seed has a negative non-fixed mean return delta larger than 2% of its zero-context mean absolute return.
 4. Online context does not increase the mean normalized violation burden by more than 5%, where normalized burden is the mean of each violation metric divided by its zero-context mean plus a small numerical epsilon.
 5. Fixed-task return does not decrease by more than 2% for either seed.
