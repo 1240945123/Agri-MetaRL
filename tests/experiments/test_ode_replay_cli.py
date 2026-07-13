@@ -6,7 +6,9 @@ import errno
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -105,6 +107,23 @@ def test_parser_requires_capsule_and_output_root():
     args = parser.parse_args(["--capsule", "source", "--output_root", "target"])
     assert args.capsule == "source"
     assert args.output_root == "target"
+
+
+def test_script_help_bootstraps_src_without_pythonpath():
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        cwd=SCRIPT.parents[2],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout.lower()
+    assert "--capsule" in completed.stdout
+    assert "--output_root" in completed.stdout
 
 
 def test_cli_loads_before_replay_and_writes_exactly_three_outputs(

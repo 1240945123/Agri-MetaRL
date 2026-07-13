@@ -17,6 +17,13 @@ import sys
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
+
+ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = str(ROOT / "src")
+if SOURCE_ROOT not in sys.path:
+    sys.path.insert(0, SOURCE_ROOT)
+
+
 import numpy as np
 
 from gl_gym.experiments.ode_failure import LoadedFailureCapsule, load_failure_capsule
