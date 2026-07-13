@@ -420,6 +420,151 @@ def test_inference_episode_rejects_unknown_mode():
         model.begin_inference_episode("adaptive_magic")
 
 
+def _inference_info(key="eval-task-1"):
+    return {
+        "task_descriptor": {
+            "weather_year": 2011,
+            "start_day": 59,
+            "parameter_uncertainty": 0.0,
+            "economic_scenario": "standard",
+            "climate_constraint_scenario": "standard",
+        },
+        "task_instance_key": key,
+    }
+
+
+def test_online_inference_accumulates_only_evaluation_transitions():
+    model = make_tiny_agri_metarl(support_size=1)
+    model.begin_inference_episode("online_context")
+
+    model.observe_inference_transition(
+        observation=np.zeros(3, dtype=np.float32),
+        action=np.zeros(1, dtype=np.float32),
+        reward=1.0,
+        next_observation=np.ones(3, dtype=np.float32),
+        done=False,
+        info=_inference_info(),
+    )
+
+    assert len(model._inference_support_memory.support("eval-task-1")) == 1
+    assert model.support_memory.support("eval-task-1") == ()
+    assert model._inference_support_ready_step == 1
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_online_predict_uses_context_only_after_support_is_ready(
+    monkeypatch, batched
+):
+    model = make_tiny_agri_metarl(support_size=1)
+    seen = []
+
+    def fake_policy_predict(observation, **kwargs):
+        seen.append(np.asarray(observation).copy())
+        action = np.zeros((1, 1) if batched else (1,), dtype=np.float32)
+        return action, None
+
+    monkeypatch.setattr(model.policy, "predict", fake_policy_predict)
+    model.begin_inference_episode("online_context")
+    first_observation = np.zeros((1, 3) if batched else (3,), dtype=np.float32)
+    model.predict(first_observation, deterministic=True)
+    model.observe_inference_transition(
+        np.zeros(3, dtype=np.float32),
+        np.zeros(1, dtype=np.float32),
+        1.0,
+        np.ones(3, dtype=np.float32),
+        False,
+        _inference_info(),
+    )
+    monkeypatch.setattr(
+        model,
+        "_context_from_support",
+        lambda support: (torch.ones(model.context_dim, device=model.device), True),
+    )
+    second_observation = np.ones((1, 3) if batched else (3,), dtype=np.float32)
+    model.predict(second_observation, deterministic=True)
+
+    np.testing.assert_array_equal(seen[0][..., -model.context_dim :], 0.0)
+    np.testing.assert_array_equal(seen[1][..., -model.context_dim :], 1.0)
+
+
+def test_zero_context_mode_never_reads_inference_support(monkeypatch):
+    model = make_tiny_agri_metarl(support_size=1)
+    model.begin_inference_episode("zero_context")
+    monkeypatch.setattr(
+        model,
+        "_context_from_support",
+        lambda support: pytest.fail("zero-context mode encoded support"),
+    )
+
+    action, _ = model.predict(np.zeros(3, dtype=np.float32), deterministic=True)
+
+    assert action.shape == (1,)
+
+
+@pytest.mark.parametrize("bad_info", [{}, {"task_instance_key": "k"}])
+def test_online_transition_requires_complete_task_identity(bad_info):
+    model = make_tiny_agri_metarl()
+    model.begin_inference_episode("online_context")
+
+    with pytest.raises(KeyError, match="task identity"):
+        model.observe_inference_transition(
+            np.zeros(3), np.zeros(1), 1.0, np.ones(3), False, bad_info
+        )
+
+
+@pytest.mark.parametrize(
+    ("observation", "action", "reward", "next_observation"),
+    [
+        (np.array([np.nan, 0.0, 0.0]), np.zeros(1), 1.0, np.ones(3)),
+        (np.zeros(3), np.array([np.inf]), 1.0, np.ones(3)),
+        (np.zeros(3), np.zeros(1), np.nan, np.ones(3)),
+        (np.zeros(3), np.zeros(1), 1.0, np.array([0.0, np.inf, 0.0])),
+    ],
+)
+def test_online_transition_rejects_nonfinite_values(
+    observation, action, reward, next_observation
+):
+    model = make_tiny_agri_metarl()
+    model.begin_inference_episode("online_context")
+
+    with pytest.raises(ValueError, match="finite"):
+        model.observe_inference_transition(
+            observation,
+            action,
+            reward,
+            next_observation,
+            False,
+            _inference_info(),
+        )
+
+
+def test_online_predict_rejects_more_than_one_evaluation_environment():
+    model = make_tiny_agri_metarl()
+    model.begin_inference_episode("online_context")
+
+    with pytest.raises(ValueError, match="single evaluation environment"):
+        model.predict(np.zeros((2, 3), dtype=np.float32), deterministic=True)
+
+
+def test_inference_episode_diagnostics_are_json_friendly():
+    model = make_tiny_agri_metarl(support_size=1)
+    model.begin_inference_episode("online_context")
+    empty = model.inference_episode_diagnostics()
+    assert np.isnan(empty["support_ready_step"])
+    assert empty["context_norm_mean"] == 0.0
+    assert empty["context_norm_max"] == 0.0
+
+    model._inference_support_ready_step = 1
+    model._inference_context_norms.extend([2.0, 4.0])
+    diagnostics = model.inference_episode_diagnostics()
+    assert diagnostics == {
+        "support_ready_step": 1.0,
+        "context_norm_mean": 3.0,
+        "context_norm_max": 4.0,
+    }
+    assert all(isinstance(value, float) for value in diagnostics.values())
+
+
 def test_three_rollout_cpu_smoke_trains_calibration_without_nonfinite_values():
     model = AgriMetaRL(
         "MlpLstmPolicy",

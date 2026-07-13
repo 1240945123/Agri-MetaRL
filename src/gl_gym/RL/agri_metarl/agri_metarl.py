@@ -285,6 +285,86 @@ class AgriMetaRL(RecurrentPPO):
         self._inference_support_ready_step = None
         self._inference_step = None
 
+    def observe_inference_transition(
+        self,
+        observation,
+        action,
+        reward: float,
+        next_observation,
+        done: bool,
+        info: dict[str, Any],
+    ) -> None:
+        if self._inference_mode is None or self._inference_support_memory is None:
+            raise RuntimeError("begin_inference_episode() must be called first")
+
+        observation_array = np.asarray(observation)
+        action_array = np.asarray(action)
+        next_observation_array = np.asarray(next_observation)
+        if (
+            not np.isfinite(observation_array).all()
+            or not np.isfinite(action_array).all()
+            or not np.isfinite(next_observation_array).all()
+            or not np.isfinite(reward)
+        ):
+            raise ValueError("inference transition must contain only finite values")
+        if (
+            "task_descriptor" not in info
+            or info["task_descriptor"] is None
+            or "task_instance_key" not in info
+            or info["task_instance_key"] is None
+        ):
+            raise KeyError("inference info must contain complete task identity")
+
+        task_key = str(info["task_instance_key"])
+        if self._inference_task_key not in (None, task_key):
+            raise ValueError("task identity changed inside one inference episode")
+        self._inference_task_key = task_key
+        transition = Transition(
+            observation=np.asarray(observation_array, dtype=np.float32),
+            action=np.asarray(action_array, dtype=np.float32).reshape(-1),
+            reward=float(reward),
+            next_observation=np.asarray(next_observation_array, dtype=np.float32),
+            done=bool(done),
+        )
+        self._inference_support_memory.observe(task_key, transition)
+        self._inference_step += 1
+        if (
+            self._inference_support_ready_step is None
+            and len(self._inference_support_memory.support(task_key))
+            >= self.support_size
+        ):
+            self._inference_support_ready_step = self._inference_step
+
+    def _inference_context(self) -> np.ndarray:
+        context = np.zeros(self.context_dim, dtype=np.float32)
+        if self._inference_mode != "online_context" or self._inference_task_key is None:
+            return context
+        if self._inference_support_memory is None:
+            raise RuntimeError("online inference support memory is not initialized")
+
+        support = self._inference_support_memory.support(self._inference_task_key)
+        encoded, ready = self._context_from_support(support)
+        if not ready:
+            return context
+        context = encoded.detach().cpu().numpy().astype(np.float32, copy=False)
+        if not np.isfinite(context).all():
+            raise ValueError("inference context contains non-finite values")
+        self._inference_context_norms.append(float(np.linalg.norm(context)))
+        return context
+
+    def inference_episode_diagnostics(self) -> dict[str, float]:
+        norms = np.asarray(self._inference_context_norms or (), dtype=float)
+        support_ready_step = (
+            np.nan
+            if self._inference_support_ready_step is None
+            else self._inference_support_ready_step
+        )
+        return {
+            "support_ready_step": float(support_ready_step),
+            "context_norm_mean": float(norms.mean()) if norms.size else 0.0,
+            "context_norm_max": float(norms.max()) if norms.size else 0.0,
+        }
+
     def predict(
         self,
         observation,
@@ -297,13 +377,30 @@ class AgriMetaRL(RecurrentPPO):
         augmented_dim = raw_dim + self.context_dim
 
         if observation_array.shape == (raw_dim,):
-            context = np.zeros(self.context_dim, dtype=observation_array.dtype)
+            context = (
+                np.zeros(self.context_dim, dtype=observation_array.dtype)
+                if self._inference_mode is None
+                else self._inference_context()
+            )
             observation = np.concatenate([observation_array, context], axis=0)
         elif observation_array.shape == (augmented_dim,):
             observation = observation_array
         elif observation_array.ndim >= 2 and observation_array.shape[-1] == raw_dim:
-            context_shape = (*observation_array.shape[:-1], self.context_dim)
-            context = np.zeros(context_shape, dtype=observation_array.dtype)
+            if (
+                self._inference_mode == "online_context"
+                and observation_array.shape[0] != 1
+            ):
+                raise ValueError(
+                    "online inference requires a single evaluation environment"
+                )
+            if (
+                self._inference_mode is not None
+                and observation_array.shape == (1, raw_dim)
+            ):
+                context = self._inference_context().reshape(1, -1)
+            else:
+                context_shape = (*observation_array.shape[:-1], self.context_dim)
+                context = np.zeros(context_shape, dtype=observation_array.dtype)
             observation = np.concatenate([observation_array, context], axis=-1)
 
         return self.policy.predict(
