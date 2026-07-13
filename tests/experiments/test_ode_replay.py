@@ -112,6 +112,9 @@ def test_replay_types_are_frozen_and_outcome_detaches_final_state():
     outcome = ReplayOutcome("original", True, True, 0.25, source, warnings=["notice"])
     source[:] = 99
     np.testing.assert_array_equal(outcome.final_state, [1.0, 2.0])
+    assert outcome.final_state.flags.writeable is False
+    with pytest.raises(ValueError, match="read-only|writeable"):
+        outcome.final_state[0] = 7.0
     assert outcome.warnings == ("notice",)
     with pytest.raises(FrozenInstanceError):
         outcome.success = False
@@ -185,25 +188,117 @@ def test_replay_runs_six_fresh_variants_in_order_with_exact_inputs_and_options()
     [
         ("x0", np.array([1.0, np.nan], dtype=np.float32)),
         ("u", np.array([0.1, np.inf], dtype=np.float64)),
+        ("previous_control", np.array([0.3, np.nan], dtype=np.float32)),
+        ("requested_action", np.array([0.0, -np.inf])),
+        ("weather", np.array([5.0, np.nan, 7.0], dtype=np.float32)),
+        ("sampled_parameters", np.array([np.inf])),
         ("p_dyn", np.array([5.0, 6.0, -np.inf, 8.0], dtype=np.float64)),
         ("dt", np.array(np.nan)),
+        ("dt", np.array(0.0)),
+        ("day_of_year", np.array(np.nan)),
+        ("hour_of_day", np.array(np.inf)),
+        ("timestep", np.array(-1)),
+        ("timestep", np.array(1.5)),
+        ("nx", np.array(True)),
+        ("nx", np.array(0)),
+        ("nu", np.array(2.0)),
+        ("nd", np.array(-1)),
+        ("n_params", np.array(False)),
+        ("x0", np.array([[1.25, -2.5]], dtype=np.float32)),
+        ("u", np.array([0.1])),
+        ("previous_control", np.array([[0.3, 0.4]], dtype=np.float32)),
+        ("requested_action", np.zeros(3)),
+        ("weather", np.array([5.0, 6.0])),
+        ("sampled_parameters", np.array([[8.0]])),
+        ("p_dyn", np.array([5.0, 6.0, 7.0])),
     ],
 )
-def test_replay_rejects_nonfinite_stored_inputs_before_building_integrator(
-    field, bad_value
-):
+def test_replay_rejects_invalid_stored_inputs_before_external_calls(field, bad_value):
     capsule = _capsule()
     capsule.failure_inputs[field] = bad_value
     factory = RecordingFactory()
+    controller_calls = []
+
+    def controller_factory():
+        controller_calls.append(True)
+        return RecordingController()
 
     with pytest.raises(ValueError, match=field):
         replay_failure_capsule(
             capsule,
             integrator_factory=factory,
-            controller_factory=lambda: RecordingController(),
+            controller_factory=controller_factory,
         )
 
     assert factory.builds == []
+    assert controller_calls == []
+
+
+def test_replay_rejects_p_dyn_content_mismatch_before_external_calls():
+    capsule = _capsule()
+    capsule.failure_inputs["p_dyn"][0] += 1.0
+    factory = RecordingFactory()
+    controller_calls = []
+
+    with pytest.raises(ValueError, match="p_dyn"):
+        replay_failure_capsule(
+            capsule,
+            integrator_factory=factory,
+            controller_factory=lambda: controller_calls.append(True),
+        )
+
+    assert factory.builds == [] and controller_calls == []
+
+
+def test_external_mutation_cannot_change_capsule_or_later_variant_inputs():
+    capsule = _capsule()
+    before = {
+        name: (value.dtype, value.shape, value.tobytes())
+        for name, value in capsule.failure_inputs.items()
+    }
+    entries = []
+
+    def factory(**kwargs):
+        def integrate(**call):
+            entries.append(
+                {
+                    key: (value.dtype, value.shape, value.tobytes())
+                    for key, value in call.items()
+                }
+            )
+            original_x0 = np.array(call["x0"], copy=True)
+            call["x0"][...] = 91
+            call["u"][...] = 92
+            call["p"][...] = 93
+            return {"xf": original_x0 + 1.0}
+
+        return integrate
+
+    class MutatingController:
+        def predict(self, x0, weather, env):
+            x0[...] = 81
+            weather[...] = 82
+            return np.array([0.8, 0.9])
+
+    replay_failure_capsule(capsule, factory, lambda: MutatingController())
+
+    for name, value in capsule.failure_inputs.items():
+        assert (value.dtype, value.shape, value.tobytes()) == before[name]
+    first_calls = (entries[0], entries[1], entries[2], entries[3], entries[5], entries[9])
+    for call in first_calls:
+        assert call["x0"] == before["x0"]
+    for call in entries:
+        assert call["p"] == before["p_dyn"]
+    expected_controls = (
+        before["u"],
+        before["previous_control"],
+        (np.dtype(np.float64), (2,), np.array([0.8, 0.9]).tobytes()),
+        before["u"],
+        before["u"],
+        before["u"],
+    )
+    for call, expected in zip(first_calls, expected_controls):
+        assert call["u"] == expected
 
 
 def test_replay_captures_warnings_exceptions_and_elapsed_time():
@@ -244,13 +339,23 @@ def test_replay_marks_nonfinite_or_wrong_shape_final_states_failed(bad_final, me
 
 
 def test_rule_based_variant_is_unavailable_when_controller_cannot_be_built():
+    events = []
+
     def unavailable():
+        events.append("controller")
         raise FileNotFoundError("rule config unavailable")
 
-    factory = RecordingFactory()
+    class ExplodingFactory(RecordingFactory):
+        def __call__(self, **kwargs):
+            events.append("integrator")
+            self.builds.append(kwargs)
+            raise RuntimeError("integrator factory unavailable")
+
+    factory = ExplodingFactory()
     report = replay_failure_capsule(_capsule(), factory, unavailable)
     rule = report.outcomes[2]
-    assert len(factory.builds) == 6
+    assert len(factory.builds) == 5
+    assert events == ["integrator", "integrator", "controller", "integrator", "integrator", "integrator"]
     assert rule.available is False and rule.success is False
     assert rule.exception_type == "FileNotFoundError"
     assert rule.exception_message == "rule config unavailable"
@@ -265,8 +370,48 @@ def test_rule_prediction_exception_is_an_available_variant_failure():
         _capsule(), RecordingFactory(), lambda: BrokenController()
     )
     rule = report.outcomes[2]
-    assert rule.available is True and rule.success is False
+    assert rule.available is False and rule.success is False
     assert rule.exception_type == "IndexError"
+
+
+@pytest.mark.parametrize(
+    "control",
+    [np.array([0.1]), np.array([0.1, np.nan]), np.array([0.1, np.inf])],
+)
+def test_invalid_rule_control_is_unavailable_without_building_rule_integrator(control):
+    factory = RecordingFactory()
+    report = replay_failure_capsule(
+        _capsule(), factory, lambda: RecordingController(control)
+    )
+    rule = report.outcomes[2]
+    assert len(factory.builds) == 5
+    assert rule.available is False and rule.success is False
+    assert rule.exception_type == "ValueError"
+
+
+def test_rule_integrator_factory_failure_after_valid_control_is_available():
+    calls = []
+
+    class Controller:
+        def predict(self, x0, weather, env):
+            calls.append("controller")
+            return np.array([0.8, 0.9])
+
+    def factory(**kwargs):
+        calls.append("integrator")
+        if calls == ["integrator", "integrator", "controller", "integrator"]:
+            raise RuntimeError("rule integrator failed")
+
+        def integrate(**call):
+            return {"xf": call["x0"]}
+
+        return integrate
+
+    report = replay_failure_capsule(_capsule(), factory, Controller)
+    rule = report.outcomes[2]
+    assert calls[:4] == ["integrator", "integrator", "controller", "integrator"]
+    assert rule.available is True and rule.success is False
+    assert rule.exception_type == "RuntimeError"
 
 
 def test_build_rule_based_controller_uses_existing_loader_and_controller(monkeypatch):
@@ -308,12 +453,29 @@ def test_classification_labels(statuses, expected):
     assert classify_replay_outcomes(_all_outcomes(**statuses)) == expected
 
 
-def test_solver_success_with_unavailable_control_uses_available_control_evidence():
+def test_solver_success_with_unavailable_control_is_insufficient():
     outcomes = _all_outcomes(
         rule_based_control={"available": False},
         original_2x_substeps={"success": True},
     )
-    assert classify_replay_outcomes(outcomes) == "solver_step_sensitivity"
+    assert classify_replay_outcomes(outcomes) == "insufficient_counterfactual_evidence"
+
+
+@pytest.mark.parametrize("solver_success", [False, True])
+def test_demonstrated_control_success_classifies_even_if_other_control_unavailable(
+    solver_success,
+):
+    outcomes = _all_outcomes(
+        previous_control={"success": True},
+        rule_based_control={"available": False},
+        original_2x_substeps={"success": solver_success},
+    )
+    expected = (
+        "mixed_control_and_solver_sensitivity"
+        if solver_success
+        else "policy_induced_control_instability"
+    )
+    assert classify_replay_outcomes(outcomes) == expected
 
 
 @pytest.mark.parametrize(

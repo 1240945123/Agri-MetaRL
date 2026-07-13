@@ -54,9 +54,9 @@ class ReplayOutcome:
             final_state = np.asarray(self.final_state)
             if final_state.dtype.kind not in "biuf" or not np.isfinite(final_state).all():
                 raise ValueError("final_state must be numeric and finite")
-            object.__setattr__(
-                self, "final_state", np.array(final_state, copy=True)
-            )
+            owned_final_state = np.array(final_state, copy=True)
+            owned_final_state.setflags(write=False)
+            object.__setattr__(self, "final_state", owned_final_state)
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +97,7 @@ def classify_replay_outcomes(outcomes: Iterable[ReplayOutcome]) -> str:
     if control_success:
         return "policy_induced_control_instability"
     if solver_success and all(
-        not outcome.success for outcome in controls if outcome.available
+        outcome.available and not outcome.success for outcome in controls
     ):
         return "solver_step_sensitivity"
     if all(outcome.available and not outcome.success for outcome in ordered):
@@ -115,14 +115,83 @@ def _factory_arguments(inputs: Mapping[str, np.ndarray], dt: float) -> dict[str,
     }
 
 
-def _validate_replay_inputs(inputs: Mapping[str, np.ndarray]) -> None:
-    for name in ("x0", "u", "p_dyn"):
-        value = np.asarray(inputs[name])
-        if value.dtype.kind not in "biuf" or not np.isfinite(value).all():
-            raise ValueError(f"{name} must be numeric and finite")
-    dt = np.asarray(inputs["dt"])
-    if dt.size != 1 or dt.dtype.kind not in "biuf" or not np.isfinite(dt).all():
-        raise ValueError("dt must be a finite scalar")
+def _numeric_scalar(inputs: Mapping[str, np.ndarray], name: str) -> float:
+    value = np.asarray(inputs[name])
+    if value.shape != () or value.dtype.kind not in "iuf":
+        raise ValueError(f"{name} must be a non-boolean numeric scalar")
+    scalar = float(value)
+    if not math.isfinite(scalar):
+        raise ValueError(f"{name} must be finite")
+    return scalar
+
+
+def _integral_scalar(
+    inputs: Mapping[str, np.ndarray], name: str, *, positive: bool
+) -> int:
+    value = np.asarray(inputs[name])
+    if value.shape != () or value.dtype.kind not in "iu":
+        raise ValueError(f"{name} must be a non-boolean integral scalar")
+    scalar = int(value)
+    if (positive and scalar <= 0) or (not positive and scalar < 0):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be {qualifier}")
+    return scalar
+
+
+def _finite_vector(
+    inputs: Mapping[str, np.ndarray], name: str, expected_size: int
+) -> np.ndarray:
+    value = np.asarray(inputs[name])
+    if value.shape != (expected_size,):
+        raise ValueError(f"{name} shape must be ({expected_size},)")
+    if value.dtype.kind not in "biuf" or not np.isfinite(value).all():
+        raise ValueError(f"{name} must be numeric and finite")
+    return value
+
+
+def _snapshot_and_validate_inputs(
+    source: Mapping[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    required = {
+        "x0",
+        "u",
+        "previous_control",
+        "requested_action",
+        "weather",
+        "sampled_parameters",
+        "p_dyn",
+        "timestep",
+        "day_of_year",
+        "hour_of_day",
+        "dt",
+        "nx",
+        "nu",
+        "nd",
+        "n_params",
+    }
+    missing = required.difference(source)
+    if missing:
+        raise ValueError(f"missing replay inputs: {', '.join(sorted(missing))}")
+    inputs = {name: np.array(value, copy=True) for name, value in source.items()}
+    nx = _integral_scalar(inputs, "nx", positive=True)
+    nu = _integral_scalar(inputs, "nu", positive=True)
+    nd = _integral_scalar(inputs, "nd", positive=True)
+    n_params = _integral_scalar(inputs, "n_params", positive=True)
+    _integral_scalar(inputs, "timestep", positive=False)
+    dt = _numeric_scalar(inputs, "dt")
+    if dt <= 0:
+        raise ValueError("dt must be positive")
+    _numeric_scalar(inputs, "day_of_year")
+    _numeric_scalar(inputs, "hour_of_day")
+    _finite_vector(inputs, "x0", nx)
+    for name in ("u", "previous_control", "requested_action"):
+        _finite_vector(inputs, name, nu)
+    weather = _finite_vector(inputs, "weather", nd)
+    sampled = _finite_vector(inputs, "sampled_parameters", n_params)
+    p_dyn = _finite_vector(inputs, "p_dyn", nd + n_params)
+    if not np.array_equal(p_dyn, np.concatenate((weather, sampled))):
+        raise ValueError("p_dyn must equal concat(weather, sampled_parameters)")
+    return inputs
 
 
 def _final_array(result: Any, nx: int) -> np.ndarray:
@@ -139,6 +208,15 @@ def _final_array(result: Any, nx: int) -> np.ndarray:
     if final.dtype.kind not in "biuf" or not np.isfinite(final).all():
         raise ValueError("final state must be numeric and finite")
     return np.array(final, copy=True)
+
+
+def _rule_control(value: Any, nu: int) -> np.ndarray:
+    control = np.asarray(value)
+    if control.shape != (nu,):
+        raise ValueError(f"rule_based_control shape must be ({nu},)")
+    if control.dtype.kind not in "biuf" or not np.isfinite(control).all():
+        raise ValueError("rule_based_control must be numeric and finite")
+    return np.array(control, copy=True)
 
 
 def _run_variant(
@@ -171,24 +249,33 @@ def _run_variant(
     with python_warnings.catch_warnings(record=True) as caught:
         python_warnings.simplefilter("always")
         try:
-            integrator = integrator_factory(**factory_args)
             if variant == "rule_based_control":
                 try:
                     controller = controller_factory()
-                except Exception as error:
+                    environment = SimpleNamespace(
+                        nu=int(inputs["nu"]),
+                        day_of_year=float(inputs["day_of_year"]),
+                        hour_of_day=float(inputs["hour_of_day"]),
+                    )
+                    control = _rule_control(
+                        controller.predict(
+                            np.array(inputs["x0"], copy=True),
+                            np.array(inputs["weather"], copy=True),
+                            environment,
+                        ),
+                        int(inputs["nu"]),
+                    )
+                except Exception:
                     available = False
-                    raise error
-                environment = SimpleNamespace(
-                    nu=int(inputs["nu"]),
-                    day_of_year=float(inputs["day_of_year"]),
-                    hour_of_day=float(inputs["hour_of_day"]),
-                )
-                control = controller.predict(
-                    inputs["x0"], inputs["weather"], environment
-                )
-            state: Any = inputs["x0"]
+                    raise
+            integrator = integrator_factory(**factory_args)
+            state: Any = np.array(inputs["x0"], copy=True)
             for _ in range(substeps):
-                result = integrator(x0=state, u=control, p=inputs["p_dyn"])
+                result = integrator(
+                    x0=np.array(state, copy=True),
+                    u=np.array(control, copy=True),
+                    p=np.array(inputs["p_dyn"], copy=True),
+                )
                 state = _final_array(result, nx)
             final_state = np.array(state, copy=True)
         except Exception as error:
@@ -215,11 +302,11 @@ def replay_failure_capsule(
     controller_factory: Callable[[], Any] = build_rule_based_controller,
 ) -> ReplayReport:
     """Replay all fixed counterfactual variants for a loaded failure capsule."""
-    _validate_replay_inputs(capsule.failure_inputs)
+    inputs = _snapshot_and_validate_inputs(capsule.failure_inputs)
     outcomes = tuple(
         _run_variant(
             variant,
-            capsule.failure_inputs,
+            inputs,
             integrator_factory,
             controller_factory,
         )
