@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import importlib.util
 import json
 import math
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -389,20 +392,64 @@ def test_temp_name_is_short_and_independent_of_long_output_basename(
     assert len(observed) < 64
 
 
-def test_publication_race_preserves_competitor_contents(tmp_path, monkeypatch):
+@pytest.mark.parametrize("nonempty", [False, True])
+def test_publication_race_preserves_competitor_destination(
+    tmp_path, monkeypatch, nonempty
+):
     output = tmp_path / "report"
 
     def competitor(final):
         final.mkdir(exist_ok=True)
-        (final / "competitor.txt").write_text("keep", encoding="utf-8")
+        if nonempty:
+            (final / "competitor.txt").write_text("keep", encoding="utf-8")
 
     monkeypatch.setattr(cli, "_publication_race_hook", competitor)
     with pytest.raises(FileExistsError):
         cli.write_replay_report_atomic(
             _report(), output, state_dim=2, capsule_identity=IDENTITY
         )
-    assert (output / "competitor.txt").read_text(encoding="utf-8") == "keep"
+    assert output.is_dir()
+    if nonempty:
+        assert (output / "competitor.txt").read_text(encoding="utf-8") == "keep"
+    else:
+        assert not list(output.iterdir())
     assert not list(tmp_path.glob(".ode-replay-*"))
+
+
+def test_atomic_rename_noreplace_uses_native_windows_no_clobber(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    monkeypatch.setattr(sys, "platform", "win32")
+    with pytest.raises(FileExistsError):
+        cli._atomic_rename_noreplace(source, destination)
+    assert source.is_dir()
+    assert destination.is_dir()
+
+
+def test_atomic_rename_noreplace_maps_linux_eexist(tmp_path, monkeypatch):
+    class RenameAt2:
+        def __call__(self, *_args):
+            ctypes.set_errno(errno.EEXIST)
+            return -1
+
+    libc = SimpleNamespace(renameat2=RenameAt2())
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(cli, "_load_libc", lambda: libc, raising=False)
+    with pytest.raises(FileExistsError):
+        cli._atomic_rename_noreplace(tmp_path / "source", tmp_path / "destination")
+
+
+@pytest.mark.parametrize("platform", ["linux", "freebsd13"])
+def test_atomic_rename_noreplace_fails_closed_when_unsupported(
+    tmp_path, monkeypatch, platform
+):
+    monkeypatch.setattr(sys, "platform", platform)
+    if platform == "linux":
+        monkeypatch.setattr(cli, "_load_libc", lambda: SimpleNamespace(), raising=False)
+    with pytest.raises(RuntimeError, match="atomic no-replace rename.*unsupported"):
+        cli._atomic_rename_noreplace(tmp_path / "source", tmp_path / "destination")
 
 
 def test_strict_validation_rejects_extra_file_and_directory(tmp_path):
@@ -432,6 +479,43 @@ def test_strict_validation_rejects_required_file_symlink(tmp_path):
     except OSError:
         pytest.skip("symlinks are unavailable on this platform")
     with pytest.raises(ValueError, match="regular non-symlink"):
+        cli._validate_replay_directory(output, state_dim=2)
+
+
+def test_strict_validation_rejects_invalid_utf8_markdown(tmp_path):
+    output = tmp_path / "report"
+    cli.write_replay_report_atomic(
+        _report(), output, state_dim=2, capsule_identity=IDENTITY
+    )
+    (output / "replay_summary.md").write_bytes(b"\xff")
+    with pytest.raises(ValueError, match="UTF-8"):
+        cli._validate_replay_directory(output, state_dim=2)
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("original_2x_substeps", "tampered_variant"),
+        (
+            "Classification: `solver_step_sensitivity`",
+            "Classification: `non_reproduced`",
+        ),
+        (
+            "fixed-controller integration-scheme benchmark redesign/version",
+            "tampered next action",
+        ),
+    ],
+)
+def test_strict_validation_rejects_tampered_markdown(tmp_path, old, new):
+    output = tmp_path / "report"
+    cli.write_replay_report_atomic(
+        _report(), output, state_dim=2, capsule_identity=IDENTITY
+    )
+    summary_path = output / "replay_summary.md"
+    summary = summary_path.read_text(encoding="utf-8")
+    assert old in summary
+    summary_path.write_text(summary.replace(old, new, 1), encoding="utf-8")
+    with pytest.raises(ValueError, match="Markdown.*JSON"):
         cli._validate_replay_directory(output, state_dim=2)
 
 

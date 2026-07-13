@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from datetime import datetime, timedelta, timezone
 import errno
 import json
@@ -12,6 +13,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import sys
 from typing import Any, Callable, Mapping
 from uuid import uuid4
 
@@ -258,34 +260,35 @@ def _state_arrays(
     return names, states, masks
 
 
-def _markdown(report: ReplayReport) -> str:
+def _markdown_from_payload(payload: Mapping[str, Any]) -> str:
     lines = [
         "# ODE Failure Replay Summary",
         "",
-        f"Failure: `{report.failure_id}`",
+        f"Failure: `{payload['failure_id']}`",
         "",
-        f"Classification: `{report.classification}`",
+        f"Classification: `{payload['classification']}`",
         "",
         "| Variant | Available | Success | Elapsed (s) | Exception |",
         "| --- | --- | --- | ---: | --- |",
     ]
-    for outcome in report.outcomes:
+    for outcome in payload["outcomes"]:
         exception = ""
-        if outcome.exception_type is not None:
-            exception = str(outcome.exception_type)
-            if outcome.exception_message:
-                exception += f": {outcome.exception_message}"
+        if outcome["exception_type"] is not None:
+            exception = str(outcome["exception_type"])
+            if outcome["exception_message"]:
+                exception += f": {outcome['exception_message']}"
         exception = exception.replace("|", "\\|").replace("\n", " ")
         lines.append(
-            f"| {outcome.variant} | {str(outcome.available).lower()} | "
-            f"{str(outcome.success).lower()} | {outcome.elapsed_seconds:.6f} | {exception} |"
+            f"| {outcome['variant']} | {str(outcome['available']).lower()} | "
+            f"{str(outcome['success']).lower()} | "
+            f"{outcome['elapsed_seconds']:.6f} | {exception} |"
         )
     lines.extend(
         [
             "",
             "## Next action",
             "",
-            NEXT_ACTIONS[report.classification],
+            NEXT_ACTIONS[payload["classification"]],
             "",
         ]
     )
@@ -311,7 +314,9 @@ def _write_outputs(
         final_states=states,
         finite_masks=masks,
     )
-    (directory / "replay_summary.md").write_text(_markdown(report), encoding="utf-8")
+    (directory / "replay_summary.md").write_bytes(
+        _markdown_from_payload(payload).encode("utf-8")
+    )
 
 
 def _reject_json_constant(value: str) -> None:
@@ -454,6 +459,16 @@ def _validate_replay_directory(directory: Path, *, state_dim: int) -> None:
     except (UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid replay_results.json: {error}") from error
     successful_names = _validate_json_payload(payload)
+    try:
+        markdown = (
+            (directory / "replay_summary.md")
+            .read_bytes()
+            .decode("utf-8", errors="strict")
+        )
+    except UnicodeDecodeError as error:
+        raise ValueError("replay Markdown must be valid UTF-8") from error
+    if markdown != _markdown_from_payload(payload):
+        raise ValueError("replay Markdown does not exactly match validated JSON")
 
     try:
         with np.load(directory / "replay_states.npz", allow_pickle=False) as archive:
@@ -484,51 +499,82 @@ def _publication_race_hook(_final: Path) -> None:
     """Test seam immediately before the no-clobber publication operation."""
 
 
-def _remove_owned_empty_reservation(path: Path, identity: tuple[int, int]) -> None:
-    try:
-        metadata = path.lstat()
-        if (metadata.st_dev, metadata.st_ino) != identity or any(path.iterdir()):
-            return
-        path.rmdir()
-    except (FileNotFoundError, NotADirectoryError, OSError):
+def _load_libc() -> ctypes.CDLL:
+    return ctypes.CDLL(None, use_errno=True)
+
+
+def _raise_atomic_rename_error(error_number: int, destination: Path) -> None:
+    if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            str(destination),
+        )
+    unsupported = {errno.ENOSYS, errno.EINVAL}
+    for name in ("ENOTSUP", "EOPNOTSUPP"):
+        value = getattr(errno, name, None)
+        if value is not None:
+            unsupported.add(value)
+    if error_number in unsupported:
+        raise RuntimeError(
+            "atomic no-replace rename is unsupported by this kernel/filesystem"
+        ) from OSError(error_number, os.strerror(error_number), str(destination))
+    raise OSError(error_number, os.strerror(error_number), str(destination))
+
+
+def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename a directory, failing closed if no no-clobber API exists."""
+    if sys.platform == "win32":
+        os.rename(source, destination)
         return
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        raise RuntimeError(
+            f"atomic no-replace rename is unsupported on platform {sys.platform!r}"
+        )
+
+    libc = _load_libc()
+    source_bytes = os.fsencode(os.fspath(source))
+    destination_bytes = os.fsencode(os.fspath(destination))
+    if sys.platform.startswith("linux"):
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise RuntimeError(
+                "atomic no-replace rename is unsupported: libc has no renameat2"
+            )
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = renameat2(
+            -100,
+            source_bytes,
+            -100,
+            destination_bytes,
+            1,
+        )
+    elif sys.platform == "darwin":
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            raise RuntimeError(
+                "atomic no-replace rename is unsupported: libc has no renamex_np"
+            )
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = renamex_np(source_bytes, destination_bytes, 0x00000004)
+    if result != 0:
+        _raise_atomic_rename_error(ctypes.get_errno(), destination)
 
 
 def _publish_directory_no_clobber(temporary: Path, output: Path) -> None:
-    """Atomically publish a directory without replacing a competing path."""
-    if os.name == "nt":
-        _publication_race_hook(output)
-        try:
-            temporary.rename(output)
-        except OSError as error:
-            if output.exists() or output.is_symlink():
-                raise FileExistsError(
-                    f"replay output already exists: {output}"
-                ) from error
-            raise
-        return
-
-    try:
-        output.mkdir(exist_ok=False)
-    except FileExistsError:
-        raise FileExistsError(f"replay output already exists: {output}") from None
-    metadata = output.lstat()
-    identity = (metadata.st_dev, metadata.st_ino)
-    published = False
-    try:
-        _publication_race_hook(output)
-        current = output.lstat()
-        if (current.st_dev, current.st_ino) != identity:
-            raise FileExistsError(f"replay output reservation changed: {output}")
-        temporary.rename(output)
-        published = True
-    except OSError as error:
-        if error.errno in (errno.EEXIST, errno.ENOTEMPTY) or output.exists():
-            raise FileExistsError(f"replay output already exists: {output}") from error
-        raise
-    finally:
-        if not published:
-            _remove_owned_empty_reservation(output, identity)
+    """Publish with one atomic no-replace operation after the test race seam."""
+    _publication_race_hook(output)
+    _atomic_rename_noreplace(temporary, output)
 
 
 def write_replay_report_atomic(
