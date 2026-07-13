@@ -109,13 +109,17 @@ def test_parser_requires_capsule_and_output_root():
     assert args.output_root == "target"
 
 
-def test_script_help_bootstraps_src_without_pythonpath():
+def _isolated_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
+    return environment
+
+
+def test_script_help_bootstraps_src_without_pythonpath_from_unrelated_cwd(tmp_path):
     completed = subprocess.run(
-        [sys.executable, str(SCRIPT), "--help"],
-        cwd=SCRIPT.parents[2],
-        env=environment,
+        [sys.executable, "-I", str(SCRIPT), "--help"],
+        cwd=tmp_path,
+        env=_isolated_environment(),
         capture_output=True,
         text=True,
         check=False,
@@ -124,6 +128,34 @@ def test_script_help_bootstraps_src_without_pythonpath():
     assert "usage:" in completed.stdout.lower()
     assert "--capsule" in completed.stdout
     assert "--output_root" in completed.stdout
+
+
+def test_script_bootstrap_imports_ode_failure_from_workspace_src(tmp_path):
+    probe = """
+import json
+from pathlib import Path
+import runpy
+import sys
+
+runpy.run_path(sys.argv[1], run_name="replay_bootstrap_probe")
+import gl_gym.experiments.ode_failure as ode_failure
+print(json.dumps(str(Path(ode_failure.__file__).resolve())))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", probe, str(SCRIPT.resolve())],
+        cwd=tmp_path,
+        env=_isolated_environment(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    resolved_module = Path(json.loads(completed.stdout.strip())).resolve()
+    expected_module = (
+        SCRIPT.parents[2] / "src" / "gl_gym" / "experiments" / "ode_failure.py"
+    ).resolve()
+    assert resolved_module.is_relative_to((SCRIPT.parents[2] / "src").resolve())
+    assert resolved_module == expected_module
 
 
 def test_cli_loads_before_replay_and_writes_exactly_three_outputs(
