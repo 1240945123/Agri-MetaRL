@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
+from importlib import metadata
 import platform
 from pathlib import Path
 import shutil
@@ -28,6 +30,7 @@ from gl_gym.experiments.context_ab import (
     select_diagnostic_tasks,
     write_context_ab_artifacts,
 )
+from gl_gym.experiments.ode_failure import CapsuleContext, FailureCapsuleRecorder
 from gl_gym.experiments.suite_evaluation import (
     load_task_env,
     run_deterministic_episode,
@@ -45,6 +48,13 @@ HASH_FIELDS = (
 )
 DEFAULT_RESULT_ROOT = Path(
     "artifacts/results/AgriControl_C_2026-07-10-v3-context-ab"
+)
+RELEVANT_FAILURE_SOURCES = (
+    Path("src/gl_gym/environments/tomato_env.py"),
+    Path("src/gl_gym/environments/models/ode.py"),
+    Path("src/gl_gym/environments/models/utils.py"),
+    Path("configs/envs/TomatoEnv.yml"),
+    Path("configs/agents/rule_based.yml"),
 )
 
 
@@ -122,6 +132,19 @@ def validate_result_root(
     return resolved
 
 
+def validate_failure_root(
+    failure_root: str | Path,
+    formal_result_root: str | Path,
+) -> Path:
+    """Require failure evidence to live outside the formal publication tree."""
+
+    resolved = Path(failure_root).resolve()
+    formal = Path(formal_result_root).resolve()
+    if resolved == formal or formal in resolved.parents:
+        raise ValueError("failure root must be outside the formal result root")
+    return resolved
+
+
 def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
     """Hash a file with bounded memory use."""
 
@@ -130,6 +153,23 @@ def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
         for chunk in iter(lambda: stream.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _package_versions() -> dict[str, str]:
+    versions = {"python": platform.python_version()}
+    for distribution in (
+        "numpy",
+        "pandas",
+        "casadi",
+        "stable-baselines3",
+        "torch",
+        "gymnasium",
+    ):
+        try:
+            versions[distribution] = metadata.version(distribution)
+        except metadata.PackageNotFoundError:
+            continue
+    return versions
 
 
 def resume_row_is_complete(
@@ -309,14 +349,23 @@ def run_diagnostic(
     source_tasks_csv: str | Path,
     device: str,
     resume: bool,
+    failure_root: str | Path | None = None,
     model_loader: Callable[[Path, str], Any] | None = None,
     env_loader: Callable[[Any, Any, Path], Any] = load_task_env,
     episode_runner: Callable[..., Any] = run_deterministic_episode,
     provenance_loader: Callable[[], dict[str, Any]] = _provenance,
+    recorder_factory: Callable[
+        [str | Path, CapsuleContext], Any
+    ] = FailureCapsuleRecorder,
 ) -> pd.DataFrame:
     """Execute all 32 episodes with injectable model, environment, and runner hooks."""
 
     root = validate_result_root(result_root, suite.result_root)
+    capsule_root = (
+        validate_failure_root(failure_root, root)
+        if failure_root is not None
+        else None
+    )
     if root.exists() and not root.is_dir():
         raise ValueError(f"diagnostic result root must be a directory: {root}")
     selected = select_diagnostic_tasks(tasks)
@@ -327,6 +376,32 @@ def run_diagnostic(
         "source_manifest_sha256": sha256_file(source_manifest),
         "source_tasks_sha256": sha256_file(source_tasks_csv),
     }
+    provenance: dict[str, Any] | None = None
+
+    def get_provenance() -> dict[str, Any]:
+        nonlocal provenance
+        if provenance is None:
+            provenance = dict(provenance_loader())
+        return provenance
+
+    source_checksums: dict[str, str] = {}
+    package_versions: dict[str, str] = {}
+    if capsule_root is not None:
+        source_checksums = {
+            str((ROOT / path).resolve()): sha256_file(ROOT / path)
+            for path in RELEVANT_FAILURE_SOURCES
+        }
+        source_checksums.update(
+            {
+                str(Path(source_manifest).resolve()): source_hashes[
+                    "source_manifest_sha256"
+                ],
+                str(Path(source_tasks_csv).resolve()): source_hashes[
+                    "source_tasks_sha256"
+                ],
+            }
+        )
+        package_versions = _package_versions()
     evidence_by_seed = {
         int(run["seed"]): {
             "model_sha256": str(run["model_sha256"]),
@@ -384,11 +459,33 @@ def run_diagnostic(
                     continue
                 env = env_loader(suite, task, Path(run["vecnormalize_path"]))
                 try:
+                    runner_kwargs: dict[str, Any] = {
+                        "inference_mode": mode,
+                        "return_diagnostics": True,
+                    }
+                    if capsule_root is not None:
+                        episode_provenance = get_provenance()
+                        recorder = recorder_factory(
+                            capsule_root,
+                            CapsuleContext(
+                                seed=int(run["seed"]),
+                                task_id=task.task_id,
+                                inference_mode=mode,
+                                task=asdict(task),
+                                checkpoint_path=str(
+                                    Path(run["model_path"]).resolve()
+                                ),
+                                checkpoint_sha256=str(run["model_sha256"]),
+                                git_head=str(episode_provenance["git_commit"]),
+                                dirty=bool(episode_provenance["dirty"]),
+                                source_checksums=dict(source_checksums),
+                                package_versions=dict(package_versions),
+                                formal_result_root=str(root.resolve()),
+                            ),
+                        )
+                        runner_kwargs["failure_recorder"] = recorder
                     metrics, diagnostics = episode_runner(
-                        model,
-                        env,
-                        inference_mode=mode,
-                        return_diagnostics=True,
+                        model, env, **runner_kwargs
                     )
                 finally:
                     env.close()
@@ -427,7 +524,7 @@ def run_diagnostic(
     if len(rows) != 32:
         raise RuntimeError(f"diagnostic completed {len(rows)} of 32 required episodes")
     raw = pd.DataFrame(rows)
-    provenance = provenance_loader()
+    provenance = get_provenance()
     manifest = {
         "source_manifest": str(Path(source_manifest).resolve()),
         "source_manifest_sha256": source_hashes["source_manifest_sha256"],
@@ -456,6 +553,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source_tasks_csv", required=True)
     parser.add_argument("--model_root", required=True)
     parser.add_argument("--result_root", default=str(DEFAULT_RESULT_ROOT))
+    parser.add_argument("--failure_root")
     parser.add_argument("--seeds", nargs="+", type=int, required=True)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--resume", action="store_true")
@@ -478,6 +576,7 @@ def main() -> None:
         tasks=pd.read_csv(source_tasks_csv),
         runs=runs,
         result_root=args.result_root,
+        failure_root=args.failure_root,
         source_manifest=source_manifest,
         source_tasks_csv=source_tasks_csv,
         device=args.device,

@@ -109,6 +109,32 @@ class FakeEnv:
         return np.array([[0.0]]), np.array([10.0]), np.array([done]), [info]
 
 
+class DiagnosticFakeEnv(FakeEnv):
+    def __init__(self, *, fail_enable=False, fail_disable=False):
+        super().__init__()
+        self.diagnostic_calls = []
+        self.fail_enable = fail_enable
+        self.fail_disable = fail_disable
+
+    def env_method(self, name, enabled):
+        self.diagnostic_calls.append((name, enabled))
+        if enabled and self.fail_enable:
+            raise RuntimeError("enable failed")
+        if not enabled and self.fail_disable:
+            raise RuntimeError("disable failed")
+
+
+class RecordingFailureRecorder:
+    def __init__(self, error=None):
+        self.calls = []
+        self.error = error
+
+    def record_step(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+
+
 def test_run_deterministic_episode_sums_metrics():
     metrics = run_deterministic_episode(FakeModel(), FakeEnv())
 
@@ -118,6 +144,143 @@ def test_run_deterministic_episode_sums_metrics():
     assert metrics["temp_violation"] == 3
     assert metrics["co2_violation"] == 6
     assert metrics["rh_violation"] == 9
+
+
+def test_failure_recorder_enables_diagnostics_and_captures_original_transition():
+    class TransitionEnv(DiagnosticFakeEnv):
+        def reset(self):
+            return np.array([[1.0, 2.0]], dtype=np.float32)
+
+        def step(self, actions):
+            self.step_count += 1
+            info = {
+                "integration_failure": {"message": "exact"},
+                "diagnostic_transition": {"step": self.step_count},
+            }
+            done = self.step_count == 3
+            if done:
+                info["terminal_observation"] = np.array([9.0, 10.0])
+            return (
+                np.array([[10.0 + self.step_count, 20.0]], dtype=np.float32),
+                np.array([self.step_count], dtype=np.float32),
+                np.array([done]),
+                [info],
+            )
+
+    env = TransitionEnv()
+    recorder = RecordingFailureRecorder()
+    run_deterministic_episode(FakeModel(), env, failure_recorder=recorder)
+
+    assert env.diagnostic_calls == [
+        ("set_ode_diagnostics_enabled", True),
+        ("set_ode_diagnostics_enabled", False),
+    ]
+    assert len(recorder.calls) == 3
+    first = recorder.calls[0]
+    assert first["step_index"] == 0
+    np.testing.assert_array_equal(first["policy_observation"], [1.0, 2.0])
+    assert first["reward"] == 1.0
+    assert first["done"] is False
+    assert first["info"]["integration_failure"] == {"message": "exact"}
+    assert first["info"]["diagnostic_transition"] == {"step": 1}
+
+
+def test_default_episode_does_not_toggle_ode_diagnostics():
+    env = DiagnosticFakeEnv()
+    run_deterministic_episode(FakeModel(), env)
+    assert env.diagnostic_calls == []
+
+
+def test_nonterminal_capture_error_propagates_before_next_prediction():
+    model = HookedFakeModel()
+    env = DiagnosticFakeEnv()
+    recorder = RecordingFailureRecorder(RuntimeError("capture failed"))
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        run_deterministic_episode(
+            model, env, inference_mode="online_context", failure_recorder=recorder
+        )
+
+    assert [event[0] for event in model.events] == ["begin", "predict", "end"]
+    assert env.step_count == 1
+    assert env.diagnostic_calls[-1] == ("set_ode_diagnostics_enabled", False)
+
+
+def test_early_termination_remains_primary_when_capture_fails():
+    class EarlyEnv(DiagnosticFakeEnv):
+        def step(self, actions):
+            self.step_count += 1
+            return (
+                np.array([[8.0]]),
+                np.array([1.0]),
+                np.array([True]),
+                [{}],
+            )
+
+    with pytest.raises(RuntimeError, match="terminated before") as captured:
+        run_deterministic_episode(
+            HookedFakeModel(),
+            EarlyEnv(),
+            inference_mode="online_context",
+            failure_recorder=RecordingFailureRecorder(
+                RuntimeError("capture failed")
+            ),
+        )
+
+    assert any("capture failed" in note for note in captured.value.__notes__)
+
+
+def test_enable_failure_avoids_disable_and_still_ends_inference_episode():
+    model = HookedFakeModel()
+    env = DiagnosticFakeEnv(fail_enable=True)
+
+    with pytest.raises(RuntimeError, match="enable failed"):
+        run_deterministic_episode(
+            model,
+            env,
+            inference_mode="online_context",
+            failure_recorder=RecordingFailureRecorder(),
+        )
+
+    assert env.diagnostic_calls == [("set_ode_diagnostics_enabled", True)]
+    assert [event[0] for event in model.events] == ["begin", "end"]
+
+
+def test_primary_error_keeps_priority_over_disable_and_inference_cleanup_errors():
+    class CleanupFailModel(HookedFakeModel):
+        def end_inference_episode(self):
+            self.events.append(("end",))
+            raise RuntimeError("end failed")
+
+    model = CleanupFailModel(fail_predict=True)
+    env = DiagnosticFakeEnv(fail_disable=True)
+    with pytest.raises(RuntimeError, match="predict failed") as captured:
+        run_deterministic_episode(
+            model,
+            env,
+            inference_mode="online_context",
+            failure_recorder=RecordingFailureRecorder(),
+        )
+
+    assert any("disable failed" in note for note in captured.value.__notes__)
+    assert any("end failed" in note for note in captured.value.__notes__)
+
+
+def test_disable_error_is_primary_and_inference_cleanup_error_is_noted():
+    class CleanupFailModel(HookedFakeModel):
+        def end_inference_episode(self):
+            self.events.append(("end",))
+            raise RuntimeError("end failed")
+
+    with pytest.raises(RuntimeError, match="disable failed") as captured:
+        run_deterministic_episode(
+            CleanupFailModel(),
+            DiagnosticFakeEnv(fail_disable=True),
+            inference_mode="online_context",
+            failure_recorder=RecordingFailureRecorder(),
+        )
+
+    assert any("end failed" in note for note in captured.value.__notes__)
 
 
 def test_deterministic_episode_invokes_online_hooks_in_lifecycle_order():

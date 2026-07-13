@@ -576,6 +576,34 @@ def test_validate_result_root_rejects_source_suite_collision(tmp_path: Path):
         cli.validate_result_root(tmp_path / "suite", tmp_path / "suite" / ".." / "suite")
 
 
+@pytest.mark.parametrize("relation", ["equal", "inside"])
+def test_failure_root_must_be_isolated_from_formal_result_root(
+    tmp_path: Path, relation: str
+):
+    cli = _load_context_cli()
+    formal = tmp_path / "diagnostic"
+    failure = formal if relation == "equal" else formal / "failures"
+    with pytest.raises(ValueError, match="failure root"):
+        cli.validate_failure_root(failure, formal)
+
+    approved = tmp_path / ".diagnostic.work" / "failures"
+    assert cli.validate_failure_root(approved, formal) == approved.resolve()
+
+
+def test_context_cli_parser_accepts_failure_root():
+    cli = _load_context_cli()
+    args = cli.build_parser().parse_args(
+        [
+            "--source_manifest", "manifest.json",
+            "--source_tasks_csv", "tasks.csv",
+            "--model_root", "models",
+            "--seeds", "42", "123",
+            "--failure_root", "capsules",
+        ]
+    )
+    assert args.failure_root == "capsules"
+
+
 @pytest.mark.parametrize(
     "relation", ["ancestor", "descendant", "work", "staging", "staging_descendant"]
 )
@@ -885,6 +913,89 @@ def test_cli_core_fake_smoke_writes_exactly_32_rows(tmp_path: Path):
     assert manifest["source_manifest_sha256"] == cli.sha256_file(source_manifest)
     assert manifest["source_tasks_sha256"] == cli.sha256_file(source_tasks_csv)
     assert len(list((tmp_path / "diagnostic" / "traces").glob("*.npy"))) == 32
+
+
+def test_failure_capture_builds_per_episode_context_and_does_not_publish(
+    tmp_path: Path
+):
+    case = _fake_cli_case(tmp_path)
+    root = tmp_path / "diagnostic"
+    failure_root = tmp_path / ".diagnostic.work" / "failures"
+    provenance_calls = 0
+    created = []
+
+    class Recorder:
+        pass
+
+    def recorder_factory(path, context):
+        created.append((Path(path), context))
+        return Recorder()
+
+    def provenance_loader():
+        nonlocal provenance_calls
+        provenance_calls += 1
+        return {"git_commit": "a" * 40, "dirty": True}
+
+    def fail_first(
+        model, env, *, inference_mode, return_diagnostics, failure_recorder
+    ):
+        assert isinstance(failure_recorder, Recorder)
+        raise RuntimeError("injected early failure")
+
+    with pytest.raises(RuntimeError, match="injected early failure"):
+        case.cli.run_diagnostic(
+            suite=case.suite,
+            tasks=case.tasks,
+            runs=case.runs,
+            result_root=root,
+            failure_root=failure_root,
+            source_manifest=case.source_manifest,
+            source_tasks_csv=case.source_tasks_csv,
+            device="cpu",
+            resume=False,
+            model_loader=case.model_loader,
+            env_loader=case.env_loader,
+            episode_runner=fail_first,
+            recorder_factory=recorder_factory,
+            provenance_loader=provenance_loader,
+        )
+
+    assert provenance_calls == 1
+    assert len(created) == 1
+    recorder_path, context = created[0]
+    assert recorder_path == failure_root.resolve()
+    assert context.seed == 42
+    assert context.task_id == DIAGNOSTIC_TASK_IDS[0]
+    assert context.inference_mode == MODES[0]
+    assert context.task["task_id"] == DIAGNOSTIC_TASK_IDS[0]
+    assert Path(context.checkpoint_path).is_absolute()
+    assert context.checkpoint_sha256 == case.runs[0]["model_sha256"]
+    assert context.git_head == "a" * 40
+    assert context.dirty is True
+    assert context.formal_result_root == str(root.resolve())
+    assert context.package_versions
+
+    expected_sources = {
+        (case.cli.ROOT / "src/gl_gym/environments/tomato_env.py").resolve(),
+        (case.cli.ROOT / "src/gl_gym/environments/models/ode.py").resolve(),
+        (case.cli.ROOT / "src/gl_gym/environments/models/utils.py").resolve(),
+        (case.cli.ROOT / "configs/envs/TomatoEnv.yml").resolve(),
+        (case.cli.ROOT / "configs/agents/rule_based.yml").resolve(),
+        case.source_manifest.resolve(),
+        case.source_tasks_csv.resolve(),
+    }
+    assert {Path(key) for key in context.source_checksums} == expected_sources
+    for path in expected_sources:
+        assert context.source_checksums[str(path)] == case.cli.sha256_file(path)
+
+    for name in (
+        "eval_raw.csv",
+        "paired_deltas.csv",
+        "split_summary.csv",
+        "diagnostic_manifest.json",
+        "decision.json",
+    ):
+        assert not (root / name).exists()
 
 
 @pytest.mark.parametrize("failure_stage", ["mid_run", "final_publish"])

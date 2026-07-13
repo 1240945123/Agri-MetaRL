@@ -125,6 +125,7 @@ def run_deterministic_episode(
     env: Any,
     inference_mode: str | None = None,
     return_diagnostics: bool = False,
+    failure_recorder: Any | None = None,
 ) -> dict[str, float] | tuple[dict[str, float], dict[str, Any]]:
     required_hooks = (
         "begin_inference_episode",
@@ -157,9 +158,14 @@ def run_deterministic_episode(
     model_diagnostics: dict[str, Any] = {}
 
     primary_error: BaseException | None = None
+    diagnostics_enabled = False
     try:
         if use_inference_hooks:
             model.begin_inference_episode(inference_mode)
+
+        if failure_recorder is not None:
+            env.env_method("set_ode_diagnostics_enabled", True)
+            diagnostics_enabled = True
 
         reset_result = env.reset()
         obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
@@ -174,6 +180,18 @@ def run_deterministic_episode(
             totals["episode_return"] += float(rewards[0])
             info = infos[0]
             done = bool(dones[0])
+            capture_error: BaseException | None = None
+            if failure_recorder is not None:
+                try:
+                    failure_recorder.record_step(
+                        step_index=step_index,
+                        policy_observation=np.asarray(previous_obs[0]).copy(),
+                        reward=float(rewards[0]),
+                        done=done,
+                        info=info,
+                    )
+                except BaseException as error:
+                    capture_error = error
             for key in (
                 "EPI",
                 "revenue",
@@ -185,6 +203,23 @@ def run_deterministic_episode(
                 "rh_violation",
             ):
                 totals[key] += float(info.get(key, 0.0))
+
+            if (
+                capture_error is not None
+                and done
+                and step_index + 1 < n_steps
+            ):
+                early_done_error = RuntimeError(
+                    "evaluation episode terminated before configured horizon: "
+                    f"step {step_index + 1} of {n_steps}"
+                )
+                early_done_error.add_note(
+                    "failure capsule capture also failed: "
+                    f"{type(capture_error).__name__}: {capture_error}"
+                )
+                raise early_done_error
+            if capture_error is not None:
+                raise capture_error
 
             if use_inference_hooks:
                 if done:
@@ -217,12 +252,30 @@ def run_deterministic_episode(
         primary_error = error
         raise
     finally:
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        if diagnostics_enabled:
+            try:
+                env.env_method("set_ode_diagnostics_enabled", False)
+            except BaseException as error:
+                cleanup_errors.append(("ODE diagnostics disable", error))
         if use_inference_hooks:
             try:
                 model.end_inference_episode()
-            except Exception:
-                if primary_error is None:
-                    raise
+            except BaseException as error:
+                cleanup_errors.append(("inference episode cleanup", error))
+
+        if primary_error is not None:
+            for label, error in cleanup_errors:
+                primary_error.add_note(
+                    f"{label} also failed: {type(error).__name__}: {error}"
+                )
+        elif cleanup_errors:
+            _, cleanup_primary = cleanup_errors[0]
+            for label, error in cleanup_errors[1:]:
+                cleanup_primary.add_note(
+                    f"{label} also failed: {type(error).__name__}: {error}"
+                )
+            raise cleanup_primary
 
     if not return_diagnostics:
         return totals
