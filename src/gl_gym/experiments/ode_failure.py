@@ -7,10 +7,12 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
+from numbers import Integral
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 from typing import Any
 import uuid
 
@@ -66,6 +68,11 @@ HISTORY_ARRAYS = (
     "done",
 )
 _SAFE_PART = re.compile(r"[^A-Za-z0-9._-]+")
+_WINDOWS_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +162,8 @@ def _sanitize(value: Any) -> str:
         text = text.replace("..", ".")
     if not text or text in {".", ".."}:
         text = "unnamed"
+    if text.split(".", 1)[0].upper() in _WINDOWS_DEVICE_NAMES:
+        text = f"safe_{text}"
     return text[:120]
 
 
@@ -219,8 +228,9 @@ def _content_identity(
     return identity.hexdigest()
 
 
-def _context_dict(context: CapsuleContext) -> dict:
+def _context_dict(context: CapsuleContext, seed: int) -> dict:
     data = asdict(context)
+    data["seed"] = seed
     # Validate at the boundary and detach mutable dictionaries from the caller.
     return json.loads(
         _strict_json_bytes(data).decode("utf-8"), parse_constant=_reject_constant
@@ -233,9 +243,15 @@ class FailureCapsuleRecorder:
     ):
         if capacity != CAPACITY:
             raise ValueError("failure history capacity must be exactly 256")
+        if isinstance(context.seed, (bool, np.bool_)) or not isinstance(
+            context.seed, Integral
+        ):
+            raise TypeError("context seed must be a non-boolean integer")
+        self._seed_part = str(int(context.seed))
         self.root = Path(root)
+        self._resolved_root = self.root.resolve()
         self.context = context
-        self._context = _context_dict(context)
+        self._context = _context_dict(context, int(context.seed))
         self._history: deque[dict[str, Any]] = deque(maxlen=CAPACITY)
 
     @property
@@ -400,15 +416,20 @@ class FailureCapsuleRecorder:
         failure_id = _failure_id(self._context, failure_inputs)
         target = (
             self.root
-            / str(self.context.seed)
+            / self._seed_part
             / _sanitize(self.context.task_id)
             / _sanitize(self.context.inference_mode)
             / failure_id
         )
+        target = target.resolve()
+        if not target.is_relative_to(self._resolved_root):
+            raise ValueError("failure capsule destination escapes the configured root")
         target.parent.mkdir(parents=True, exist_ok=True)
         # Keep sibling staging names short enough for legacy Windows path limits.
         temporary = target.parent / f".tmp-{uuid.uuid4().hex}"
         temporary.mkdir()
+        primary_error: BaseException | None = None
+        outcome: Path | None = None
         try:
             np.savez_compressed(temporary / "failure_inputs.npz", **failure_inputs)
             np.savez_compressed(temporary / "history.npz", **history_arrays)
@@ -436,22 +457,44 @@ class FailureCapsuleRecorder:
                     existing.manifest.get("content_identity_sha256")
                     == manifest["content_identity_sha256"]
                 ):
-                    return target
-                raise FileExistsError(f"failure capsule collision for {failure_id}")
+                    outcome = target
+                else:
+                    raise FileExistsError(f"failure capsule collision for {failure_id}")
+            else:
+                try:
+                    os.rename(temporary, target)
+                    outcome = target
+                except FileExistsError:
+                    existing = load_failure_capsule(target)
+                    if (
+                        existing.manifest.get("content_identity_sha256")
+                        == manifest["content_identity_sha256"]
+                    ):
+                        outcome = target
+                    else:
+                        raise FileExistsError(
+                            f"failure capsule collision for {failure_id}"
+                        )
+        except BaseException as error:
+            primary_error = error
+
+        cleanup_error: BaseException | None = None
+        if temporary.exists():
             try:
-                os.rename(temporary, target)
-            except FileExistsError:
-                existing = load_failure_capsule(target)
-                if (
-                    existing.manifest.get("content_identity_sha256")
-                    == manifest["content_identity_sha256"]
-                ):
-                    return target
-                raise FileExistsError(f"failure capsule collision for {failure_id}")
-            return target
-        finally:
-            if temporary.exists():
                 shutil.rmtree(temporary)
+            except BaseException as error:
+                cleanup_error = error
+        if primary_error is not None:
+            if cleanup_error is not None:
+                primary_error.add_note(
+                    f"temporary capsule cleanup also failed: {cleanup_error}"
+                )
+            raise primary_error
+        if outcome is not None:
+            return outcome
+        if cleanup_error is not None:
+            raise cleanup_error
+        raise RuntimeError("failure capsule write completed without an outcome")
 
     def _manifest(
         self,
@@ -644,13 +687,26 @@ def _load_failure_capsule(
     capsule_path = Path(path)
     if not capsule_path.is_dir():
         raise ValueError(f"failure capsule directory is missing: {capsule_path}")
-    present = {item.name for item in capsule_path.iterdir() if item.is_file()}
+    entries = list(capsule_path.iterdir())
+    present = {item.name for item in entries}
     missing = REQUIRED_FILES - present
     if missing:
         raise ValueError(f"missing required capsule files: {sorted(missing)}")
     extra = present - REQUIRED_FILES
     if extra:
         raise ValueError(f"unexpected extra capsule files: {sorted(extra)}")
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    for entry in entries:
+        entry_stat = entry.lstat()
+        attributes = getattr(entry_stat, "st_file_attributes", 0)
+        if (
+            entry.is_symlink()
+            or attributes & reparse_flag
+            or not stat.S_ISREG(entry_stat.st_mode)
+        ):
+            raise ValueError(
+                f"required capsule entry must be a regular non-symlink file: {entry.name}"
+            )
     manifest = _read_json(capsule_path / "manifest.json")
     if (
         not isinstance(manifest, dict)
@@ -663,13 +719,27 @@ def _load_failure_capsule(
         raise ValueError("invalid manifest file checksum table")
     for name in sorted(expected_hashed):
         metadata = files[name]
-        if not isinstance(metadata, dict) or metadata.get("sha256") != _sha256_file(
-            capsule_path / name
-        ):
+        if not isinstance(metadata, dict):
+            raise ValueError(f"invalid file metadata for {name}")
+        if metadata.get("sha256") != _sha256_file(capsule_path / name):
             raise ValueError(f"checksum mismatch for {name}")
+        size_bytes = metadata.get("size_bytes")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, Integral)
+            or int(size_bytes) != (capsule_path / name).lstat().st_size
+        ):
+            raise ValueError(f"size mismatch for {name}")
     failure_inputs = _load_npz(capsule_path / "failure_inputs.npz")
     history_arrays = _load_npz(capsule_path / "history.npz")
     _validate_failure_inputs(failure_inputs)
+    failure_timestep = manifest.get("failure_timestep")
+    if (
+        isinstance(failure_timestep, bool)
+        or not isinstance(failure_timestep, Integral)
+        or int(failure_timestep) != int(failure_inputs["timestep"])
+    ):
+        raise ValueError("manifest failure_timestep mismatch")
     _validate_array_metadata(manifest, "failure_inputs", failure_inputs)
     _validate_array_metadata(manifest, "history", history_arrays)
     rows = []

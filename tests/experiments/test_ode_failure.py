@@ -132,6 +132,7 @@ def _rewrite_history_npz(path: Path, transform) -> None:
 
     def update(manifest):
         manifest["files"]["history.npz"]["sha256"] = _sha256(history_path)
+        manifest["files"]["history.npz"]["size_bytes"] = history_path.stat().st_size
         manifest["arrays"]["history"] = {
             name: {"dtype": array.dtype.str, "shape": list(array.shape)}
             for name, array in sorted(arrays.items())
@@ -146,6 +147,25 @@ def test_context_is_frozen_and_capacity_is_fixed(tmp_path):
         context.seed = 9
     with pytest.raises(ValueError, match="256"):
         FailureCapsuleRecorder(tmp_path, context, capacity=255)
+
+
+@pytest.mark.parametrize("seed", [True, "17", 17.0, None])
+def test_recorder_rejects_non_integral_or_boolean_seed(tmp_path, seed):
+    with pytest.raises(TypeError, match="seed"):
+        FailureCapsuleRecorder(tmp_path, _context(seed=seed))
+
+
+def test_integral_seed_is_canonicalized_and_device_names_are_sanitized(tmp_path):
+    recorder = FailureCapsuleRecorder(
+        tmp_path,
+        _context(seed=np.int64(17), task_id="CON.txt", inference_mode="lPt1.log"),
+    )
+    path = recorder.record_step(8, np.zeros(2), -1.0, True, _info(8, failure=True))
+    assert path is not None
+    assert path.parents[2].name == "17"
+    assert path.parents[1].name.upper().split(".", 1)[0] != "CON"
+    assert path.parent.name.upper().split(".", 1)[0] != "LPT1"
+    assert path.resolve().is_relative_to(tmp_path.resolve())
 
 
 def test_history_retains_last_256_steps_and_copies_inputs(tmp_path):
@@ -295,6 +315,24 @@ def test_writer_cleans_sibling_temp_directory_on_failure(tmp_path, monkeypatch):
     assert not list(tmp_path.rglob("*.tmp-*"))
 
 
+def test_cleanup_failure_does_not_mask_primary_write_error(tmp_path, monkeypatch):
+    recorder = FailureCapsuleRecorder(tmp_path, _context())
+
+    def write_error(*args, **kwargs):
+        raise OSError("primary disk write failure")
+
+    def cleanup_error(*args, **kwargs):
+        raise PermissionError("secondary cleanup failure")
+
+    monkeypatch.setattr(
+        "gl_gym.experiments.ode_failure.np.savez_compressed", write_error
+    )
+    monkeypatch.setattr("gl_gym.experiments.ode_failure.shutil.rmtree", cleanup_error)
+    with pytest.raises(OSError, match="primary disk write failure") as captured:
+        recorder.record_step(8, np.zeros(2), -1.0, True, _info(8, failure=True))
+    assert any("secondary cleanup failure" in note for note in captured.value.__notes__)
+
+
 @pytest.mark.parametrize(
     "filename", ["failure_inputs.npz", "history.npz", "history.jsonl", "traceback.txt"]
 )
@@ -321,7 +359,8 @@ def test_loader_rejects_object_array_even_with_updated_checksum(tmp_path):
     _rewrite_manifest(
         path,
         lambda manifest: manifest["files"]["failure_inputs.npz"].update(
-            sha256=_sha256(path / "failure_inputs.npz")
+            sha256=_sha256(path / "failure_inputs.npz"),
+            size_bytes=(path / "failure_inputs.npz").stat().st_size,
         ),
     )
     with pytest.raises(ValueError, match="object|pickle"):
@@ -360,7 +399,8 @@ def test_loader_rejects_p_dyn_mismatch_with_updated_checksum(tmp_path):
     _rewrite_manifest(
         path,
         lambda manifest: manifest["files"]["failure_inputs.npz"].update(
-            sha256=_sha256(path / "failure_inputs.npz")
+            sha256=_sha256(path / "failure_inputs.npz"),
+            size_bytes=(path / "failure_inputs.npz").stat().st_size,
         ),
     )
     with pytest.raises(ValueError, match="p_dyn"):
@@ -407,6 +447,52 @@ def test_loader_rejects_extra_regular_file(tmp_path):
     path = _record_failure(tmp_path)
     (path / "unexpected.txt").write_text("not part of the capsule", encoding="utf-8")
     with pytest.raises(ValueError, match="extra|unexpected|required"):
+        load_failure_capsule(path)
+
+
+def test_loader_rejects_extra_directory(tmp_path):
+    path = _record_failure(tmp_path)
+    (path / "unexpected-directory").mkdir()
+    with pytest.raises(ValueError, match="extra|unexpected|required|entries"):
+        load_failure_capsule(path)
+
+
+def test_loader_rejects_required_file_symlink(tmp_path):
+    path = _record_failure(tmp_path)
+    external = tmp_path / "external-traceback.txt"
+    external.write_text("external evidence", encoding="utf-8")
+    required = path / "traceback.txt"
+    required.unlink()
+    try:
+        required.symlink_to(external)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable on this Windows host: {error}")
+    with pytest.raises(ValueError, match="symlink|reparse|regular"):
+        load_failure_capsule(path)
+
+
+@pytest.mark.parametrize("replacement", [True, 1])
+def test_loader_rejects_invalid_manifest_file_size(tmp_path, replacement):
+    path = _record_failure(tmp_path)
+
+    def tamper(manifest):
+        actual = manifest["files"]["history.npz"]["size_bytes"]
+        manifest["files"]["history.npz"]["size_bytes"] = (
+            replacement if isinstance(replacement, bool) else actual + replacement
+        )
+
+    _rewrite_manifest(path, tamper)
+    with pytest.raises(ValueError, match="size"):
+        load_failure_capsule(path)
+
+
+@pytest.mark.parametrize("replacement", [True, 9])
+def test_loader_rejects_invalid_manifest_failure_timestep(tmp_path, replacement):
+    path = _record_failure(tmp_path)
+    _rewrite_manifest(
+        path, lambda manifest: manifest.update(failure_timestep=replacement)
+    )
+    with pytest.raises(ValueError, match="failure_timestep|timestep"):
         load_failure_capsule(path)
 
 
