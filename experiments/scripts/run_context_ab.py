@@ -110,13 +110,17 @@ def resume_row_is_complete(
         "seed",
         "task_id",
         "inference_mode",
+        "checkpoint_steps",
         "action_trace_path",
         *PAIR_METRICS,
     }
     if not required.issubset(row.keys()):
         return False
     try:
-        if checkpoint_steps is not None and int(row["checkpoint_steps"]) != checkpoint_steps:
+        row_steps = float(row["checkpoint_steps"])
+        if not np.isfinite(row_steps) or not row_steps.is_integer() or row_steps < 0:
+            return False
+        if checkpoint_steps is not None and int(row_steps) != checkpoint_steps:
             return False
         metrics = np.asarray([float(row[name]) for name in PAIR_METRICS], dtype=float)
         if not np.isfinite(metrics).all():
@@ -128,8 +132,51 @@ def resume_row_is_complete(
             and trace.shape[1] > 0
             and np.isfinite(trace).all()
         )
-    except (OSError, TypeError, ValueError):
+    except (KeyError, OSError, OverflowError, TypeError, ValueError):
         return False
+
+
+def _normalize_diagnostic_scalar(name: str, value: Any) -> Any:
+    """Return a stable CSV-safe scalar without hiding missing diagnostics."""
+
+    if value is None:
+        return float("nan")
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (str, bool, int, float)):
+        return value
+    raise TypeError(f"diagnostic {name!r} must be a CSV-safe scalar")
+
+
+def _validated_diagnostics(
+    diagnostics: dict[str, Any],
+    *,
+    metric_names: set[str],
+) -> dict[str, Any]:
+    required = {"support_ready_step", "context_norm_mean", "context_norm_max"}
+    missing = required.difference(diagnostics)
+    if missing:
+        raise KeyError(
+            f"episode diagnostics are missing required keys: {sorted(missing)}"
+        )
+    reserved = {
+        "seed",
+        "task_id",
+        "split",
+        "inference_mode",
+        "checkpoint_steps",
+        "action_trace_path",
+    }
+    collisions = set(diagnostics).intersection(reserved | metric_names)
+    if collisions:
+        raise ValueError(
+            "episode diagnostics collide with raw row fields: "
+            f"{sorted(collisions)}"
+        )
+    return {
+        name: _normalize_diagnostic_scalar(name, value)
+        for name, value in diagnostics.items()
+    }
 
 
 def _provenance() -> dict[str, Any]:
@@ -258,21 +305,21 @@ def run_diagnostic(
                 action_trace = np.asarray(
                     diagnostics.pop("action_trace"), dtype=np.float32
                 )
+                normalized_diagnostics = _validated_diagnostics(
+                    diagnostics,
+                    metric_names=set(metrics),
+                )
                 trace_path = _trace_path(root, int(run["seed"]), task.task_id, mode)
                 np.save(trace_path, action_trace, allow_pickle=False)
                 row = {
+                    **metrics,
+                    **normalized_diagnostics,
                     "seed": int(run["seed"]),
                     "task_id": task.task_id,
                     "split": task.split,
                     "inference_mode": mode,
                     "checkpoint_steps": checkpoint_steps,
                     "action_trace_path": str(trace_path),
-                    **metrics,
-                    "support_ready_step": diagnostics.get(
-                        "support_ready_step", float("nan")
-                    ),
-                    "context_norm_mean": diagnostics.get("context_norm_mean", 0.0),
-                    "context_norm_max": diagnostics.get("context_norm_max", 0.0),
                 }
                 completed[key] = row
                 ordered_rows = [completed[key] for key in sorted(completed)]

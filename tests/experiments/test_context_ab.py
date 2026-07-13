@@ -510,6 +510,7 @@ def test_resume_skip_requires_matching_progress_row_and_valid_trace(tmp_path: Pa
         "seed": 42,
         "task_id": DIAGNOSTIC_TASK_IDS[0],
         "inference_mode": "zero_context",
+        "checkpoint_steps": 100,
         "action_trace_path": str(trace),
         **{metric: 1.0 for metric in PAIR_METRICS},
     }
@@ -518,6 +519,24 @@ def test_resume_skip_requires_matching_progress_row_and_valid_trace(tmp_path: Pa
     assert not cli.resume_row_is_complete(row)
     trace.write_bytes(b"not-npy")
     assert not cli.resume_row_is_complete(row)
+
+
+@pytest.mark.parametrize("bad_steps", [None, np.nan, np.inf, "not-a-step"])
+def test_resume_row_requires_valid_checkpoint_steps(tmp_path: Path, bad_steps):
+    cli = _load_context_cli()
+    trace = tmp_path / "trace.npy"
+    np.save(trace, np.ones((2, 1), dtype=np.float32))
+    row = {
+        "seed": 42,
+        "task_id": DIAGNOSTIC_TASK_IDS[0],
+        "inference_mode": "zero_context",
+        "action_trace_path": str(trace),
+        **{metric: 1.0 for metric in PAIR_METRICS},
+    }
+    if bad_steps is not None:
+        row["checkpoint_steps"] = bad_steps
+
+    assert not cli.resume_row_is_complete(row, checkpoint_steps=100)
 
 
 def test_resume_row_must_match_current_checkpoint_steps(tmp_path: Path):
@@ -539,6 +558,46 @@ def test_resume_row_must_match_current_checkpoint_steps(tmp_path: Path):
 
     assert cli.resume_row_is_complete(row, checkpoint_steps=100)
     assert not cli.resume_row_is_complete(row, checkpoint_steps=200)
+
+
+def test_validated_diagnostics_requires_all_core_diagnostics():
+    cli = _load_context_cli()
+    with pytest.raises(KeyError, match="support_ready_step"):
+        cli._validated_diagnostics(
+            {"context_norm_mean": 0.0, "context_norm_max": 0.0},
+            metric_names={"episode_return"},
+        )
+
+
+def test_validated_diagnostics_rejects_core_and_metric_collisions():
+    cli = _load_context_cli()
+    diagnostics = {
+        "support_ready_step": None,
+        "context_norm_mean": 0.0,
+        "context_norm_max": 0.0,
+        "seed": 999,
+        "episode_return": -1.0,
+    }
+    with pytest.raises(ValueError, match="episode_return.*seed"):
+        cli._validated_diagnostics(
+            diagnostics,
+            metric_names={"episode_return"},
+        )
+
+
+def test_validated_diagnostics_normalizes_none_and_numpy_scalars():
+    cli = _load_context_cli()
+    normalized = cli._validated_diagnostics(
+        {
+            "support_ready_step": None,
+            "context_norm_mean": np.float32(1.5),
+            "context_norm_max": 2.0,
+        },
+        metric_names=set(),
+    )
+    assert np.isnan(normalized["support_ready_step"])
+    assert normalized["context_norm_mean"] == pytest.approx(1.5)
+    assert isinstance(normalized["context_norm_mean"], float)
 
 
 def test_cli_core_fake_smoke_writes_exactly_32_rows(tmp_path: Path):
@@ -594,6 +653,7 @@ def test_cli_core_fake_smoke_writes_exactly_32_rows(tmp_path: Path):
                 "support_ready_step": 1.0 if value else np.nan,
                 "context_norm_mean": value,
                 "context_norm_max": value,
+                "context_variance": 4.2,
             },
         )
 
@@ -614,5 +674,12 @@ def test_cli_core_fake_smoke_writes_exactly_32_rows(tmp_path: Path):
 
     assert len(result) == 32
     assert unrelated.read_text(encoding="utf-8") == "unrelated"
-    assert len(pd.read_csv(tmp_path / "diagnostic" / "eval_raw.csv")) == 32
+    final_raw = pd.read_csv(tmp_path / "diagnostic" / "eval_raw.csv")
+    progress_raw = pd.read_csv(
+        tmp_path / ".diagnostic.work" / "progress.csv"
+    )
+    assert len(final_raw) == 32
+    assert result["context_variance"].eq(4.2).all()
+    assert final_raw["context_variance"].eq(4.2).all()
+    assert progress_raw["context_variance"].eq(4.2).all()
     assert len(list((tmp_path / "diagnostic" / "traces").glob("*.npy"))) == 32
