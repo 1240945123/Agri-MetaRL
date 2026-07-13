@@ -13,6 +13,7 @@ import pytest
 from gl_gym.experiments.ode_replay import ReplayOutcome, ReplayReport, VARIANT_NAMES
 
 
+IDENTITY = "a" * 64
 SCRIPT = Path(__file__).parents[2] / "experiments" / "scripts" / "replay_ode_failure.py"
 SPEC = importlib.util.spec_from_file_location("replay_ode_failure_cli", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
@@ -55,7 +56,7 @@ def _capsule(tmp_path: Path, formal_root: Path | None = None):
         path=capsule_path.resolve(),
         manifest={
             "failure_id": "failure-123",
-            "content_identity_sha256": "a" * 64,
+            "content_identity_sha256": IDENTITY,
             "context": {"formal_result_root": str(formal)},
             "formal_result_root": str(formal),
         },
@@ -103,7 +104,7 @@ def test_cli_loads_before_replay_and_writes_exactly_three_outputs(
     payload = json.loads((result / "replay_results.json").read_text(encoding="utf-8"))
     assert payload["schema_version"] == "ode-replay-report-v1"
     assert payload["failure_id"] == "failure-123"
-    assert payload["capsule_identity_sha256"] == "a" * 64
+    assert payload["capsule_identity_sha256"] == IDENTITY
     assert payload["classification"] == "solver_step_sensitivity"
     assert [item["variant"] for item in payload["outcomes"]] == list(VARIANT_NAMES)
     assert [item["configuration"]["substeps"] for item in payload["outcomes"]] == [
@@ -146,7 +147,10 @@ def test_cli_loads_before_replay_and_writes_exactly_three_outputs(
 def test_empty_success_npz_preserves_capsule_state_dimension(tmp_path):
     output = tmp_path / "report"
     cli.write_replay_report_atomic(
-        _report("state_or_model_domain_failure", successes=()), output, state_dim=2
+        _report("state_or_model_domain_failure", successes=()),
+        output,
+        state_dim=2,
+        capsule_identity=IDENTITY,
     )
     with np.load(output / "replay_states.npz", allow_pickle=False) as archive:
         assert archive["variant_names"].shape == (0,)
@@ -182,7 +186,9 @@ def test_markdown_contains_table_classification_and_exact_action(
     tmp_path, classification, expected
 ):
     output = tmp_path / classification
-    cli.write_replay_report_atomic(_report(classification), output, state_dim=2)
+    cli.write_replay_report_atomic(
+        _report(classification), output, state_dim=2, capsule_identity=IDENTITY
+    )
     summary = (output / "replay_summary.md").read_text(encoding="utf-8")
     assert "| Variant | Available | Success | Elapsed (s) | Exception |" in summary
     assert f"Classification: `{classification}`" in summary
@@ -229,7 +235,9 @@ def test_existing_final_output_is_never_overwritten(tmp_path, as_directory):
     output = tmp_path / "existing"
     output.mkdir() if as_directory else output.write_text("keep", encoding="utf-8")
     with pytest.raises(FileExistsError):
-        cli.write_replay_report_atomic(_report(), output, state_dim=2)
+        cli.write_replay_report_atomic(
+            _report(), output, state_dim=2, capsule_identity=IDENTITY
+        )
     assert (
         output.is_dir()
         if as_directory
@@ -252,6 +260,28 @@ def test_injected_replay_failure_leaves_no_final_output(tmp_path, monkeypatch):
     assert not output.exists()
 
 
+def test_report_failure_id_must_match_loaded_capsule_before_writing(
+    tmp_path, monkeypatch
+):
+    capsule = _capsule(tmp_path)
+    monkeypatch.setattr(cli, "load_failure_capsule", lambda _: capsule)
+    writer_called = False
+
+    def writer(*_args, **_kwargs):
+        nonlocal writer_called
+        writer_called = True
+
+    monkeypatch.setattr(cli, "write_replay_report_atomic", writer)
+    mismatched = ReplayReport(
+        "different-failure", _report().classification, _report().outcomes
+    )
+    output = tmp_path / "replay"
+    with pytest.raises(ValueError, match="failure_id.*capsule"):
+        cli.run_replay_cli(capsule.path, output, replay_loader=lambda _: mismatched)
+    assert writer_called is False
+    assert not output.exists()
+
+
 def test_atomic_validation_failure_cleans_temp_and_preserves_primary_exception(
     tmp_path, monkeypatch
 ):
@@ -262,9 +292,11 @@ def test_atomic_validation_failure_cleans_temp_and_preserves_primary_exception(
 
     monkeypatch.setattr(cli, "_validate_replay_directory", fail_validation)
     with pytest.raises(ValueError, match="primary validation failure"):
-        cli.write_replay_report_atomic(_report(), output, state_dim=2)
+        cli.write_replay_report_atomic(
+            _report(), output, state_dim=2, capsule_identity=IDENTITY
+        )
     assert not output.exists()
-    assert not list(tmp_path.glob(".report.*.tmp"))
+    assert not list(tmp_path.glob(".ode-replay-*"))
 
 
 def test_cleanup_error_does_not_mask_primary_exception(tmp_path, monkeypatch):
@@ -279,26 +311,167 @@ def test_cleanup_error_does_not_mask_primary_exception(tmp_path, monkeypatch):
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cleanup")),
     )
     with pytest.raises(ValueError, match="primary") as caught:
-        cli.write_replay_report_atomic(_report(), tmp_path / "report", state_dim=2)
+        cli.write_replay_report_atomic(
+            _report(),
+            tmp_path / "report",
+            state_dim=2,
+            capsule_identity=IDENTITY,
+        )
     assert any("cleanup" in note for note in getattr(caught.value, "__notes__", ()))
 
 
-def test_strict_validation_rejects_extra_and_symlink_entries(tmp_path):
+def test_temp_name_is_short_and_independent_of_long_output_basename(
+    tmp_path, monkeypatch
+):
+    output = tmp_path / ("r" * 180)
+    observed = None
+
+    def observe_and_fail(directory, **_kwargs):
+        nonlocal observed
+        observed = directory.name
+        raise ValueError("stop after observing temp")
+
+    monkeypatch.setattr(cli, "_validate_replay_directory", observe_and_fail)
+    with pytest.raises(ValueError, match="observing temp"):
+        cli.write_replay_report_atomic(
+            _report(), output, state_dim=2, capsule_identity=IDENTITY
+        )
+    assert observed is not None
+    assert observed.startswith(".ode-replay-")
+    assert output.name not in observed
+    assert len(observed) < 64
+
+
+def test_publication_race_preserves_competitor_contents(tmp_path, monkeypatch):
     output = tmp_path / "report"
-    cli.write_replay_report_atomic(_report(), output, state_dim=2)
+
+    def competitor(final):
+        final.mkdir(exist_ok=True)
+        (final / "competitor.txt").write_text("keep", encoding="utf-8")
+
+    monkeypatch.setattr(cli, "_publication_race_hook", competitor)
+    with pytest.raises(FileExistsError):
+        cli.write_replay_report_atomic(
+            _report(), output, state_dim=2, capsule_identity=IDENTITY
+        )
+    assert (output / "competitor.txt").read_text(encoding="utf-8") == "keep"
+    assert not list(tmp_path.glob(".ode-replay-*"))
+
+
+def test_strict_validation_rejects_extra_file_and_directory(tmp_path):
+    output = tmp_path / "report"
+    cli.write_replay_report_atomic(
+        _report(), output, state_dim=2, capsule_identity=IDENTITY
+    )
     (output / "extra.txt").write_text("unexpected", encoding="utf-8")
     with pytest.raises(ValueError, match="unexpected replay output entries"):
         cli._validate_replay_directory(output, state_dim=2)
     (output / "extra.txt").unlink()
+    (output / "extra-dir").mkdir()
+    with pytest.raises(ValueError, match="unexpected replay output entries"):
+        cli._validate_replay_directory(output, state_dim=2)
 
-    target = output / "target"
-    target.write_text("x", encoding="utf-8")
-    link = output / "replay_summary.md.link"
+
+def test_strict_validation_rejects_required_file_symlink(tmp_path):
+    output = tmp_path / "report"
+    cli.write_replay_report_atomic(
+        _report(), output, state_dim=2, capsule_identity=IDENTITY
+    )
+    summary = output / "replay_summary.md"
+    outside = tmp_path / "outside-summary.md"
+    summary.replace(outside)
     try:
-        link.symlink_to(target)
+        summary.symlink_to(outside)
     except OSError:
         pytest.skip("symlinks are unavailable on this platform")
-    with pytest.raises(
-        ValueError, match="unexpected replay output entries|regular non-symlink"
-    ):
+    with pytest.raises(ValueError, match="regular non-symlink"):
+        cli._validate_replay_directory(output, state_dim=2)
+
+
+def _mutate_top_extra(payload):
+    payload["extra"] = "forbidden"
+
+
+def _mutate_top_missing(payload):
+    del payload["generated_at_utc"]
+
+
+def _mutate_bad_timestamp(payload):
+    payload["generated_at_utc"] = "2026-07-13T12:00:00"
+
+
+def _mutate_empty_identity(payload):
+    payload["capsule_identity_sha256"] = ""
+
+
+def _mutate_empty_failure(payload):
+    payload["failure_id"] = ""
+
+
+def _mutate_bad_classification(payload):
+    payload["classification"] = "unsupported"
+
+
+def _mutate_outcome_extra(payload):
+    payload["outcomes"][0]["extra"] = 1
+
+
+def _mutate_outcome_missing(payload):
+    del payload["outcomes"][0]["warnings"]
+
+
+def _mutate_available_int(payload):
+    payload["outcomes"][0]["available"] = 1
+
+
+def _mutate_elapsed_int(payload):
+    payload["outcomes"][0]["elapsed_seconds"] = 1
+
+
+def _mutate_warnings_string(payload):
+    payload["outcomes"][0]["warnings"] = "not-a-list"
+
+
+def _mutate_success_exception(payload):
+    payload["outcomes"][3]["exception_type"] = "RuntimeError"
+
+
+def _mutate_unavailable_success(payload):
+    payload["outcomes"][3]["available"] = False
+
+
+def _mutate_failure_without_exception(payload):
+    payload["outcomes"][0]["exception_type"] = None
+    payload["outcomes"][0]["exception_message"] = None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _mutate_top_extra,
+        _mutate_top_missing,
+        _mutate_bad_timestamp,
+        _mutate_empty_identity,
+        _mutate_empty_failure,
+        _mutate_bad_classification,
+        _mutate_outcome_extra,
+        _mutate_outcome_missing,
+        _mutate_available_int,
+        _mutate_elapsed_int,
+        _mutate_warnings_string,
+        _mutate_success_exception,
+        _mutate_unavailable_success,
+        _mutate_failure_without_exception,
+    ],
+)
+def test_strict_json_validation_rejects_malformed_fields(tmp_path, mutate):
+    output = tmp_path / "report"
+    cli.write_replay_report_atomic(
+        _report(), output, state_dim=2, capsule_identity=IDENTITY
+    )
+    json_path = output / "replay_results.json"
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    mutate(payload)
+    json_path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
+    with pytest.raises(ValueError):
         cli._validate_replay_directory(output, state_dim=2)

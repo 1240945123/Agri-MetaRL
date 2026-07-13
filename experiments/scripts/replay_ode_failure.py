@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import errno
 import json
 import math
 import os
@@ -26,6 +27,28 @@ from gl_gym.experiments.ode_replay import (
 SCHEMA_VERSION = "ode-replay-report-v1"
 OUTPUT_NAMES = frozenset(
     {"replay_results.json", "replay_states.npz", "replay_summary.md"}
+)
+JSON_TOP_LEVEL_KEYS = frozenset(
+    {
+        "schema_version",
+        "generated_at_utc",
+        "failure_id",
+        "capsule_identity_sha256",
+        "classification",
+        "outcomes",
+    }
+)
+JSON_OUTCOME_KEYS = frozenset(
+    {
+        "variant",
+        "configuration",
+        "available",
+        "success",
+        "elapsed_seconds",
+        "warnings",
+        "exception_type",
+        "exception_message",
+    }
 )
 CLASSIFICATIONS = frozenset(
     {
@@ -300,8 +323,89 @@ def _is_regular_nonreparse(path: Path) -> bool:
     )
 
 
+def _is_directory_nonreparse(path: Path) -> bool:
+    metadata = path.lstat()
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return (
+        not path.is_symlink()
+        and not bool(attributes & reparse_flag)
+        and stat.S_ISDIR(metadata.st_mode)
+    )
+
+
+def _parse_aware_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError("generated replay timestamp must be non-empty text")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("generated replay timestamp must be ISO-8601") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("generated replay timestamp must be timezone-aware")
+    return parsed
+
+
+def _validate_json_payload(payload: Any) -> list[str]:
+    if not isinstance(payload, dict) or set(payload) != JSON_TOP_LEVEL_KEYS:
+        raise ValueError("replay report must have the exact top-level key set")
+    if payload["schema_version"] != SCHEMA_VERSION:
+        raise ValueError("invalid replay report schema")
+    if not isinstance(payload["failure_id"], str) or not payload["failure_id"]:
+        raise ValueError("replay failure_id must be non-empty text")
+    if (
+        not isinstance(payload["capsule_identity_sha256"], str)
+        or not payload["capsule_identity_sha256"]
+    ):
+        raise ValueError("replay capsule identity must be non-empty text")
+    if payload["classification"] not in CLASSIFICATIONS:
+        raise ValueError("invalid replay classification")
+    _parse_aware_timestamp(payload["generated_at_utc"])
+
+    outcomes = payload["outcomes"]
+    if not isinstance(outcomes, list) or len(outcomes) != len(VARIANT_NAMES):
+        raise ValueError("replay report must contain exactly six outcomes")
+    successful_names: list[str] = []
+    for expected_variant, item in zip(VARIANT_NAMES, outcomes):
+        if not isinstance(item, dict) or set(item) != JSON_OUTCOME_KEYS:
+            raise ValueError("replay outcome must have the exact key set")
+        if item["variant"] != expected_variant:
+            raise ValueError("invalid replay outcome order")
+        if item["configuration"] != VARIANT_CONFIGURATIONS[expected_variant]:
+            raise ValueError("invalid replay variant configuration")
+        available = item["available"]
+        success = item["success"]
+        if type(available) is not bool or type(success) is not bool:
+            raise ValueError("replay availability and success must be boolean")
+        elapsed = item["elapsed_seconds"]
+        if type(elapsed) is not float or not math.isfinite(elapsed) or elapsed < 0:
+            raise ValueError("replay elapsed time must be a finite non-negative float")
+        warning_messages = item["warnings"]
+        if not isinstance(warning_messages, list) or not all(
+            isinstance(message, str) for message in warning_messages
+        ):
+            raise ValueError("replay warnings must be a list of strings")
+        exception_type = item["exception_type"]
+        exception_message = item["exception_message"]
+        if exception_type is not None and not isinstance(exception_type, str):
+            raise ValueError("replay exception_type must be text or null")
+        if exception_message is not None and not isinstance(exception_message, str):
+            raise ValueError("replay exception_message must be text or null")
+        if success:
+            if not available:
+                raise ValueError("successful replay outcomes must be available")
+            if exception_type is not None or exception_message is not None:
+                raise ValueError(
+                    "successful replay outcomes cannot contain an exception"
+                )
+            successful_names.append(expected_variant)
+        elif exception_type is None or exception_message is None:
+            raise ValueError("failed replay outcomes must contain exception metadata")
+    return successful_names
+
+
 def _validate_replay_directory(directory: Path, *, state_dim: int) -> None:
-    if directory.is_symlink() or not directory.is_dir():
+    if not directory.exists() or not _is_directory_nonreparse(directory):
         raise ValueError("replay output must be a regular directory")
     entries = list(directory.iterdir())
     names = {entry.name for entry in entries}
@@ -324,26 +428,7 @@ def _validate_replay_directory(directory: Path, *, state_dim: int) -> None:
         )
     except (UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid replay_results.json: {error}") from error
-    if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError("invalid replay report schema")
-    outcomes = payload.get("outcomes")
-    if not isinstance(outcomes, list) or [
-        item.get("variant") for item in outcomes
-    ] != list(VARIANT_NAMES):
-        raise ValueError("invalid replay outcome order")
-    successful_names: list[str] = []
-    for item in outcomes:
-        elapsed = item.get("elapsed_seconds")
-        if (
-            isinstance(elapsed, bool)
-            or not isinstance(elapsed, (int, float))
-            or not math.isfinite(elapsed)
-        ):
-            raise ValueError("invalid replay elapsed time")
-        if item.get("configuration") != VARIANT_CONFIGURATIONS[item["variant"]]:
-            raise ValueError("invalid replay variant configuration")
-        if item.get("success") is True:
-            successful_names.append(item["variant"])
+    successful_names = _validate_json_payload(payload)
 
     try:
         with np.load(directory / "replay_states.npz", allow_pickle=False) as archive:
@@ -370,6 +455,57 @@ def _validate_replay_directory(directory: Path, *, state_dim: int) -> None:
         raise ValueError("replay final states contain non-finite values")
 
 
+def _publication_race_hook(_final: Path) -> None:
+    """Test seam immediately before the no-clobber publication operation."""
+
+
+def _remove_owned_empty_reservation(path: Path, identity: tuple[int, int]) -> None:
+    try:
+        metadata = path.lstat()
+        if (metadata.st_dev, metadata.st_ino) != identity or any(path.iterdir()):
+            return
+        path.rmdir()
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return
+
+
+def _publish_directory_no_clobber(temporary: Path, output: Path) -> None:
+    """Atomically publish a directory without replacing a competing path."""
+    if os.name == "nt":
+        _publication_race_hook(output)
+        try:
+            temporary.rename(output)
+        except OSError as error:
+            if output.exists() or output.is_symlink():
+                raise FileExistsError(
+                    f"replay output already exists: {output}"
+                ) from error
+            raise
+        return
+
+    try:
+        output.mkdir(exist_ok=False)
+    except FileExistsError:
+        raise FileExistsError(f"replay output already exists: {output}") from None
+    metadata = output.lstat()
+    identity = (metadata.st_dev, metadata.st_ino)
+    published = False
+    try:
+        _publication_race_hook(output)
+        current = output.lstat()
+        if (current.st_dev, current.st_ino) != identity:
+            raise FileExistsError(f"replay output reservation changed: {output}")
+        temporary.rename(output)
+        published = True
+    except OSError as error:
+        if error.errno in (errno.EEXIST, errno.ENOTEMPTY) or output.exists():
+            raise FileExistsError(f"replay output already exists: {output}") from error
+        raise
+    finally:
+        if not published:
+            _remove_owned_empty_reservation(output, identity)
+
+
 def write_replay_report_atomic(
     report: ReplayReport,
     output: str | Path,
@@ -382,10 +518,10 @@ def write_replay_report_atomic(
     if output_path.exists() or output_path.is_symlink():
         raise FileExistsError(f"replay output already exists: {output_path}")
     resolved_dim = _validate_report(report, state_dim)
-    if capsule_identity is not None and not isinstance(capsule_identity, str):
-        raise ValueError("capsule identity must be text or None")
+    if not isinstance(capsule_identity, str) or not capsule_identity:
+        raise ValueError("capsule identity must be non-empty text")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output_path.parent / f".{output_path.name}.{uuid4().hex[:8]}.tmp"
+    temporary = output_path.parent / f".ode-replay-{uuid4().hex[:12]}"
     temporary.mkdir()
     published = False
     try:
@@ -396,9 +532,7 @@ def write_replay_report_atomic(
             capsule_identity=capsule_identity,
         )
         _validate_replay_directory(temporary, state_dim=resolved_dim)
-        if output_path.exists() or output_path.is_symlink():
-            raise FileExistsError(f"replay output already exists: {output_path}")
-        temporary.rename(output_path)
+        _publish_directory_no_clobber(temporary, output_path)
         published = True
         return output_path
     except BaseException as primary:
@@ -430,6 +564,8 @@ def run_replay_cli(
     if output.exists() or output.is_symlink():
         raise FileExistsError(f"replay output already exists: {output}")
     report = replay_loader(capsule)
+    if report.failure_id != capsule.manifest["failure_id"]:
+        raise ValueError("replay report failure_id does not match loaded capsule")
     x0 = np.asarray(capsule.failure_inputs["x0"])
     return write_replay_report_atomic(
         report,
