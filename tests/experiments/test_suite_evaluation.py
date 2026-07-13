@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import gl_gym.experiments.suite_evaluation as suite_evaluation
 from gl_gym.experiments.suite_schema import create_default_suite_config, write_suite_manifest
 from gl_gym.experiments.suite_evaluation import (
     EvaluationMetricRow,
@@ -482,6 +483,41 @@ def test_validate_completed_run_paths_ignores_dry_run_missing_artifacts(tmp_path
     )
 
     validate_completed_run_paths(run)
+
+
+def test_load_task_env_closes_base_env_when_vecnormalize_load_fails(
+    tmp_path: Path, monkeypatch
+):
+    import gl_gym.RL.utils as rl_utils
+    import gl_gym.common.utils as common_utils
+    import gl_gym.experiments.suite_tasks as suite_tasks
+    from stable_baselines3.common.vec_env import VecNormalize
+
+    class BaseEnv:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    env = BaseEnv()
+    vec_path = tmp_path / "vec.pkl"
+    vec_path.write_bytes(b"vec")
+    monkeypatch.setattr(common_utils, "load_env_params", lambda *args: ({}, {}))
+    monkeypatch.setattr(
+        suite_tasks, "apply_task_to_env_params", lambda base, specific, task: (base, specific)
+    )
+    monkeypatch.setattr(rl_utils, "make_vec_env", lambda *args, **kwargs: env)
+
+    def fail_load(path, base_env):
+        assert base_env is env
+        raise RuntimeError("invalid vecnormalize")
+
+    monkeypatch.setattr(VecNormalize, "load", fail_load)
+    with pytest.raises(RuntimeError, match="invalid vecnormalize"):
+        suite_evaluation.load_task_env(
+            SimpleNamespace(env_id="Fake"), SimpleNamespace(), vec_path
+        )
+    assert env.closed
 
 
 def test_evaluate_suite_filters_tasks_for_smoke_runs():

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import platform
 from pathlib import Path
 import shutil
@@ -36,6 +37,12 @@ from gl_gym.experiments.suite_schema import load_suite_manifest
 
 
 APPROVED_SEEDS = (42, 123)
+HASH_FIELDS = (
+    "model_sha256",
+    "vecnormalize_sha256",
+    "source_manifest_sha256",
+    "source_tasks_sha256",
+)
 DEFAULT_RESULT_ROOT = Path(
     "artifacts/results/AgriControl_C_2026-07-10-v3-context-ab"
 )
@@ -79,6 +86,8 @@ def build_diagnostic_runs(
                 "seed": seed,
                 "model_path": model_path.resolve(),
                 "vecnormalize_path": vecnormalize_path.resolve(),
+                "model_sha256": sha256_file(model_path),
+                "vecnormalize_sha256": sha256_file(vecnormalize_path),
             }
         )
     return runs
@@ -92,17 +101,42 @@ def validate_result_root(
 
     resolved = Path(result_root).resolve()
     source = Path(source_suite_result_root).resolve()
-    if resolved == source:
+    work = resolved.parent / f".{resolved.name}.work"
+    roots_overlap = (
+        resolved == source
+        or resolved in source.parents
+        or source in resolved.parents
+        or work == source
+        or work in source.parents
+        or source in work.parents
+    )
+    staging_collision = any(
+        candidate.parent == resolved.parent
+        and candidate.name.startswith(f".{resolved.name}.staging-")
+        for candidate in (source, *source.parents)
+    )
+    if roots_overlap or staging_collision:
         raise ValueError(
             "diagnostic result root must differ from the formal source suite result root"
         )
     return resolved
 
 
+def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
+    """Hash a file with bounded memory use."""
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def resume_row_is_complete(
     row: dict[str, Any] | pd.Series,
     *,
     checkpoint_steps: int | None = None,
+    expected_hashes: dict[str, str] | None = None,
 ) -> bool:
     """Return whether a progress row has usable evidence and a valid action trace."""
 
@@ -112,6 +146,11 @@ def resume_row_is_complete(
         "inference_mode",
         "checkpoint_steps",
         "action_trace_path",
+        "split",
+        "support_ready_step",
+        "context_norm_mean",
+        "context_norm_max",
+        *HASH_FIELDS,
         *PAIR_METRICS,
     }
     if not required.issubset(row.keys()):
@@ -122,15 +161,46 @@ def resume_row_is_complete(
             return False
         if checkpoint_steps is not None and int(row_steps) != checkpoint_steps:
             return False
+        row_hashes = {name: str(row[name]) for name in HASH_FIELDS}
+        if any(
+            len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
+            for value in row_hashes.values()
+        ):
+            return False
+        if expected_hashes is not None and any(
+            row_hashes[name] != expected_hashes[name] for name in HASH_FIELDS
+        ):
+            return False
         metrics = np.asarray([float(row[name]) for name in PAIR_METRICS], dtype=float)
         if not np.isfinite(metrics).all():
             return False
+        context = np.asarray(
+            [float(row["context_norm_mean"]), float(row["context_norm_max"])],
+            dtype=float,
+        )
+        if not np.isfinite(context).all():
+            return False
         trace = np.load(Path(str(row["action_trace_path"])), allow_pickle=False)
-        return bool(
+        trace_is_valid = bool(
             trace.ndim == 2
             and trace.shape[0] > 0
             and trace.shape[1] > 0
             and np.isfinite(trace).all()
+        )
+        if not trace_is_valid:
+            return False
+        readiness = float(row["support_ready_step"])
+        if str(row["inference_mode"]) == "online_context":
+            return bool(
+                np.isfinite(readiness)
+                and readiness.is_integer()
+                and 1 <= readiness < trace.shape[0]
+            )
+        if str(row["inference_mode"]) != "zero_context":
+            return False
+        return bool(
+            not np.isfinite(readiness)
+            or (readiness.is_integer() and 1 <= readiness < trace.shape[0])
         )
     except (KeyError, OSError, OverflowError, TypeError, ValueError):
         return False
@@ -200,6 +270,10 @@ def _progress_path(result_root: Path) -> Path:
     return result_root.parent / f".{result_root.name}.work" / "progress.csv"
 
 
+def _work_root(result_root: Path) -> Path:
+    return _progress_path(result_root).parent
+
+
 def _load_progress(path: Path, resume: bool) -> list[dict[str, Any]]:
     if not resume:
         if path.parent.exists():
@@ -243,14 +317,24 @@ def run_diagnostic(
     """Execute all 32 episodes with injectable model, environment, and runner hooks."""
 
     root = validate_result_root(result_root, suite.result_root)
+    if root.exists() and not root.is_dir():
+        raise ValueError(f"diagnostic result root must be a directory: {root}")
     selected = select_diagnostic_tasks(tasks)
     task_records = [task_from_row(row) for row in selected.itertuples(index=False)]
     progress_path = _progress_path(root)
     progress_rows = _load_progress(progress_path, resume)
-    if not resume and root.exists():
-        if not root.is_dir():
-            raise ValueError(f"diagnostic result root must be a directory: {root}")
-        shutil.rmtree(root / "traces", ignore_errors=True)
+    source_hashes = {
+        "source_manifest_sha256": sha256_file(source_manifest),
+        "source_tasks_sha256": sha256_file(source_tasks_csv),
+    }
+    evidence_by_seed = {
+        int(run["seed"]): {
+            "model_sha256": str(run["model_sha256"]),
+            "vecnormalize_sha256": str(run["vecnormalize_sha256"]),
+            **source_hashes,
+        }
+        for run in runs
+    }
     target_keys = {
         (int(run["seed"]), task_id, mode)
         for run in runs
@@ -263,7 +347,9 @@ def run_diagnostic(
             row_key = _key(row)
         except (KeyError, TypeError, ValueError):
             continue
-        if row_key in target_keys and resume_row_is_complete(row):
+        if row_key in target_keys and resume_row_is_complete(
+            row, expected_hashes=evidence_by_seed.get(row_key[0])
+        ):
             completed[row_key] = row
 
     load_model = model_loader or (
@@ -271,7 +357,8 @@ def run_diagnostic(
             str(path), device=selected_device
         )
     )
-    root.joinpath("traces").mkdir(parents=True, exist_ok=True)
+    work_root = _work_root(root)
+    work_root.joinpath("traces").mkdir(parents=True, exist_ok=True)
     checkpoint_records: list[dict[str, Any]] = []
     for run in runs:
         model = load_model(Path(run["model_path"]), device)
@@ -282,13 +369,17 @@ def run_diagnostic(
                 "model_path": str(Path(run["model_path"]).resolve()),
                 "vecnormalize_path": str(Path(run["vecnormalize_path"]).resolve()),
                 "checkpoint_steps": checkpoint_steps,
+                "model_sha256": str(run["model_sha256"]),
+                "vecnormalize_sha256": str(run["vecnormalize_sha256"]),
             }
         )
         for task in task_records:
             for mode in MODES:
                 key = (int(run["seed"]), task.task_id, mode)
                 if key in completed and resume_row_is_complete(
-                    completed[key], checkpoint_steps=checkpoint_steps
+                    completed[key],
+                    checkpoint_steps=checkpoint_steps,
+                    expected_hashes=evidence_by_seed[int(run["seed"])],
                 ):
                     continue
                 env = env_loader(suite, task, Path(run["vecnormalize_path"]))
@@ -309,7 +400,9 @@ def run_diagnostic(
                     diagnostics,
                     metric_names=set(metrics),
                 )
-                trace_path = _trace_path(root, int(run["seed"]), task.task_id, mode)
+                trace_path = _trace_path(
+                    work_root, int(run["seed"]), task.task_id, mode
+                )
                 np.save(trace_path, action_trace, allow_pickle=False)
                 row = {
                     **metrics,
@@ -320,6 +413,7 @@ def run_diagnostic(
                     "inference_mode": mode,
                     "checkpoint_steps": checkpoint_steps,
                     "action_trace_path": str(trace_path),
+                    **evidence_by_seed[int(run["seed"])],
                 }
                 completed[key] = row
                 ordered_rows = [completed[key] for key in sorted(completed)]
@@ -336,7 +430,9 @@ def run_diagnostic(
     provenance = provenance_loader()
     manifest = {
         "source_manifest": str(Path(source_manifest).resolve()),
+        "source_manifest_sha256": source_hashes["source_manifest_sha256"],
         "source_tasks_csv": str(Path(source_tasks_csv).resolve()),
+        "source_tasks_sha256": source_hashes["source_tasks_sha256"],
         "source_suite_id": str(suite.suite_id),
         "source_suite_result_root": str(Path(suite.result_root).resolve()),
         "result_root": str(root),
@@ -351,7 +447,7 @@ def run_diagnostic(
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
     }
     write_context_ab_artifacts(raw, root, manifest)
-    return raw
+    return pd.read_csv(root / "eval_raw.csv")
 
 
 def build_parser() -> argparse.ArgumentParser:

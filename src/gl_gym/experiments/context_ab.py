@@ -410,8 +410,32 @@ def write_context_ab_artifacts(
                 raise ValueError(f"diagnostic result root must be a directory: {root}")
             shutil.copytree(root, staging, dirs_exist_ok=True)
 
+        staging_traces = staging / "traces"
+        shutil.rmtree(staging_traces, ignore_errors=True)
+        staging_traces.mkdir(parents=True)
+        published_raw = raw.copy()
+        final_trace_paths: dict[tuple[int, str, str], Path] = {}
+        for index, row in raw.iterrows():
+            filename = (
+                f"seed{int(row['seed'])}__{row['task_id']}__"
+                f"{row['inference_mode']}.npy"
+            )
+            source_trace = Path(str(row["action_trace_path"]))
+            shutil.copy2(source_trace, staging_traces / filename)
+            final_trace = (root / "traces" / filename).resolve()
+            published_raw.at[index, "action_trace_path"] = str(final_trace)
+            final_trace_paths[
+                (int(row["seed"]), str(row["task_id"]), str(row["inference_mode"]))
+            ] = final_trace
+        for mode in MODES:
+            column = f"action_trace_path_{'zero' if mode == MODES[0] else 'online'}"
+            paired[column] = [
+                str(final_trace_paths[(int(row.seed), str(row.task_id), mode)])
+                for row in paired.itertuples(index=False)
+            ]
+
         staging_paths = {name: staging / path.name for name, path in paths.items()}
-        raw.to_csv(staging_paths["eval_raw"], index=False)
+        published_raw.to_csv(staging_paths["eval_raw"], index=False)
         paired.to_csv(staging_paths["paired_deltas"], index=False)
         summary.to_csv(staging_paths["split_summary"], index=False)
         _write_strict_json(staging_paths["diagnostic_manifest"], manifest)

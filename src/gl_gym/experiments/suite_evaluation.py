@@ -87,7 +87,11 @@ def load_task_env(suite: Any, task: EvaluationTaskRecord, vecnormalize_path: str
     if not vec_path.is_file():
         env.close()
         raise FileNotFoundError(f"VecNormalize statistics do not exist: {vec_path}")
-    env = VecNormalize.load(str(vec_path), env)
+    try:
+        env = VecNormalize.load(str(vec_path), env)
+    except BaseException:
+        env.close()
+        raise
     env.training = False
     env.norm_reward = False
     return env

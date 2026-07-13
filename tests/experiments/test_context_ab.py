@@ -366,6 +366,9 @@ def test_write_context_ab_artifacts_writes_complete_schema_and_strict_json(tmp_p
     paired = pd.read_csv(root / "paired_deltas.csv")
     summary = pd.read_csv(root / "split_summary.csv")
     assert len(written_raw) == 32
+    published_traces = written_raw["action_trace_path"].map(Path)
+    assert published_traces.map(lambda path: path.parent == root / "traces").all()
+    assert published_traces.map(Path.is_file).all()
     assert len(paired) == 16
     assert set(["inference_mode", "split", *PAIR_METRICS]).issubset(summary.columns)
     assert json.loads((root / "diagnostic_manifest.json").read_text(encoding="utf-8"))["seeds"] == [42, 123]
@@ -403,7 +406,7 @@ def test_write_context_ab_artifacts_preserves_complete_root_on_publish_failure(t
     trace = root / "traces" / "keep.npy"
     trace.parent.mkdir()
     np.save(trace, np.ones((2, 1)))
-    before = {name: (root / name).read_bytes() for name in artifact_names}
+    before = _tree_bytes(root)
     real_replace = context_ab.os.replace
     failed = False
 
@@ -419,8 +422,7 @@ def test_write_context_ab_artifacts_preserves_complete_root_on_publish_failure(t
     with pytest.raises(OSError, match="injected publish failure"):
         write_context_ab_artifacts(raw, root, {"revision": 2})
 
-    assert {name: (root / name).read_bytes() for name in artifact_names} == before
-    assert trace.exists()
+    assert _tree_bytes(root) == before
     assert not list(tmp_path.glob(".diagnostic.staging-*"))
     assert not list(tmp_path.glob(".diagnostic.backup-*"))
 
@@ -465,6 +467,67 @@ def _write_diagnostic_checkpoints(model_root: Path, seeds=(42, 123)) -> None:
         vec.write_bytes(b"vec")
 
 
+def _fake_cli_case(tmp_path: Path):
+    cli = _load_context_cli()
+    model_root = tmp_path / "models"
+    _write_diagnostic_checkpoints(model_root)
+    source_manifest = tmp_path / "source" / "suite_manifest.json"
+    source_tasks_csv = tmp_path / "source" / "eval_tasks.csv"
+    source_manifest.parent.mkdir(parents=True)
+    source_manifest.write_text("{}", encoding="utf-8")
+    source_tasks_csv.write_text("task_id\n", encoding="utf-8")
+    suite = SimpleNamespace(
+        suite_id="source", result_root=str(tmp_path / "source"), env_id="Fake"
+    )
+    tasks = pd.DataFrame(
+        [
+            {
+                "suite_id": "source", "task_id": task_id,
+                "split": task_id.split("_", 1)[0], "weather_year": 2010,
+                "start_day": 59, "uncertainty_scale": 0.0,
+                "economic_scenario": "standard",
+                "climate_constraint_scenario": "standard",
+            }
+            for task_id in DIAGNOSTIC_TASK_IDS
+        ]
+    )
+
+    class Model:
+        num_timesteps = 196608
+
+    class Env:
+        def close(self):
+            pass
+
+    def successful_episode(model, env, *, inference_mode, return_diagnostics):
+        value = float(inference_mode == "online_context")
+        return (
+            {metric: 100.0 if metric == "episode_return" else 1.0 for metric in PAIR_METRICS},
+            {
+                "action_trace": np.full((3, 1), value, dtype=np.float32),
+                "support_ready_step": 1.0 if value else np.nan,
+                "context_norm_mean": value,
+                "context_norm_max": value,
+            },
+        )
+
+    return SimpleNamespace(
+        cli=cli, suite=suite, tasks=tasks,
+        runs=cli.build_diagnostic_runs(model_root, [42, 123]),
+        source_manifest=source_manifest, source_tasks_csv=source_tasks_csv,
+        model_loader=lambda path, device: Model(),
+        env_loader=lambda suite, task, path: Env(),
+        episode_runner=successful_episode,
+    )
+
+
+def _tree_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in root.rglob("*") if path.is_file()
+    }
+
+
 def test_build_diagnostic_runs_uses_exact_last_checkpoint_paths(tmp_path: Path):
     cli = _load_context_cli()
     _write_diagnostic_checkpoints(tmp_path)
@@ -477,6 +540,17 @@ def test_build_diagnostic_runs_uses_exact_last_checkpoint_paths(tmp_path: Path):
     assert str(runs[1]["vecnormalize_path"]).replace("\\", "/").endswith(
         "agri_metarl/deterministic/envs/agri_metarl_seed123/last_vecnormalize.pkl"
     )
+    assert runs[0]["model_sha256"] == cli.sha256_file(runs[0]["model_path"])
+    assert runs[0]["vecnormalize_sha256"] == cli.sha256_file(runs[0]["vecnormalize_path"])
+
+
+def test_sha256_file_detects_same_path_replacement(tmp_path: Path):
+    cli = _load_context_cli()
+    path = tmp_path / "checkpoint.zip"
+    path.write_bytes(b"first")
+    first = cli.sha256_file(path, chunk_size=2)
+    path.write_bytes(b"second")
+    assert cli.sha256_file(path, chunk_size=2) != first
 
 
 @pytest.mark.parametrize("seeds", [[42], [123, 42], [42, 123, 456]])
@@ -502,6 +576,28 @@ def test_validate_result_root_rejects_source_suite_collision(tmp_path: Path):
         cli.validate_result_root(tmp_path / "suite", tmp_path / "suite" / ".." / "suite")
 
 
+@pytest.mark.parametrize(
+    "relation", ["ancestor", "descendant", "work", "staging", "staging_descendant"]
+)
+def test_validate_result_root_rejects_source_tree_and_derived_collisions(
+    tmp_path: Path, relation: str
+):
+    cli = _load_context_cli()
+    result = tmp_path / "diagnostic"
+    if relation == "ancestor":
+        source = result / "formal"
+    elif relation == "descendant":
+        source = tmp_path
+    elif relation == "work":
+        source = tmp_path / ".diagnostic.work"
+    elif relation == "staging":
+        source = tmp_path / ".diagnostic.staging-existing"
+    else:
+        source = tmp_path / ".diagnostic.staging-existing" / "formal"
+    with pytest.raises(ValueError, match="diagnostic result root"):
+        cli.validate_result_root(result, source)
+
+
 def test_resume_skip_requires_matching_progress_row_and_valid_trace(tmp_path: Path):
     cli = _load_context_cli()
     trace = tmp_path / "trace.npy"
@@ -509,9 +605,17 @@ def test_resume_skip_requires_matching_progress_row_and_valid_trace(tmp_path: Pa
     row = {
         "seed": 42,
         "task_id": DIAGNOSTIC_TASK_IDS[0],
+        "split": "fixed",
         "inference_mode": "zero_context",
         "checkpoint_steps": 100,
         "action_trace_path": str(trace),
+        "support_ready_step": np.nan,
+        "context_norm_mean": 0.0,
+        "context_norm_max": 0.0,
+        "model_sha256": "a" * 64,
+        "vecnormalize_sha256": "b" * 64,
+        "source_manifest_sha256": "c" * 64,
+        "source_tasks_sha256": "d" * 64,
         **{metric: 1.0 for metric in PAIR_METRICS},
     }
     assert cli.resume_row_is_complete(row)
@@ -553,11 +657,97 @@ def test_resume_row_must_match_current_checkpoint_steps(tmp_path: Path):
         "support_ready_step": np.nan,
         "context_norm_mean": 0.0,
         "context_norm_max": 0.0,
+        "model_sha256": "a" * 64,
+        "vecnormalize_sha256": "b" * 64,
+        "source_manifest_sha256": "c" * 64,
+        "source_tasks_sha256": "d" * 64,
         **{metric: 1.0 for metric in PAIR_METRICS},
     }
 
     assert cli.resume_row_is_complete(row, checkpoint_steps=100)
     assert not cli.resume_row_is_complete(row, checkpoint_steps=200)
+
+
+def test_resume_online_row_requires_valid_readiness_and_context_diagnostics(tmp_path: Path):
+    cli = _load_context_cli()
+    trace = tmp_path / "trace.npy"
+    np.save(trace, np.ones((3, 1), dtype=np.float32))
+    base = {
+        "seed": 42,
+        "task_id": DIAGNOSTIC_TASK_IDS[0],
+        "split": "fixed",
+        "inference_mode": "online_context",
+        "checkpoint_steps": 100,
+        "action_trace_path": str(trace),
+        "support_ready_step": 1.0,
+        "context_norm_mean": 1.0,
+        "context_norm_max": 2.0,
+        "model_sha256": "a" * 64,
+        "vecnormalize_sha256": "b" * 64,
+        "source_manifest_sha256": "c" * 64,
+        "source_tasks_sha256": "d" * 64,
+        **{metric: 1.0 for metric in PAIR_METRICS},
+    }
+    assert cli.resume_row_is_complete(base)
+    for name, bad in (("support_ready_step", np.nan), ("support_ready_step", 3),
+                      ("context_norm_mean", np.nan), ("context_norm_max", np.inf)):
+        row = dict(base)
+        row[name] = bad
+        assert not cli.resume_row_is_complete(row)
+
+
+def test_resume_row_rejects_replaced_same_step_inputs(tmp_path: Path):
+    cli = _load_context_cli()
+    trace = tmp_path / "trace.npy"
+    np.save(trace, np.ones((3, 1), dtype=np.float32))
+    expected = {
+        "model_sha256": "a" * 64,
+        "vecnormalize_sha256": "b" * 64,
+        "source_manifest_sha256": "c" * 64,
+        "source_tasks_sha256": "d" * 64,
+    }
+    row = {
+        "seed": 42, "task_id": DIAGNOSTIC_TASK_IDS[0],
+        "split": "fixed",
+        "inference_mode": "zero_context", "checkpoint_steps": 100,
+        "action_trace_path": str(trace), "support_ready_step": np.nan,
+        "context_norm_mean": 0.0, "context_norm_max": 0.0,
+        **expected, **{metric: 1.0 for metric in PAIR_METRICS},
+    }
+    assert cli.resume_row_is_complete(row, checkpoint_steps=100, expected_hashes=expected)
+    for name in expected:
+        changed = dict(expected)
+        changed[name] = "f" * 64
+        assert not cli.resume_row_is_complete(
+            row, checkpoint_steps=100, expected_hashes=changed
+        )
+
+
+def test_resume_hashes_detect_replaced_model_vec_and_changed_tasks(tmp_path: Path):
+    cli = _load_context_cli()
+    paths = {
+        "model_sha256": tmp_path / "model.zip",
+        "vecnormalize_sha256": tmp_path / "vec.pkl",
+        "source_manifest_sha256": tmp_path / "manifest.json",
+        "source_tasks_sha256": tmp_path / "tasks.csv",
+    }
+    for path in paths.values():
+        path.write_bytes(b"original")
+    expected = {name: cli.sha256_file(path) for name, path in paths.items()}
+    trace = tmp_path / "trace.npy"
+    np.save(trace, np.ones((3, 1), dtype=np.float32))
+    row = {
+        "seed": 42, "task_id": DIAGNOSTIC_TASK_IDS[0], "split": "fixed",
+        "inference_mode": "zero_context", "checkpoint_steps": 100,
+        "action_trace_path": str(trace), "support_ready_step": np.nan,
+        "context_norm_mean": 0.0, "context_norm_max": 0.0,
+        **expected, **{metric: 1.0 for metric in PAIR_METRICS},
+    }
+    for name, path in paths.items():
+        path.write_bytes(f"replaced-{name}".encode())
+        changed = dict(expected)
+        changed[name] = cli.sha256_file(path)
+        assert not cli.resume_row_is_complete(row, expected_hashes=changed)
 
 
 def test_validated_diagnostics_requires_all_core_diagnostics():
@@ -608,6 +798,11 @@ def test_cli_core_fake_smoke_writes_exactly_32_rows(tmp_path: Path):
     np.save(stale_trace, np.zeros((1, 1), dtype=np.float32))
     unrelated = tmp_path / "diagnostic" / "keep-me.txt"
     unrelated.write_text("unrelated", encoding="utf-8")
+    source_manifest = tmp_path / "source" / "suite_manifest.json"
+    source_tasks_csv = tmp_path / "source" / "eval_tasks.csv"
+    source_manifest.parent.mkdir(parents=True)
+    source_manifest.write_text("{}", encoding="utf-8")
+    source_tasks_csv.write_text("task_id\n", encoding="utf-8")
     suite = SimpleNamespace(suite_id="source", result_root=str(tmp_path / "source"), env_id="Fake")
     split_by_task = {task_id: task_id.split("_", 1)[0] for task_id in DIAGNOSTIC_TASK_IDS}
     tasks = pd.DataFrame(
@@ -662,8 +857,8 @@ def test_cli_core_fake_smoke_writes_exactly_32_rows(tmp_path: Path):
         tasks=tasks,
         runs=cli.build_diagnostic_runs(tmp_path / "models", [42, 123]),
         result_root=tmp_path / "diagnostic",
-        source_manifest=tmp_path / "source" / "suite_manifest.json",
-        source_tasks_csv=tmp_path / "source" / "eval_tasks.csv",
+        source_manifest=source_manifest,
+        source_tasks_csv=source_tasks_csv,
         device="cpu",
         resume=False,
         model_loader=lambda path, device: Model(),
@@ -682,4 +877,63 @@ def test_cli_core_fake_smoke_writes_exactly_32_rows(tmp_path: Path):
     assert result["context_variance"].eq(4.2).all()
     assert final_raw["context_variance"].eq(4.2).all()
     assert progress_raw["context_variance"].eq(4.2).all()
+    for name in ("model_sha256", "vecnormalize_sha256", "source_manifest_sha256", "source_tasks_sha256"):
+        assert progress_raw[name].str.fullmatch(r"[0-9a-f]{64}").all()
+    manifest = json.loads(
+        (tmp_path / "diagnostic" / "diagnostic_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["source_manifest_sha256"] == cli.sha256_file(source_manifest)
+    assert manifest["source_tasks_sha256"] == cli.sha256_file(source_tasks_csv)
     assert len(list((tmp_path / "diagnostic" / "traces").glob("*.npy"))) == 32
+
+
+@pytest.mark.parametrize("failure_stage", ["mid_run", "final_publish"])
+def test_diagnostic_failure_preserves_published_root_and_resumable_work(
+    tmp_path: Path, monkeypatch, failure_stage: str
+):
+    case = _fake_cli_case(tmp_path)
+    root = tmp_path / "diagnostic"
+    (root / "traces").mkdir(parents=True)
+    (root / "published.txt").write_bytes(b"published-before")
+    np.save(root / "traces" / "old.npy", np.ones((2, 1)))
+    before = _tree_bytes(root)
+    episode_runner = case.episode_runner
+    if failure_stage == "mid_run":
+        calls = 0
+
+        def fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("injected mid-run failure")
+            return episode_runner(*args, **kwargs)
+
+        selected_runner = fail_second
+        expected = "mid-run"
+    else:
+        selected_runner = episode_runner
+        real_replace = context_ab.os.replace
+
+        def fail_publish(source, destination):
+            if Path(source).name.startswith(".diagnostic.staging-"):
+                raise OSError("injected final publish failure")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(context_ab.os, "replace", fail_publish)
+        expected = "final publish"
+
+    with pytest.raises((RuntimeError, OSError), match=expected):
+        case.cli.run_diagnostic(
+            suite=case.suite, tasks=case.tasks, runs=case.runs,
+            result_root=root, source_manifest=case.source_manifest,
+            source_tasks_csv=case.source_tasks_csv, device="cpu", resume=False,
+            model_loader=case.model_loader, env_loader=case.env_loader,
+            episode_runner=selected_runner,
+            provenance_loader=lambda: {"git_commit": "abc", "dirty": False},
+        )
+
+    assert _tree_bytes(root) == before
+    work = tmp_path / ".diagnostic.work"
+    progress = pd.read_csv(work / "progress.csv")
+    assert len(progress) == (1 if failure_stage == "mid_run" else 32)
+    assert progress["action_trace_path"].map(lambda path: Path(path).is_file()).all()
