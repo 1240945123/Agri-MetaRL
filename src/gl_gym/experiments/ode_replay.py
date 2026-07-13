@@ -115,6 +115,16 @@ def _factory_arguments(inputs: Mapping[str, np.ndarray], dt: float) -> dict[str,
     }
 
 
+def _validate_replay_inputs(inputs: Mapping[str, np.ndarray]) -> None:
+    for name in ("x0", "u", "p_dyn"):
+        value = np.asarray(inputs[name])
+        if value.dtype.kind not in "biuf" or not np.isfinite(value).all():
+            raise ValueError(f"{name} must be numeric and finite")
+    dt = np.asarray(inputs["dt"])
+    if dt.size != 1 or dt.dtype.kind not in "biuf" or not np.isfinite(dt).all():
+        raise ValueError("dt must be a finite scalar")
+
+
 def _final_array(result: Any, nx: int) -> np.ndarray:
     if not isinstance(result, Mapping) or "xf" not in result:
         raise ValueError("integrator result must contain 'xf'")
@@ -205,6 +215,7 @@ def replay_failure_capsule(
     controller_factory: Callable[[], Any] = build_rule_based_controller,
 ) -> ReplayReport:
     """Replay all fixed counterfactual variants for a loaded failure capsule."""
+    _validate_replay_inputs(capsule.failure_inputs)
     outcomes = tuple(
         _run_variant(
             variant,

@@ -99,6 +99,14 @@ def _all_outcomes(**statuses):
     return tuple(_outcome(name, **statuses.get(name, {})) for name in VARIANTS)
 
 
+def _assert_byte_equivalent(actual, expected):
+    actual_array = np.asarray(actual)
+    expected_array = np.asarray(expected)
+    assert actual_array.dtype == expected_array.dtype
+    assert actual_array.shape == expected_array.shape
+    assert actual_array.tobytes() == expected_array.tobytes()
+
+
 def test_replay_types_are_frozen_and_outcome_detaches_final_state():
     source = np.array([1.0, 2.0])
     outcome = ReplayOutcome("original", True, True, 0.25, source, warnings=["notice"])
@@ -154,15 +162,15 @@ def test_replay_runs_six_fresh_variants_in_order_with_exact_inputs_and_options()
     inputs = capsule.failure_inputs
     for build_calls in calls_by_build:
         for call in build_calls:
-            assert call["p"].dtype == inputs["p_dyn"].dtype
-            assert call["p"].shape == inputs["p_dyn"].shape
-            assert call["p"].tobytes() == inputs["p_dyn"].tobytes()
+            _assert_byte_equivalent(call["p"], inputs["p_dyn"])
+    for build_calls in calls_by_build:
+        _assert_byte_equivalent(build_calls[0]["x0"], inputs["x0"])
     for build_index in (0, 3, 4, 5):
-        assert calls_by_build[build_index][0]["u"].tobytes() == inputs["u"].tobytes()
-    assert calls_by_build[1][0]["u"].tobytes() == inputs["previous_control"].tobytes()
-    np.testing.assert_array_equal(calls_by_build[2][0]["u"], controller.control)
+        for call in calls_by_build[build_index]:
+            _assert_byte_equivalent(call["u"], inputs["u"])
+    _assert_byte_equivalent(calls_by_build[1][0]["u"], inputs["previous_control"])
+    _assert_byte_equivalent(calls_by_build[2][0]["u"], controller.control)
     for substeps in (calls_by_build[3], calls_by_build[4]):
-        assert substeps[0]["x0"].tobytes() == inputs["x0"].tobytes()
         for previous, current in zip(substeps, substeps[1:]):
             np.testing.assert_array_equal(current["x0"], previous["x0"] + 1.0)
 
@@ -170,6 +178,32 @@ def test_replay_runs_six_fresh_variants_in_order_with_exact_inputs_and_options()
     assert x0.tobytes() == inputs["x0"].tobytes()
     assert weather.tobytes() == inputs["weather"].tobytes()
     assert (env.nu, env.day_of_year, env.hour_of_day) == (2, 151.5, 13.25)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("x0", np.array([1.0, np.nan], dtype=np.float32)),
+        ("u", np.array([0.1, np.inf], dtype=np.float64)),
+        ("p_dyn", np.array([5.0, 6.0, -np.inf, 8.0], dtype=np.float64)),
+        ("dt", np.array(np.nan)),
+    ],
+)
+def test_replay_rejects_nonfinite_stored_inputs_before_building_integrator(
+    field, bad_value
+):
+    capsule = _capsule()
+    capsule.failure_inputs[field] = bad_value
+    factory = RecordingFactory()
+
+    with pytest.raises(ValueError, match=field):
+        replay_failure_capsule(
+            capsule,
+            integrator_factory=factory,
+            controller_factory=lambda: RecordingController(),
+        )
+
+    assert factory.builds == []
 
 
 def test_replay_captures_warnings_exceptions_and_elapsed_time():
