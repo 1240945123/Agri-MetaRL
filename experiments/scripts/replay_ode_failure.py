@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import errno
 import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 from typing import Any, Callable, Mapping
@@ -18,8 +19,10 @@ import numpy as np
 
 from gl_gym.experiments.ode_failure import LoadedFailureCapsule, load_failure_capsule
 from gl_gym.experiments.ode_replay import (
+    ReplayOutcome,
     ReplayReport,
     VARIANT_NAMES,
+    classify_replay_outcomes,
     replay_failure_capsule,
 )
 
@@ -152,6 +155,9 @@ def _validate_report(report: ReplayReport, state_dim: int | None) -> int:
     outcomes = tuple(report.outcomes)
     if tuple(item.variant for item in outcomes) != VARIANT_NAMES:
         raise ValueError("replay report outcomes must use the fixed variant order")
+    derived_classification = classify_replay_outcomes(outcomes)
+    if report.classification != derived_classification:
+        raise ValueError("replay report classification is inconsistent with outcomes")
 
     inferred_dims: set[int] = set()
     for outcome in outcomes:
@@ -343,7 +349,13 @@ def _parse_aware_timestamp(value: Any) -> datetime:
         raise ValueError("generated replay timestamp must be ISO-8601") from error
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("generated replay timestamp must be timezone-aware")
+    if parsed.utcoffset() != timedelta(0):
+        raise ValueError("generated replay timestamp must use UTC")
     return parsed
+
+
+def _is_canonical_sha256(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
 def _validate_json_payload(payload: Any) -> list[str]:
@@ -353,11 +365,8 @@ def _validate_json_payload(payload: Any) -> list[str]:
         raise ValueError("invalid replay report schema")
     if not isinstance(payload["failure_id"], str) or not payload["failure_id"]:
         raise ValueError("replay failure_id must be non-empty text")
-    if (
-        not isinstance(payload["capsule_identity_sha256"], str)
-        or not payload["capsule_identity_sha256"]
-    ):
-        raise ValueError("replay capsule identity must be non-empty text")
+    if not _is_canonical_sha256(payload["capsule_identity_sha256"]):
+        raise ValueError("replay capsule identity must be lowercase SHA-256 hex")
     if payload["classification"] not in CLASSIFICATIONS:
         raise ValueError("invalid replay classification")
     _parse_aware_timestamp(payload["generated_at_utc"])
@@ -366,6 +375,7 @@ def _validate_json_payload(payload: Any) -> list[str]:
     if not isinstance(outcomes, list) or len(outcomes) != len(VARIANT_NAMES):
         raise ValueError("replay report must contain exactly six outcomes")
     successful_names: list[str] = []
+    replay_outcomes: list[ReplayOutcome] = []
     for expected_variant, item in zip(VARIANT_NAMES, outcomes):
         if not isinstance(item, dict) or set(item) != JSON_OUTCOME_KEYS:
             raise ValueError("replay outcome must have the exact key set")
@@ -401,6 +411,21 @@ def _validate_json_payload(payload: Any) -> list[str]:
             successful_names.append(expected_variant)
         elif exception_type is None or exception_message is None:
             raise ValueError("failed replay outcomes must contain exception metadata")
+        replay_outcomes.append(
+            ReplayOutcome(
+                variant=expected_variant,
+                available=available,
+                success=success,
+                elapsed_seconds=elapsed,
+                final_state=np.zeros(1, dtype=np.float64) if success else None,
+                exception_type=exception_type,
+                exception_message=exception_message,
+                warnings=tuple(warning_messages),
+            )
+        )
+    derived_classification = classify_replay_outcomes(replay_outcomes)
+    if payload["classification"] != derived_classification:
+        raise ValueError("replay classification is inconsistent with outcomes")
     return successful_names
 
 
@@ -518,8 +543,8 @@ def write_replay_report_atomic(
     if output_path.exists() or output_path.is_symlink():
         raise FileExistsError(f"replay output already exists: {output_path}")
     resolved_dim = _validate_report(report, state_dim)
-    if not isinstance(capsule_identity, str) or not capsule_identity:
-        raise ValueError("capsule identity must be non-empty text")
+    if not _is_canonical_sha256(capsule_identity):
+        raise ValueError("capsule identity must be lowercase SHA-256 hex")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.parent / f".ode-replay-{uuid4().hex[:12]}"
     temporary.mkdir()

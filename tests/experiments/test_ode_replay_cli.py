@@ -39,12 +39,42 @@ def _outcome(
 def _report(
     classification: str = "solver_step_sensitivity",
     *,
-    successes: tuple[str, ...] = ("original_2x_substeps",),
+    successes: tuple[str, ...] | None = None,
+    unavailable: tuple[str, ...] | None = None,
 ) -> ReplayReport:
+    success_by_classification = {
+        "policy_induced_control_instability": ("rule_based_control",),
+        "mixed_control_and_solver_sensitivity": (
+            "previous_control",
+            "original_2x_substeps",
+        ),
+        "solver_step_sensitivity": ("original_2x_substeps",),
+        "state_or_model_domain_failure": (),
+        "non_reproduced": ("original",),
+        "insufficient_counterfactual_evidence": (),
+    }
+    unavailable_by_classification = {
+        "insufficient_counterfactual_evidence": ("rule_based_control",)
+    }
+    successes = (
+        success_by_classification[classification] if successes is None else successes
+    )
+    unavailable = (
+        unavailable_by_classification.get(classification, ())
+        if unavailable is None
+        else unavailable
+    )
     return ReplayReport(
         "failure-123",
         classification,
-        tuple(_outcome(name, success=name in successes) for name in VARIANT_NAMES),
+        tuple(
+            _outcome(
+                name,
+                success=name in successes,
+                available=name not in unavailable,
+            )
+            for name in VARIANT_NAMES
+        ),
     )
 
 
@@ -157,6 +187,23 @@ def test_empty_success_npz_preserves_capsule_state_dimension(tmp_path):
         assert archive["variant_names"].dtype.kind == "U"
         assert archive["final_states"].shape == (0, 2)
         assert archive["finite_masks"].shape == (0, 2)
+
+
+def test_in_memory_report_rejects_approved_classification_inconsistent_with_outcomes(
+    tmp_path,
+):
+    inconsistent = _report(
+        "policy_induced_control_instability",
+        successes=("original_2x_substeps",),
+    )
+    with pytest.raises(ValueError, match="classification.*outcomes"):
+        cli.write_replay_report_atomic(
+            inconsistent,
+            tmp_path / "report",
+            state_dim=2,
+            capsule_identity=IDENTITY,
+        )
+    assert not (tmp_path / "report").exists()
 
 
 @pytest.mark.parametrize(
@@ -400,8 +447,24 @@ def _mutate_bad_timestamp(payload):
     payload["generated_at_utc"] = "2026-07-13T12:00:00"
 
 
+def _mutate_nonzero_timestamp_offset(payload):
+    payload["generated_at_utc"] = "2026-07-13T12:00:00+08:00"
+
+
 def _mutate_empty_identity(payload):
     payload["capsule_identity_sha256"] = ""
+
+
+def _mutate_short_identity(payload):
+    payload["capsule_identity_sha256"] = "a" * 63
+
+
+def _mutate_nonhex_identity(payload):
+    payload["capsule_identity_sha256"] = "g" * 64
+
+
+def _mutate_uppercase_identity(payload):
+    payload["capsule_identity_sha256"] = "A" * 64
 
 
 def _mutate_empty_failure(payload):
@@ -410,6 +473,10 @@ def _mutate_empty_failure(payload):
 
 def _mutate_bad_classification(payload):
     payload["classification"] = "unsupported"
+
+
+def _mutate_inconsistent_approved_classification(payload):
+    payload["classification"] = "policy_induced_control_instability"
 
 
 def _mutate_outcome_extra(payload):
@@ -451,9 +518,14 @@ def _mutate_failure_without_exception(payload):
         _mutate_top_extra,
         _mutate_top_missing,
         _mutate_bad_timestamp,
+        _mutate_nonzero_timestamp_offset,
         _mutate_empty_identity,
+        _mutate_short_identity,
+        _mutate_nonhex_identity,
+        _mutate_uppercase_identity,
         _mutate_empty_failure,
         _mutate_bad_classification,
+        _mutate_inconsistent_approved_classification,
         _mutate_outcome_extra,
         _mutate_outcome_missing,
         _mutate_available_int,
@@ -475,3 +547,14 @@ def test_strict_json_validation_rejects_malformed_fields(tmp_path, mutate):
     json_path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
     with pytest.raises(ValueError):
         cli._validate_replay_directory(output, state_dim=2)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ["", "a" * 63, "g" * 64, "A" * 64],
+)
+def test_writer_rejects_noncanonical_capsule_identity(tmp_path, identity):
+    with pytest.raises(ValueError, match="capsule identity"):
+        cli.write_replay_report_atomic(
+            _report(), tmp_path / "report", state_dim=2, capsule_identity=identity
+        )
