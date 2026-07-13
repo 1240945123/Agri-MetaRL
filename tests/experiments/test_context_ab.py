@@ -1,5 +1,7 @@
 import json
+import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -15,6 +17,15 @@ from gl_gym.experiments.context_ab import (
     select_diagnostic_tasks,
     write_context_ab_artifacts,
 )
+
+
+def _load_context_cli():
+    script = Path(__file__).resolve().parents[2] / "experiments" / "scripts" / "run_context_ab.py"
+    spec = importlib.util.spec_from_file_location("run_context_ab", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def _task_table() -> pd.DataFrame:
@@ -428,3 +439,180 @@ def test_write_context_ab_artifacts_rejects_invalid_raw_table(tmp_path: Path, ba
         message = "inference modes"
     with pytest.raises(ValueError, match=message):
         write_context_ab_artifacts(raw, tmp_path / "diagnostic", {})
+
+
+def _write_diagnostic_checkpoints(model_root: Path, seeds=(42, 123)) -> None:
+    for seed in seeds:
+        model = (
+            model_root
+            / "agri_metarl"
+            / "deterministic"
+            / "models"
+            / f"agri_metarl_seed{seed}"
+            / "last_model.zip"
+        )
+        vec = (
+            model_root
+            / "agri_metarl"
+            / "deterministic"
+            / "envs"
+            / f"agri_metarl_seed{seed}"
+            / "last_vecnormalize.pkl"
+        )
+        model.parent.mkdir(parents=True, exist_ok=True)
+        vec.parent.mkdir(parents=True, exist_ok=True)
+        model.write_bytes(b"model")
+        vec.write_bytes(b"vec")
+
+
+def test_build_diagnostic_runs_uses_exact_last_checkpoint_paths(tmp_path: Path):
+    cli = _load_context_cli()
+    _write_diagnostic_checkpoints(tmp_path)
+
+    runs = cli.build_diagnostic_runs(tmp_path, [42, 123])
+
+    assert str(runs[0]["model_path"]).replace("\\", "/").endswith(
+        "agri_metarl/deterministic/models/agri_metarl_seed42/last_model.zip"
+    )
+    assert str(runs[1]["vecnormalize_path"]).replace("\\", "/").endswith(
+        "agri_metarl/deterministic/envs/agri_metarl_seed123/last_vecnormalize.pkl"
+    )
+
+
+@pytest.mark.parametrize("seeds", [[42], [123, 42], [42, 123, 456]])
+def test_build_diagnostic_runs_requires_exact_seed_order(tmp_path: Path, seeds):
+    cli = _load_context_cli()
+    with pytest.raises(ValueError, match="exactly 42 123"):
+        cli.build_diagnostic_runs(tmp_path, seeds)
+
+
+@pytest.mark.parametrize("missing", ["model", "vecnormalize"])
+def test_build_diagnostic_runs_requires_both_checkpoint_files(tmp_path: Path, missing: str):
+    cli = _load_context_cli()
+    _write_diagnostic_checkpoints(tmp_path)
+    target = next(tmp_path.rglob("last_model.zip" if missing == "model" else "last_vecnormalize.pkl"))
+    target.unlink()
+    with pytest.raises(FileNotFoundError, match=missing):
+        cli.build_diagnostic_runs(tmp_path, [42, 123])
+
+
+def test_validate_result_root_rejects_source_suite_collision(tmp_path: Path):
+    cli = _load_context_cli()
+    with pytest.raises(ValueError, match="diagnostic result root"):
+        cli.validate_result_root(tmp_path / "suite", tmp_path / "suite" / ".." / "suite")
+
+
+def test_resume_skip_requires_matching_progress_row_and_valid_trace(tmp_path: Path):
+    cli = _load_context_cli()
+    trace = tmp_path / "trace.npy"
+    np.save(trace, np.ones((2, 1), dtype=np.float32))
+    row = {
+        "seed": 42,
+        "task_id": DIAGNOSTIC_TASK_IDS[0],
+        "inference_mode": "zero_context",
+        "action_trace_path": str(trace),
+        **{metric: 1.0 for metric in PAIR_METRICS},
+    }
+    assert cli.resume_row_is_complete(row)
+    trace.unlink()
+    assert not cli.resume_row_is_complete(row)
+    trace.write_bytes(b"not-npy")
+    assert not cli.resume_row_is_complete(row)
+
+
+def test_resume_row_must_match_current_checkpoint_steps(tmp_path: Path):
+    cli = _load_context_cli()
+    trace = tmp_path / "trace.npy"
+    np.save(trace, np.ones((2, 1), dtype=np.float32))
+    row = {
+        "seed": 42,
+        "task_id": DIAGNOSTIC_TASK_IDS[0],
+        "split": "fixed",
+        "inference_mode": "zero_context",
+        "checkpoint_steps": 100,
+        "action_trace_path": str(trace),
+        "support_ready_step": np.nan,
+        "context_norm_mean": 0.0,
+        "context_norm_max": 0.0,
+        **{metric: 1.0 for metric in PAIR_METRICS},
+    }
+
+    assert cli.resume_row_is_complete(row, checkpoint_steps=100)
+    assert not cli.resume_row_is_complete(row, checkpoint_steps=200)
+
+
+def test_cli_core_fake_smoke_writes_exactly_32_rows(tmp_path: Path):
+    cli = _load_context_cli()
+    _write_diagnostic_checkpoints(tmp_path / "models")
+    stale_trace = tmp_path / "diagnostic" / "traces" / "stale.npy"
+    stale_trace.parent.mkdir(parents=True)
+    np.save(stale_trace, np.zeros((1, 1), dtype=np.float32))
+    unrelated = tmp_path / "diagnostic" / "keep-me.txt"
+    unrelated.write_text("unrelated", encoding="utf-8")
+    suite = SimpleNamespace(suite_id="source", result_root=str(tmp_path / "source"), env_id="Fake")
+    split_by_task = {task_id: task_id.split("_", 1)[0] for task_id in DIAGNOSTIC_TASK_IDS}
+    tasks = pd.DataFrame(
+        [
+            {
+                "suite_id": "source",
+                "task_id": task_id,
+                "split": split_by_task[task_id],
+                "weather_year": 2010,
+                "start_day": 59,
+                "uncertainty_scale": 0.0,
+                "economic_scenario": "standard",
+                "climate_constraint_scenario": "standard",
+            }
+            for task_id in DIAGNOSTIC_TASK_IDS
+        ]
+    )
+
+    class Model:
+        num_timesteps = 196608
+
+    class Env:
+        def close(self):
+            pass
+
+    def episode_runner(model, env, *, inference_mode, return_diagnostics):
+        value = float(inference_mode == "online_context")
+        return (
+            {
+                "episode_return": 100.0 + value,
+                "EPI": 10.0 + value,
+                "revenue": 0.0,
+                "heat_cost": 0.0,
+                "co2_cost": 0.0,
+                "elec_cost": 0.0,
+                "temp_violation": 10.0 - value,
+                "co2_violation": 10.0 - value,
+                "rh_violation": 10.0 - value,
+                "twb_percent": 0.0,
+            },
+            {
+                "action_trace": np.full((3, 1), value, dtype=np.float32),
+                "support_ready_step": 1.0 if value else np.nan,
+                "context_norm_mean": value,
+                "context_norm_max": value,
+            },
+        )
+
+    result = cli.run_diagnostic(
+        suite=suite,
+        tasks=tasks,
+        runs=cli.build_diagnostic_runs(tmp_path / "models", [42, 123]),
+        result_root=tmp_path / "diagnostic",
+        source_manifest=tmp_path / "source" / "suite_manifest.json",
+        source_tasks_csv=tmp_path / "source" / "eval_tasks.csv",
+        device="cpu",
+        resume=False,
+        model_loader=lambda path, device: Model(),
+        env_loader=lambda suite, task, path: Env(),
+        episode_runner=episode_runner,
+        provenance_loader=lambda: {"git_commit": "abc", "dirty": False},
+    )
+
+    assert len(result) == 32
+    assert unrelated.read_text(encoding="utf-8") == "unrelated"
+    assert len(pd.read_csv(tmp_path / "diagnostic" / "eval_raw.csv")) == 32
+    assert len(list((tmp_path / "diagnostic" / "traces").glob("*.npy"))) == 32

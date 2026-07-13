@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import csv
 import inspect
+import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from gl_gym.experiments.suite_schema import EvaluationTaskRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +38,59 @@ class EvaluationMetricRow:
     rh_violation: float
     twb_percent: float
     trajectory_path: str
+
+
+def task_from_row(row: Any) -> EvaluationTaskRecord:
+    """Convert a pandas row/itertuples record to the canonical task record."""
+
+    return EvaluationTaskRecord(
+        suite_id=str(row.suite_id),
+        task_id=str(row.task_id),
+        split=str(row.split),
+        weather_year=int(row.weather_year),
+        start_day=int(row.start_day),
+        uncertainty_scale=float(row.uncertainty_scale),
+        economic_scenario=str(row.economic_scenario),
+        climate_constraint_scenario=str(row.climate_constraint_scenario),
+    )
+
+
+def load_task_env(suite: Any, task: EvaluationTaskRecord, vecnormalize_path: str | Path):
+    """Build one fresh normalized evaluation environment for a suite task."""
+
+    from stable_baselines3.common.vec_env import VecNormalize
+
+    from gl_gym.RL.utils import make_vec_env
+    from gl_gym.common.utils import load_env_params
+    from gl_gym.experiments.suite_tasks import apply_task_to_env_params
+
+    env_base_params, env_specific_params = load_env_params(
+        suite.env_id,
+        os.path.join("configs", "envs"),
+    )
+    env_base_params, env_specific_params = apply_task_to_env_params(
+        env_base_params,
+        env_specific_params,
+        task,
+    )
+    env = make_vec_env(
+        suite.env_id,
+        env_base_params,
+        env_specific_params,
+        seed=666,
+        n_envs=1,
+        monitor_filename=None,
+        vec_norm_kwargs=None,
+        eval_env=True,
+    )
+    vec_path = Path(vecnormalize_path)
+    if not vec_path.is_file():
+        env.close()
+        raise FileNotFoundError(f"VecNormalize statistics do not exist: {vec_path}")
+    env = VecNormalize.load(str(vec_path), env)
+    env.training = False
+    env.norm_reward = False
+    return env
 
 
 def _predict(model: Any, obs: Any, states: Any, episode_starts: np.ndarray) -> tuple[Any, Any]:
