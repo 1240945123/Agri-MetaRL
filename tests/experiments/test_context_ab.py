@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import gl_gym.experiments.context_ab as context_ab
 from gl_gym.experiments.context_ab import (
     DIAGNOSTIC_TASK_IDS,
     MODES,
@@ -48,6 +49,7 @@ def _raw_pair(tmp_path: Path) -> pd.DataFrame:
                 "co2_violation": 20.0 if mode == "zero_context" else 18.0,
                 "rh_violation": 30.0 if mode == "zero_context" else 27.0,
                 "action_trace_path": _write_trace(tmp_path / f"{mode}.npy", action),
+                "support_ready_step": 1.0 if mode == "online_context" else np.nan,
             }
         )
     return pd.DataFrame(rows)
@@ -100,6 +102,7 @@ def _raw_diagnostic_fixture(tmp_path: Path) -> pd.DataFrame:
                         "action_trace_path": _write_trace(
                             tmp_path / f"{seed}_{index}_{mode}.npy", float(mode_index)
                         ),
+                        "support_ready_step": 1.0 if mode == "online_context" else np.nan,
                     }
                 )
     return pd.DataFrame(rows)
@@ -157,6 +160,70 @@ def test_build_paired_deltas_supports_injected_action_loader(tmp_path: Path):
     assert paired.loc[0, "mean_abs_action_delta"] == 0.5
 
 
+def test_build_paired_deltas_uses_only_post_readiness_actions(tmp_path: Path):
+    raw = _raw_pair(tmp_path)
+    arrays = {
+        "zero": np.array([[0.0], [0.0], [0.0]]),
+        "online": np.array([[1.0], [0.0], [0.0]]),
+    }
+    paired = build_paired_deltas(
+        raw,
+        load_actions=lambda path: arrays["zero" if "zero" in str(path) else "online"],
+    )
+    assert paired.loc[0, "support_ready_step"] == 1
+    assert paired.loc[0, "mean_abs_action_delta"] == 0.0
+
+
+def test_build_paired_deltas_detects_post_readiness_action_change(tmp_path: Path):
+    raw = _raw_pair(tmp_path)
+    arrays = {
+        "zero": np.array([[0.0], [0.0], [0.0]]),
+        "online": np.array([[0.0], [1.0], [1.0]]),
+    }
+    paired = build_paired_deltas(
+        raw,
+        load_actions=lambda path: arrays["zero" if "zero" in str(path) else "online"],
+    )
+    assert paired.loc[0, "mean_abs_action_delta"] == 1.0
+
+
+def test_pre_readiness_only_changes_fail_the_action_gate(tmp_path: Path):
+    raw = _raw_diagnostic_fixture(tmp_path)
+    for row in raw.itertuples(index=False):
+        trace = np.zeros((3, 2), dtype=np.float32)
+        if row.inference_mode == "online_context":
+            trace[0] = 1.0
+        np.save(row.action_trace_path, trace)
+    paired = build_paired_deltas(raw)
+    assert (paired["mean_abs_action_delta"] == 0.0).all()
+    decision = evaluate_context_gate(paired)
+    assert decision["conditions"]["actions_change_both_seeds"] is False
+
+
+@pytest.mark.parametrize("support_ready_step", [np.nan, np.inf, 0, 1.5, 3, "bad"])
+def test_build_paired_deltas_rejects_invalid_support_readiness(tmp_path: Path, support_ready_step):
+    raw = _raw_pair(tmp_path)
+    if isinstance(support_ready_step, str):
+        raw["support_ready_step"] = raw["support_ready_step"].astype(object)
+    raw.loc[raw["inference_mode"] == "online_context", "support_ready_step"] = support_ready_step
+    with pytest.raises(ValueError, match="support_ready_step"):
+        build_paired_deltas(raw)
+
+
+def test_build_paired_deltas_default_loader_disables_pickle(tmp_path: Path, monkeypatch):
+    raw = _raw_pair(tmp_path)
+    real_load = np.load
+    calls = []
+
+    def recording_load(path, **kwargs):
+        calls.append(kwargs)
+        return real_load(path, **kwargs)
+
+    monkeypatch.setattr(context_ab.np, "load", recording_load)
+    build_paired_deltas(raw)
+    assert calls == [{"allow_pickle": False}, {"allow_pickle": False}]
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -182,6 +249,8 @@ def test_build_paired_deltas_rejects_nonfinite_metrics(tmp_path: Path):
         (np.empty((0, 1)), np.empty((0, 1)), "nonempty"),
         (np.zeros((2, 1)), np.zeros((3, 1)), "same shape"),
         (np.array([[np.nan]]), np.zeros((1, 1)), "finite"),
+        (np.zeros(3), np.zeros(3), "2D"),
+        (np.zeros((3, 0)), np.zeros((3, 0)), "positive dimensions"),
     ],
 )
 def test_build_paired_deltas_validates_action_arrays(tmp_path: Path, zero, online, message):
@@ -243,6 +312,38 @@ def test_gate_handles_nonfinite_evidence_with_strict_json():
     json.dumps(decision, allow_nan=False)
 
 
+def test_gate_rejects_asymmetric_seed_task_subset_that_would_otherwise_pass():
+    paired = _passing_paired_fixture()
+    paired = paired.loc[~((paired["seed"] == 123) & (paired["task_id"] == DIAGNOSTIC_TASK_IDS[-1]))]
+    decision = evaluate_context_gate(paired)
+    assert decision["outcome"] == "redesign_before_training"
+    assert decision["reasons"]
+    assert "experiment structure" in decision["reasons"][0]
+
+
+def test_gate_requires_exact_approved_seeds():
+    paired = _passing_paired_fixture()
+    paired.loc[paired["seed"] == 123, "seed"] = 999
+    decision = evaluate_context_gate(paired)
+    assert decision["outcome"] == "redesign_before_training"
+    assert "experiment structure" in decision["reasons"][0]
+
+
+def test_gate_treats_zero_over_zero_violation_as_neutral_without_dilution():
+    paired = _passing_paired_fixture()
+    for metric in ("co2_violation", "rh_violation"):
+        paired[f"{metric}_zero"] = 0.0
+        paired[f"{metric}_online"] = 0.0
+        paired[f"{metric}_delta"] = 0.0
+    paired["temp_violation_zero"] = 10.0
+    paired["temp_violation_online"] = 20.0
+    paired["temp_violation_delta"] = 10.0
+
+    decision = evaluate_context_gate(paired)
+    assert decision["evidence"]["mean_normalized_violation_burden"] == pytest.approx(4.0 / 3.0)
+    assert decision["conditions"]["violation_burden_within_5pct"] is False
+
+
 def test_write_context_ab_artifacts_writes_complete_schema_and_strict_json(tmp_path: Path):
     raw = _raw_diagnostic_fixture(tmp_path)
     root = tmp_path / "diagnostic"
@@ -266,6 +367,51 @@ def test_write_context_ab_artifacts_requires_existing_action_traces(tmp_path: Pa
     Path(raw.loc[0, "action_trace_path"]).unlink()
     with pytest.raises(ValueError, match="action trace"):
         write_context_ab_artifacts(raw, tmp_path / "diagnostic", {})
+
+
+def test_write_context_ab_artifacts_rejects_substituted_tasks_even_with_32_rows(tmp_path: Path):
+    raw = _raw_diagnostic_fixture(tmp_path)
+    raw.loc[raw["task_id"] == DIAGNOSTIC_TASK_IDS[-1], "task_id"] = "economic_substitute"
+    with pytest.raises(ValueError, match="approved diagnostic task IDs"):
+        write_context_ab_artifacts(raw, tmp_path / "diagnostic", {})
+
+
+def test_write_context_ab_artifacts_preserves_complete_root_on_publish_failure(tmp_path: Path, monkeypatch):
+    raw = _raw_diagnostic_fixture(tmp_path)
+    root = tmp_path / "diagnostic"
+    root.mkdir()
+    artifact_names = (
+        "eval_raw.csv",
+        "paired_deltas.csv",
+        "split_summary.csv",
+        "diagnostic_manifest.json",
+        "decision.json",
+    )
+    for name in artifact_names:
+        (root / name).write_bytes(f"old-{name}".encode())
+    trace = root / "traces" / "keep.npy"
+    trace.parent.mkdir()
+    np.save(trace, np.ones((2, 1)))
+    before = {name: (root / name).read_bytes() for name in artifact_names}
+    real_replace = context_ab.os.replace
+    failed = False
+
+    def fail_staging_publish(source, destination):
+        nonlocal failed
+        source_path = Path(source)
+        if not failed and source_path.name.startswith(f".{root.name}.staging-"):
+            failed = True
+            raise OSError("injected publish failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(context_ab.os, "replace", fail_staging_publish)
+    with pytest.raises(OSError, match="injected publish failure"):
+        write_context_ab_artifacts(raw, root, {"revision": 2})
+
+    assert {name: (root / name).read_bytes() for name in artifact_names} == before
+    assert trace.exists()
+    assert not list(tmp_path.glob(".diagnostic.staging-*"))
+    assert not list(tmp_path.glob(".diagnostic.backup-*"))
 
 
 @pytest.mark.parametrize("bad_kind", ["row_count", "duplicate", "mode"])

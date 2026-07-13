@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Any, Callable
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -30,6 +34,7 @@ PAIR_METRICS = (
 )
 VIOLATION_METRICS = ("temp_violation", "co2_violation", "rh_violation")
 EPSILON = 1e-9
+EXPECTED_SEEDS = frozenset({42, 123})
 
 
 def select_diagnostic_tasks(tasks: pd.DataFrame) -> pd.DataFrame:
@@ -54,6 +59,7 @@ def _validate_raw_pairs(raw: pd.DataFrame) -> None:
         "split",
         "inference_mode",
         "action_trace_path",
+        "support_ready_step",
         *PAIR_METRICS,
     }
     missing = sorted(required.difference(raw.columns))
@@ -91,8 +97,12 @@ def _validated_actions(actions: Any, path: Any) -> np.ndarray:
         array = np.asarray(actions, dtype=float)
     except (TypeError, ValueError) as error:
         raise ValueError(f"action trace {path!r} must be numeric") from error
-    if array.size == 0:
+    if array.ndim != 2:
+        raise ValueError(f"action trace {path!r} must be a 2D (steps, action_dim) array")
+    if array.shape[0] == 0:
         raise ValueError(f"action trace {path!r} must be nonempty")
+    if array.shape[1] == 0:
+        raise ValueError(f"action trace {path!r} must have positive dimensions")
     if not np.isfinite(array).all():
         raise ValueError(f"action trace {path!r} must contain only finite values")
     return array
@@ -100,7 +110,7 @@ def _validated_actions(actions: Any, path: Any) -> np.ndarray:
 
 def build_paired_deltas(
     raw: pd.DataFrame,
-    load_actions: Callable[[Any], Any] = np.load,
+    load_actions: Callable[[Any], Any] | None = None,
 ) -> pd.DataFrame:
     """Build one online-minus-zero record for every seed/task pair."""
 
@@ -108,7 +118,10 @@ def build_paired_deltas(
     keys = ["seed", "task_id", "split"]
     value_columns = [*PAIR_METRICS, "action_trace_path"]
     zero = raw.loc[raw["inference_mode"] == MODES[0], keys + value_columns].copy()
-    online = raw.loc[raw["inference_mode"] == MODES[1], keys + value_columns].copy()
+    online = raw.loc[
+        raw["inference_mode"] == MODES[1],
+        keys + value_columns + ["support_ready_step"],
+    ].copy()
     paired = zero.merge(online, on=keys, how="inner", validate="one_to_one", suffixes=("_zero", "_online"))
     if len(paired) * 2 != len(raw):
         raise ValueError("both inference modes must share the same seed, task ID, and split")
@@ -118,22 +131,54 @@ def build_paired_deltas(
         online_column = f"{metric}_online"
         paired[f"{metric}_delta"] = paired[online_column] - paired[zero_column]
     for metric in VIOLATION_METRICS:
-        paired[f"{metric}_online_to_zero_ratio"] = (
-            paired[f"{metric}_online"] / (paired[f"{metric}_zero"].abs() + EPSILON)
+        paired[f"{metric}_online_to_zero_ratio"] = _normalized_violation_ratio(
+            paired[f"{metric}_zero"].to_numpy(dtype=float),
+            paired[f"{metric}_online"].to_numpy(dtype=float),
         )
 
+    action_loader = load_actions or (lambda path: np.load(path, allow_pickle=False))
     action_deltas: list[float] = []
     for row in paired.itertuples(index=False):
-        zero_actions = _validated_actions(load_actions(row.action_trace_path_zero), row.action_trace_path_zero)
-        online_actions = _validated_actions(load_actions(row.action_trace_path_online), row.action_trace_path_online)
+        zero_actions = _validated_actions(action_loader(row.action_trace_path_zero), row.action_trace_path_zero)
+        online_actions = _validated_actions(action_loader(row.action_trace_path_online), row.action_trace_path_online)
         if zero_actions.shape != online_actions.shape:
             raise ValueError(
                 "paired action traces must have the same shape: "
                 f"{zero_actions.shape} != {online_actions.shape}"
             )
-        action_deltas.append(float(np.mean(np.abs(online_actions - zero_actions))))
+        try:
+            readiness = float(row.support_ready_step)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"support_ready_step must be numeric, got {row.support_ready_step!r}"
+            ) from error
+        if (
+            not np.isfinite(readiness)
+            or not readiness.is_integer()
+            or readiness < 1
+            or readiness >= zero_actions.shape[0]
+        ):
+            raise ValueError(
+                "support_ready_step must be a finite integer from 1 through "
+                f"{zero_actions.shape[0] - 1}, got {row.support_ready_step!r}"
+            )
+        start = int(readiness)
+        action_deltas.append(
+            float(np.mean(np.abs(online_actions[start:] - zero_actions[start:])))
+        )
     paired["mean_abs_action_delta"] = action_deltas
     return paired
+
+
+def _normalized_violation_ratio(zero: np.ndarray, online: np.ndarray) -> np.ndarray:
+    """Return neutral ratios for zero/zero cells without hiding new violations."""
+
+    zero = np.asarray(zero, dtype=float)
+    online = np.asarray(online, dtype=float)
+    ratios = online / (np.abs(zero) + EPSILON)
+    both_zero = (zero == 0.0) & (online == 0.0)
+    ratios[both_zero] = 1.0
+    return ratios
 
 
 def _failure_decision(reason: str) -> dict[str, Any]:
@@ -162,11 +207,76 @@ def _seed_scalars(series: pd.Series) -> dict[str, float]:
     return {str(seed): float(value) for seed, value in series.items()}
 
 
+def _expected_split(task_id: str) -> str:
+    return task_id.split("_", 1)[0]
+
+
+def _paired_structure_error(paired: pd.DataFrame) -> str | None:
+    required = {"seed", "task_id", "split"}
+    missing = sorted(required.difference(paired.columns))
+    if missing:
+        return f"missing columns {missing}"
+    if len(paired) != 16:
+        return f"expected 16 paired rows, got {len(paired)}"
+    if paired.duplicated(["seed", "task_id"]).any():
+        return "duplicate seed/task paired rows"
+    if set(paired["seed"]) != EXPECTED_SEEDS:
+        return f"expected seeds {sorted(EXPECTED_SEEDS)}, got {sorted(set(paired['seed']))}"
+    approved = set(DIAGNOSTIC_TASK_IDS)
+    for seed in sorted(EXPECTED_SEEDS):
+        seed_rows = paired.loc[paired["seed"] == seed]
+        if set(seed_rows["task_id"]) != approved:
+            missing_tasks = sorted(approved.difference(seed_rows["task_id"]))
+            extra_tasks = sorted(set(seed_rows["task_id"]).difference(approved))
+            return f"seed {seed} task IDs differ; missing={missing_tasks}, extra={extra_tasks}"
+        expected_splits = seed_rows["task_id"].map(_expected_split)
+        if not seed_rows["split"].reset_index(drop=True).equals(expected_splits.reset_index(drop=True)):
+            return f"seed {seed} has task/split mismatch"
+        if int((seed_rows["split"] == "fixed").sum()) != 1 or int(
+            (seed_rows["split"] != "fixed").sum()
+        ) != 7:
+            return f"seed {seed} must have one fixed and seven non-fixed rows"
+    return None
+
+
+def _validate_raw_experiment_structure(raw: pd.DataFrame) -> None:
+    if set(raw["seed"]) != EXPECTED_SEEDS:
+        raise ValueError(
+            f"approved diagnostic seeds must be {sorted(EXPECTED_SEEDS)}, "
+            f"got {sorted(set(raw['seed']))}"
+        )
+    approved = set(DIAGNOSTIC_TASK_IDS)
+    for seed in sorted(EXPECTED_SEEDS):
+        seed_rows = raw.loc[raw["seed"] == seed]
+        task_ids = set(seed_rows["task_id"])
+        if task_ids != approved:
+            missing = sorted(approved.difference(task_ids))
+            extra = sorted(task_ids.difference(approved))
+            raise ValueError(
+                f"approved diagnostic task IDs differ for seed {seed}: "
+                f"missing={missing}, extra={extra}"
+            )
+        expected_splits = seed_rows["task_id"].map(_expected_split)
+        if not seed_rows["split"].reset_index(drop=True).equals(expected_splits.reset_index(drop=True)):
+            raise ValueError(f"approved diagnostic task IDs have incorrect splits for seed {seed}")
+        fixed_count = int((seed_rows["split"] == "fixed").sum())
+        nonfixed_count = int((seed_rows["split"] != "fixed").sum())
+        if fixed_count != 2 or nonfixed_count != 14:
+            raise ValueError(
+                f"seed {seed} must have two mode rows for one fixed and seven non-fixed tasks"
+            )
+
+
 def evaluate_context_gate(paired: pd.DataFrame) -> dict[str, Any]:
     """Evaluate the five preregistered conditions for continuing to 500k steps."""
 
+    structure_error = _paired_structure_error(paired)
+    if structure_error is not None:
+        return _failure_decision(f"invalid experiment structure: {structure_error}")
+
     required = {
         "seed",
+        "task_id",
         "split",
         "mean_abs_action_delta",
         "episode_return_zero",
@@ -180,7 +290,7 @@ def evaluate_context_gate(paired: pd.DataFrame) -> dict[str, Any]:
     if paired.empty:
         return _failure_decision("gate evidence is empty")
 
-    numeric_columns = sorted(required.difference({"seed", "split"}))
+    numeric_columns = sorted(required.difference({"seed", "task_id", "split"}))
     numeric = paired[numeric_columns].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
     if not np.isfinite(numeric).all():
         return _failure_decision("gate evidence contains non-finite values")
@@ -201,8 +311,10 @@ def evaluate_context_gate(paired: pd.DataFrame) -> dict[str, Any]:
     )
     violation_ratios = np.column_stack(
         [
-            paired[f"{metric}_online"].to_numpy(dtype=float)
-            / (np.abs(paired[f"{metric}_zero"].to_numpy(dtype=float)) + EPSILON)
+            _normalized_violation_ratio(
+                paired[f"{metric}_zero"].to_numpy(dtype=float),
+                paired[f"{metric}_online"].to_numpy(dtype=float),
+            )
             for metric in VIOLATION_METRICS
         ]
     )
@@ -266,6 +378,7 @@ def write_context_ab_artifacts(
     _validate_raw_pairs(raw)
     if set(raw["inference_mode"]) != set(MODES):
         raise ValueError(f"diagnostic inference modes must be exactly {list(MODES)}")
+    _validate_raw_experiment_structure(raw)
     missing_traces = [str(path) for path in raw["action_trace_path"] if not Path(path).is_file()]
     if missing_traces:
         raise ValueError(f"action trace files do not exist: {missing_traces[:10]}")
@@ -278,7 +391,7 @@ def write_context_ab_artifacts(
     )
     decision = evaluate_context_gate(paired)
     root = Path(result_root)
-    root.mkdir(parents=True, exist_ok=True)
+    root.parent.mkdir(parents=True, exist_ok=True)
     paths = {
         "eval_raw": root / "eval_raw.csv",
         "paired_deltas": root / "paired_deltas.csv",
@@ -286,9 +399,47 @@ def write_context_ab_artifacts(
         "diagnostic_manifest": root / "diagnostic_manifest.json",
         "decision": root / "decision.json",
     }
-    raw.to_csv(paths["eval_raw"], index=False)
-    paired.to_csv(paths["paired_deltas"], index=False)
-    summary.to_csv(paths["split_summary"], index=False)
-    _write_strict_json(paths["diagnostic_manifest"], manifest)
-    _write_strict_json(paths["decision"], decision)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{root.name}.staging-", dir=str(root.parent))
+    )
+    backup = root.parent / f".{root.name}.backup-{uuid4().hex}"
+    root_was_backed_up = False
+    try:
+        if root.exists():
+            if not root.is_dir():
+                raise ValueError(f"diagnostic result root must be a directory: {root}")
+            shutil.copytree(root, staging, dirs_exist_ok=True)
+
+        staging_paths = {name: staging / path.name for name, path in paths.items()}
+        raw.to_csv(staging_paths["eval_raw"], index=False)
+        paired.to_csv(staging_paths["paired_deltas"], index=False)
+        summary.to_csv(staging_paths["split_summary"], index=False)
+        _write_strict_json(staging_paths["diagnostic_manifest"], manifest)
+        _write_strict_json(staging_paths["decision"], decision)
+
+        if root.exists():
+            os.replace(root, backup)
+            root_was_backed_up = True
+        try:
+            os.replace(staging, root)
+        except BaseException:
+            if root_was_backed_up:
+                if root.exists():
+                    failed_publication = root.parent / f".{root.name}.failed-{uuid4().hex}"
+                    os.replace(root, failed_publication)
+                    shutil.rmtree(failed_publication, ignore_errors=True)
+                os.replace(backup, root)
+                root_was_backed_up = False
+            raise
+        if root_was_backed_up:
+            root_was_backed_up = False
+            shutil.rmtree(backup, ignore_errors=True)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        if root_was_backed_up and backup.exists() and not root.exists():
+            os.replace(backup, root)
+            root_was_backed_up = False
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
     return paths
