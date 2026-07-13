@@ -195,6 +195,30 @@ def test_deterministic_episode_uses_post_step_observation_before_terminal_step()
     assert first_observe[5] is False
 
 
+def test_deterministic_episode_rejects_termination_before_configured_horizon():
+    class EarlyTerminationEnv(FakeEnv):
+        def step(self, actions):
+            self.step_count += 1
+            info = {
+                "terminal_observation": np.array([9.0], dtype=np.float32),
+            }
+            return (
+                np.array([[0.0]], dtype=np.float32),
+                np.array([1.0], dtype=np.float32),
+                np.array([True]),
+                [info],
+            )
+
+    env = EarlyTerminationEnv()
+    model = HookedFakeModel()
+
+    with pytest.raises(RuntimeError, match="terminated before configured horizon"):
+        run_deterministic_episode(model, env, inference_mode="online_context")
+
+    assert env.step_count == 1
+    assert model.events[-1] == ("end",)
+
+
 @pytest.mark.parametrize("terminal_observation", ["missing", None])
 def test_terminal_step_requires_usable_terminal_observation_and_cleans_up(
     terminal_observation,

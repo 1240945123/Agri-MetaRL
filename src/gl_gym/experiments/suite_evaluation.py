@@ -166,13 +166,14 @@ def run_deterministic_episode(
         states = None
         episode_starts = np.ones((1,), dtype=bool)
 
-        for _ in range(n_steps):
+        for step_index in range(n_steps):
             previous_obs = obs
             actions, states = _predict(model, obs, states, episode_starts)
             obs, rewards, dones, infos = env.step(actions)
             action_trace.append(np.asarray(actions[0], dtype=np.float32).copy())
             totals["episode_return"] += float(rewards[0])
             info = infos[0]
+            done = bool(dones[0])
             for key in (
                 "EPI",
                 "revenue",
@@ -186,7 +187,6 @@ def run_deterministic_episode(
                 totals[key] += float(info.get(key, 0.0))
 
             if use_inference_hooks:
-                done = bool(dones[0])
                 if done:
                     next_observation = info.get("terminal_observation")
                     if next_observation is None:
@@ -203,6 +203,11 @@ def run_deterministic_episode(
                     next_observation,
                     done,
                     info,
+                )
+            if done and step_index + 1 < n_steps:
+                raise RuntimeError(
+                    "evaluation episode terminated before configured horizon: "
+                    f"step {step_index + 1} of {n_steps}"
                 )
             episode_starts = dones
 
