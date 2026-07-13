@@ -155,14 +155,11 @@ class TomatoEnv(GreenLightEnv):
             executed_control = np.array(self.u, copy=True)
             sampled_parameters = np.asarray(params, dtype=float).reshape(-1).copy()
         integration_error = None
+        p_dyn = ca.vertcat(ca.DM(self.weather_data[self.timestep]), params)
+        if diagnostics_enabled:
+            diagnostic_p_dyn = np.asarray(p_dyn, dtype=float).reshape(-1).copy()
         try:
-            p_dyn = ca.vertcat(ca.DM(self.weather_data[self.timestep]), params)
-            if diagnostics_enabled:
-                diagnostic_p_dyn = np.asarray(p_dyn, dtype=float).reshape(-1).copy()
             res = self.F(x0=ca.DM(self.x), u=ca.DM(self.u), p=p_dyn)
-            self.x = res["xf"].full().flatten()
-
-            # self.x = self.gl_model.evalF(self.x, self.u, self.weather_data[self.timestep], params)
         except Exception as error:
             integration_error = error
             if diagnostics_enabled:
@@ -188,6 +185,10 @@ class TomatoEnv(GreenLightEnv):
                     "traceback": traceback.format_exc(),
                 }
             self.terminated = True
+        else:
+            self.x = res["xf"].full().flatten()
+
+            # self.x = self.gl_model.evalF(self.x, self.u, self.weather_data[self.timestep], params)
 
         # update time
         self.day_of_year += (self.dt/self.c) % 365

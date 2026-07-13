@@ -132,6 +132,47 @@ def test_enabled_success_reports_raw_next_observation_without_failure(env, monke
     assert transition["raw_next_observation_available"] is True
 
 
+def test_input_construction_error_propagates_without_advancing_step(env, monkeypatch):
+    sentinel = RuntimeError("sentinel p_dyn construction failure")
+    original_vertcat = ca.vertcat
+
+    def fail_input_construction(*args):
+        raise sentinel
+
+    monkeypatch.setattr(
+        "gl_gym.environments.tomato_env.parametric_crop_uncertainty",
+        lambda p, scale, rng: np.asarray(p).copy(),
+    )
+    monkeypatch.setattr(
+        "gl_gym.environments.tomato_env.ca.vertcat", fail_input_construction
+    )
+    integrator = RecordingIntegrator(next_state=env.x.copy())
+    env.F = integrator
+    env.set_ode_diagnostics_enabled(True)
+    timestep = env.timestep
+    day_of_year = env.day_of_year
+    hour_of_day = env.hour_of_day
+    state = env.x.copy()
+    terminated = env.terminated
+
+    with pytest.raises(RuntimeError) as raised:
+        env.step(np.zeros(env.nu))
+
+    assert raised.value is sentinel
+    assert integrator.calls == []
+    assert env.timestep == timestep
+    assert env.day_of_year == day_of_year
+    assert env.hour_of_day == hour_of_day
+    np.testing.assert_array_equal(env.x, state)
+    assert env.terminated is terminated
+
+    monkeypatch.setattr("gl_gym.environments.tomato_env.ca.vertcat", original_vertcat)
+    _, _, _, _, later_info = env.step(np.zeros(env.nu))
+    assert "integration_failure" not in later_info
+    _, reset_info = env.reset(seed=123)
+    assert "integration_failure" not in reset_info
+
+
 def test_returned_diagnostics_are_isolated_from_later_mutation(env, monkeypatch):
     sampled_parameters = np.arange(env.num_params, dtype=float)
     monkeypatch.setattr(
