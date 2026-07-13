@@ -42,6 +42,25 @@ def _write_trace(path: Path, value: float, shape: tuple[int, ...] = (3, 2)) -> s
     return str(path)
 
 
+def _resume_evidence(**changes):
+    evidence = {
+        "model_sha256": "1" * 64,
+        "vecnormalize_sha256": "2" * 64,
+        "source_manifest_sha256": "3" * 64,
+        "source_tasks_sha256": "4" * 64,
+        "tomato_env_sha256": "5" * 64,
+        "ode_sha256": "6" * 64,
+        "model_utils_sha256": "7" * 64,
+        "tomato_env_config_sha256": "8" * 64,
+        "rule_based_config_sha256": "9" * 64,
+        "evaluation_provenance_sha256": "a" * 64,
+        "git_commit": "b" * 40,
+        "dirty": False,
+    }
+    evidence.update(changes)
+    return evidence
+
+
 def _raw_pair(tmp_path: Path) -> pd.DataFrame:
     rows = []
     for mode, return_value, epi, action in (
@@ -576,18 +595,41 @@ def test_validate_result_root_rejects_source_suite_collision(tmp_path: Path):
         cli.validate_result_root(tmp_path / "suite", tmp_path / "suite" / ".." / "suite")
 
 
-@pytest.mark.parametrize("relation", ["equal", "inside"])
+@pytest.mark.parametrize("relation", ["equal", "descendant", "ancestor"])
 def test_failure_root_must_be_isolated_from_formal_result_root(
     tmp_path: Path, relation: str
 ):
     cli = _load_context_cli()
     formal = tmp_path / "diagnostic"
-    failure = formal if relation == "equal" else formal / "failures"
+    source = tmp_path / "source"
+    if relation == "equal":
+        failure = formal
+    elif relation == "descendant":
+        failure = formal / "failures"
+    else:
+        failure = tmp_path
     with pytest.raises(ValueError, match="failure root"):
-        cli.validate_failure_root(failure, formal)
+        cli.validate_failure_root(failure, formal, source)
 
     approved = tmp_path / ".diagnostic.work" / "failures"
-    assert cli.validate_failure_root(approved, formal) == approved.resolve()
+    assert cli.validate_failure_root(approved, formal, source) == approved.resolve()
+
+
+@pytest.mark.parametrize("relation", ["equal", "descendant", "ancestor"])
+def test_failure_root_must_be_isolated_from_source_suite_tree(
+    tmp_path: Path, relation: str
+):
+    cli = _load_context_cli()
+    formal = tmp_path / "diagnostic"
+    source = tmp_path / "formal-source"
+    if relation == "equal":
+        failure = source
+    elif relation == "descendant":
+        failure = source / "failures"
+    else:
+        failure = tmp_path
+    with pytest.raises(ValueError, match="failure root"):
+        cli.validate_failure_root(failure, formal, source)
 
 
 def test_context_cli_parser_accepts_failure_root():
@@ -640,15 +682,60 @@ def test_resume_skip_requires_matching_progress_row_and_valid_trace(tmp_path: Pa
         "support_ready_step": np.nan,
         "context_norm_mean": 0.0,
         "context_norm_max": 0.0,
-        "model_sha256": "a" * 64,
-        "vecnormalize_sha256": "b" * 64,
-        "source_manifest_sha256": "c" * 64,
-        "source_tasks_sha256": "d" * 64,
+        **_resume_evidence(),
         **{metric: 1.0 for metric in PAIR_METRICS},
     }
     assert cli.resume_row_is_complete(row)
     trace.unlink()
     assert not cli.resume_row_is_complete(row)
+
+
+def test_resume_evidence_is_bound_to_full_evaluation_provenance(tmp_path: Path):
+    cli = _load_context_cli()
+    source_manifest = tmp_path / "manifest.json"
+    source_tasks = tmp_path / "tasks.csv"
+    source_manifest.write_text("{}", encoding="utf-8")
+    source_tasks.write_text("task_id\n", encoding="utf-8")
+    snapshot = cli._evaluation_provenance(
+        source_manifest,
+        source_tasks,
+        {"git_commit": "a" * 40, "dirty": False},
+    )
+    trace = tmp_path / "trace.npy"
+    np.save(trace, np.ones((3, 1), dtype=np.float32))
+    expected = {
+        "model_sha256": "1" * 64,
+        "vecnormalize_sha256": "2" * 64,
+        **snapshot,
+    }
+    row = {
+        "seed": 42,
+        "task_id": DIAGNOSTIC_TASK_IDS[0],
+        "split": "fixed",
+        "inference_mode": "zero_context",
+        "checkpoint_steps": 100,
+        "action_trace_path": str(trace),
+        "support_ready_step": np.nan,
+        "context_norm_mean": 0.0,
+        "context_norm_max": 0.0,
+        **expected,
+        **{metric: 1.0 for metric in PAIR_METRICS},
+    }
+
+    assert cli.resume_row_is_complete(row, expected_hashes=expected)
+    legacy = dict(row)
+    legacy.pop("evaluation_provenance_sha256")
+    assert not cli.resume_row_is_complete(legacy, expected_hashes=expected)
+    for name, replacement in (
+        ("tomato_env_sha256", "f" * 64),
+        ("ode_sha256", "e" * 64),
+        ("rule_based_config_sha256", "d" * 64),
+        ("git_commit", "b" * 40),
+        ("dirty", True),
+    ):
+        changed = dict(expected)
+        changed[name] = replacement
+        assert not cli.resume_row_is_complete(row, expected_hashes=changed)
     trace.write_bytes(b"not-npy")
     assert not cli.resume_row_is_complete(row)
 
@@ -685,10 +772,7 @@ def test_resume_row_must_match_current_checkpoint_steps(tmp_path: Path):
         "support_ready_step": np.nan,
         "context_norm_mean": 0.0,
         "context_norm_max": 0.0,
-        "model_sha256": "a" * 64,
-        "vecnormalize_sha256": "b" * 64,
-        "source_manifest_sha256": "c" * 64,
-        "source_tasks_sha256": "d" * 64,
+        **_resume_evidence(),
         **{metric: 1.0 for metric in PAIR_METRICS},
     }
 
@@ -710,10 +794,7 @@ def test_resume_online_row_requires_valid_readiness_and_context_diagnostics(tmp_
         "support_ready_step": 1.0,
         "context_norm_mean": 1.0,
         "context_norm_max": 2.0,
-        "model_sha256": "a" * 64,
-        "vecnormalize_sha256": "b" * 64,
-        "source_manifest_sha256": "c" * 64,
-        "source_tasks_sha256": "d" * 64,
+        **_resume_evidence(),
         **{metric: 1.0 for metric in PAIR_METRICS},
     }
     assert cli.resume_row_is_complete(base)
@@ -728,12 +809,7 @@ def test_resume_row_rejects_replaced_same_step_inputs(tmp_path: Path):
     cli = _load_context_cli()
     trace = tmp_path / "trace.npy"
     np.save(trace, np.ones((3, 1), dtype=np.float32))
-    expected = {
-        "model_sha256": "a" * 64,
-        "vecnormalize_sha256": "b" * 64,
-        "source_manifest_sha256": "c" * 64,
-        "source_tasks_sha256": "d" * 64,
-    }
+    expected = _resume_evidence()
     row = {
         "seed": 42, "task_id": DIAGNOSTIC_TASK_IDS[0],
         "split": "fixed",
@@ -761,7 +837,9 @@ def test_resume_hashes_detect_replaced_model_vec_and_changed_tasks(tmp_path: Pat
     }
     for path in paths.values():
         path.write_bytes(b"original")
-    expected = {name: cli.sha256_file(path) for name, path in paths.items()}
+    expected = _resume_evidence(
+        **{name: cli.sha256_file(path) for name, path in paths.items()}
+    )
     trace = tmp_path / "trace.npy"
     np.save(trace, np.ones((3, 1), dtype=np.float32))
     row = {
@@ -907,11 +985,25 @@ def test_cli_core_fake_smoke_writes_exactly_32_rows(tmp_path: Path):
     assert progress_raw["context_variance"].eq(4.2).all()
     for name in ("model_sha256", "vecnormalize_sha256", "source_manifest_sha256", "source_tasks_sha256"):
         assert progress_raw[name].str.fullmatch(r"[0-9a-f]{64}").all()
+    provenance_fields = (
+        "tomato_env_sha256",
+        "ode_sha256",
+        "model_utils_sha256",
+        "tomato_env_config_sha256",
+        "rule_based_config_sha256",
+        "evaluation_provenance_sha256",
+    )
+    for name in provenance_fields:
+        assert progress_raw[name].str.fullmatch(r"[0-9a-f]{64}").all()
+    assert progress_raw["git_commit"].eq("abc").all()
+    assert progress_raw["dirty"].eq(False).all()
     manifest = json.loads(
         (tmp_path / "diagnostic" / "diagnostic_manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["source_manifest_sha256"] == cli.sha256_file(source_manifest)
     assert manifest["source_tasks_sha256"] == cli.sha256_file(source_tasks_csv)
+    for name in (*provenance_fields, "git_commit", "dirty"):
+        assert manifest[name] == progress_raw.loc[0, name]
     assert len(list((tmp_path / "diagnostic" / "traces").glob("*.npy"))) == 32
 
 
@@ -998,6 +1090,63 @@ def test_failure_capture_builds_per_episode_context_and_does_not_publish(
         assert not (root / name).exists()
 
 
+def test_episode_error_remains_primary_when_environment_close_also_fails(
+    tmp_path: Path,
+):
+    case = _fake_cli_case(tmp_path)
+
+    class CloseFailureEnv:
+        def close(self):
+            raise RuntimeError("close failed")
+
+    def runner_failure(*args, **kwargs):
+        raise RuntimeError("runner failed")
+
+    with pytest.raises(RuntimeError, match="runner failed") as captured:
+        case.cli.run_diagnostic(
+            suite=case.suite,
+            tasks=case.tasks,
+            runs=case.runs,
+            result_root=tmp_path / "diagnostic",
+            source_manifest=case.source_manifest,
+            source_tasks_csv=case.source_tasks_csv,
+            device="cpu",
+            resume=False,
+            model_loader=case.model_loader,
+            env_loader=lambda *args: CloseFailureEnv(),
+            episode_runner=runner_failure,
+            provenance_loader=lambda: {"git_commit": "a" * 40, "dirty": False},
+        )
+
+    assert any("close failed" in note for note in captured.value.__notes__)
+
+
+def test_environment_close_error_propagates_after_successful_episode(
+    tmp_path: Path,
+):
+    case = _fake_cli_case(tmp_path)
+
+    class CloseFailureEnv:
+        def close(self):
+            raise RuntimeError("close failed")
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        case.cli.run_diagnostic(
+            suite=case.suite,
+            tasks=case.tasks,
+            runs=case.runs,
+            result_root=tmp_path / "diagnostic",
+            source_manifest=case.source_manifest,
+            source_tasks_csv=case.source_tasks_csv,
+            device="cpu",
+            resume=False,
+            model_loader=case.model_loader,
+            env_loader=lambda *args: CloseFailureEnv(),
+            episode_runner=case.episode_runner,
+            provenance_loader=lambda: {"git_commit": "a" * 40, "dirty": False},
+        )
+
+
 def test_failure_recorder_is_created_only_for_nonresumed_episode_keys(
     tmp_path: Path,
 ):
@@ -1007,6 +1156,10 @@ def test_failure_recorder_is_created_only_for_nonresumed_episode_keys(
     trace = tmp_path / "resumed_trace.npy"
     np.save(trace, np.ones((3, 1), dtype=np.float32))
     first_run = case.runs[0]
+    provenance = {"git_commit": "b" * 40, "dirty": False}
+    snapshot = case.cli._evaluation_provenance(
+        case.source_manifest, case.source_tasks_csv, provenance
+    )
     resumed_key = (42, DIAGNOSTIC_TASK_IDS[0], MODES[0])
     resumed_row = {
         "seed": resumed_key[0],
@@ -1020,8 +1173,7 @@ def test_failure_recorder_is_created_only_for_nonresumed_episode_keys(
         "context_norm_max": 0.0,
         "model_sha256": first_run["model_sha256"],
         "vecnormalize_sha256": first_run["vecnormalize_sha256"],
-        "source_manifest_sha256": case.cli.sha256_file(case.source_manifest),
-        "source_tasks_sha256": case.cli.sha256_file(case.source_tasks_csv),
+        **snapshot,
         **{metric: 1.0 for metric in PAIR_METRICS},
     }
     progress_path = case.cli._progress_path(root.resolve())
@@ -1053,13 +1205,79 @@ def test_failure_recorder_is_created_only_for_nonresumed_episode_keys(
             env_loader=case.env_loader,
             episode_runner=stop_first_executed,
             recorder_factory=recorder_factory,
-            provenance_loader=lambda: {"git_commit": "b" * 40, "dirty": False},
+            provenance_loader=lambda: provenance,
         )
 
     assert len(contexts) == 1
     executed_key = (contexts[0].seed, contexts[0].task_id, contexts[0].inference_mode)
     assert executed_key == (42, DIAGNOSTIC_TASK_IDS[0], MODES[1])
     assert executed_key != resumed_key
+
+
+def test_next_progress_write_drops_incompatible_legacy_rows(tmp_path: Path):
+    case = _fake_cli_case(tmp_path)
+    root = tmp_path / "diagnostic"
+    provenance = {"git_commit": "d" * 40, "dirty": False}
+    snapshot = case.cli._evaluation_provenance(
+        case.source_manifest, case.source_tasks_csv, provenance
+    )
+    first_run = case.runs[0]
+    rows = []
+    for mode in MODES:
+        trace = tmp_path / f"legacy_{mode}.npy"
+        np.save(trace, np.ones((3, 1), dtype=np.float32))
+        row = {
+            "seed": 42,
+            "task_id": DIAGNOSTIC_TASK_IDS[0],
+            "split": "fixed",
+            "inference_mode": mode,
+            "checkpoint_steps": 196608,
+            "action_trace_path": str(trace.resolve()),
+            "support_ready_step": 1.0 if mode == "online_context" else np.nan,
+            "context_norm_mean": 0.0,
+            "context_norm_max": 0.0,
+            "model_sha256": first_run["model_sha256"],
+            "vecnormalize_sha256": first_run["vecnormalize_sha256"],
+            **snapshot,
+            **{metric: 1.0 for metric in PAIR_METRICS},
+        }
+        if mode == "online_context":
+            row.pop("evaluation_provenance_sha256")
+        rows.append(row)
+    progress_path = case.cli._progress_path(root.resolve())
+    progress_path.parent.mkdir(parents=True)
+    pd.DataFrame(rows).to_csv(progress_path, index=False)
+    calls = 0
+
+    def rerun_legacy_then_stop(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("stop after progress rewrite")
+        return case.episode_runner(*args, **kwargs)
+
+    with pytest.raises(RuntimeError, match="stop after progress rewrite"):
+        case.cli.run_diagnostic(
+            suite=case.suite,
+            tasks=case.tasks,
+            runs=case.runs,
+            result_root=root,
+            source_manifest=case.source_manifest,
+            source_tasks_csv=case.source_tasks_csv,
+            device="cpu",
+            resume=True,
+            model_loader=case.model_loader,
+            env_loader=case.env_loader,
+            episode_runner=rerun_legacy_then_stop,
+            provenance_loader=lambda: provenance,
+        )
+
+    rewritten = pd.read_csv(progress_path)
+    assert len(rewritten) == 2
+    assert set(rewritten["inference_mode"]) == set(MODES)
+    assert rewritten["evaluation_provenance_sha256"].eq(
+        snapshot["evaluation_provenance_sha256"]
+    ).all()
 
 
 def test_failure_contexts_reuse_one_provenance_snapshot_across_episodes(

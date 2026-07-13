@@ -8,6 +8,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 from importlib import metadata
+import json
 import platform
 from pathlib import Path
 import shutil
@@ -40,21 +41,24 @@ from gl_gym.experiments.suite_schema import load_suite_manifest
 
 
 APPROVED_SEEDS = (42, 123)
+RELEVANT_SOURCE_FIELDS = (
+    ("tomato_env_sha256", Path("src/gl_gym/environments/tomato_env.py")),
+    ("ode_sha256", Path("src/gl_gym/environments/models/ode.py")),
+    ("model_utils_sha256", Path("src/gl_gym/environments/models/utils.py")),
+    ("tomato_env_config_sha256", Path("configs/envs/TomatoEnv.yml")),
+    ("rule_based_config_sha256", Path("configs/agents/rule_based.yml")),
+)
 HASH_FIELDS = (
     "model_sha256",
     "vecnormalize_sha256",
     "source_manifest_sha256",
     "source_tasks_sha256",
+    *(name for name, _ in RELEVANT_SOURCE_FIELDS),
+    "evaluation_provenance_sha256",
 )
+PROVENANCE_FIELDS = ("git_commit", "dirty")
 DEFAULT_RESULT_ROOT = Path(
     "artifacts/results/AgriControl_C_2026-07-10-v3-context-ab"
-)
-RELEVANT_FAILURE_SOURCES = (
-    Path("src/gl_gym/environments/tomato_env.py"),
-    Path("src/gl_gym/environments/models/ode.py"),
-    Path("src/gl_gym/environments/models/utils.py"),
-    Path("configs/envs/TomatoEnv.yml"),
-    Path("configs/agents/rule_based.yml"),
 )
 
 
@@ -135,13 +139,25 @@ def validate_result_root(
 def validate_failure_root(
     failure_root: str | Path,
     formal_result_root: str | Path,
+    source_suite_result_root: str | Path,
 ) -> Path:
-    """Require failure evidence to live outside the formal publication tree."""
+    """Require failure evidence to be disjoint from both formal result trees."""
 
     resolved = Path(failure_root).resolve()
     formal = Path(formal_result_root).resolve()
-    if resolved == formal or formal in resolved.parents:
-        raise ValueError("failure root must be outside the formal result root")
+    source = Path(source_suite_result_root).resolve()
+
+    def overlaps(first: Path, second: Path) -> bool:
+        return (
+            first == second
+            or first in second.parents
+            or second in first.parents
+        )
+
+    if overlaps(resolved, formal) or overlaps(resolved, source):
+        raise ValueError(
+            "failure root must be disjoint from the diagnostic and source formal roots"
+        )
     return resolved
 
 
@@ -172,11 +188,41 @@ def _package_versions() -> dict[str, str]:
     return versions
 
 
+def _evaluation_provenance(
+    source_manifest: str | Path,
+    source_tasks_csv: str | Path,
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "git_commit": str(provenance["git_commit"]),
+        "dirty": bool(provenance["dirty"]),
+        "source_manifest_sha256": sha256_file(source_manifest),
+        "source_tasks_sha256": sha256_file(source_tasks_csv),
+    }
+    snapshot.update(
+        {
+            name: sha256_file(ROOT / path)
+            for name, path in RELEVANT_SOURCE_FIELDS
+        }
+    )
+    canonical = json.dumps(
+        snapshot,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    snapshot["evaluation_provenance_sha256"] = hashlib.sha256(
+        canonical
+    ).hexdigest()
+    return snapshot
+
+
 def resume_row_is_complete(
     row: dict[str, Any] | pd.Series,
     *,
     checkpoint_steps: int | None = None,
-    expected_hashes: dict[str, str] | None = None,
+    expected_hashes: dict[str, Any] | None = None,
 ) -> bool:
     """Return whether a progress row has usable evidence and a valid action trace."""
 
@@ -191,6 +237,7 @@ def resume_row_is_complete(
         "context_norm_mean",
         "context_norm_max",
         *HASH_FIELDS,
+        *PROVENANCE_FIELDS,
         *PAIR_METRICS,
     }
     if not required.issubset(row.keys()):
@@ -209,6 +256,21 @@ def resume_row_is_complete(
             return False
         if expected_hashes is not None and any(
             row_hashes[name] != expected_hashes[name] for name in HASH_FIELDS
+        ):
+            return False
+        row_git_commit = str(row["git_commit"])
+        row_dirty = row["dirty"]
+        if isinstance(row_dirty, str):
+            if row_dirty not in {"True", "False"}:
+                return False
+            row_dirty = row_dirty == "True"
+        elif isinstance(row_dirty, (bool, np.bool_)):
+            row_dirty = bool(row_dirty)
+        else:
+            return False
+        if expected_hashes is not None and (
+            row_git_commit != str(expected_hashes["git_commit"])
+            or row_dirty != bool(expected_hashes["dirty"])
         ):
             return False
         metrics = np.asarray([float(row[name]) for name in PAIR_METRICS], dtype=float)
@@ -362,7 +424,7 @@ def run_diagnostic(
 
     root = validate_result_root(result_root, suite.result_root)
     capsule_root = (
-        validate_failure_root(failure_root, root)
+        validate_failure_root(failure_root, root, suite.result_root)
         if failure_root is not None
         else None
     )
@@ -370,33 +432,27 @@ def run_diagnostic(
         raise ValueError(f"diagnostic result root must be a directory: {root}")
     selected = select_diagnostic_tasks(tasks)
     task_records = [task_from_row(row) for row in selected.itertuples(index=False)]
+    evaluation_provenance = _evaluation_provenance(
+        source_manifest,
+        source_tasks_csv,
+        dict(provenance_loader()),
+    )
     progress_path = _progress_path(root)
     progress_rows = _load_progress(progress_path, resume)
-    source_hashes = {
-        "source_manifest_sha256": sha256_file(source_manifest),
-        "source_tasks_sha256": sha256_file(source_tasks_csv),
-    }
-    provenance: dict[str, Any] | None = None
-
-    def get_provenance() -> dict[str, Any]:
-        nonlocal provenance
-        if provenance is None:
-            provenance = dict(provenance_loader())
-        return provenance
 
     source_checksums: dict[str, str] = {}
     package_versions: dict[str, str] = {}
     if capsule_root is not None:
         source_checksums = {
-            str((ROOT / path).resolve()): sha256_file(ROOT / path)
-            for path in RELEVANT_FAILURE_SOURCES
+            str((ROOT / path).resolve()): evaluation_provenance[name]
+            for name, path in RELEVANT_SOURCE_FIELDS
         }
         source_checksums.update(
             {
-                str(Path(source_manifest).resolve()): source_hashes[
+                str(Path(source_manifest).resolve()): evaluation_provenance[
                     "source_manifest_sha256"
                 ],
-                str(Path(source_tasks_csv).resolve()): source_hashes[
+                str(Path(source_tasks_csv).resolve()): evaluation_provenance[
                     "source_tasks_sha256"
                 ],
             }
@@ -406,7 +462,7 @@ def run_diagnostic(
         int(run["seed"]): {
             "model_sha256": str(run["model_sha256"]),
             "vecnormalize_sha256": str(run["vecnormalize_sha256"]),
-            **source_hashes,
+            **evaluation_provenance,
         }
         for run in runs
     }
@@ -458,13 +514,13 @@ def run_diagnostic(
                 ):
                     continue
                 env = env_loader(suite, task, Path(run["vecnormalize_path"]))
+                primary_error: BaseException | None = None
                 try:
                     runner_kwargs: dict[str, Any] = {
                         "inference_mode": mode,
                         "return_diagnostics": True,
                     }
                     if capsule_root is not None:
-                        episode_provenance = get_provenance()
                         recorder = recorder_factory(
                             capsule_root,
                             CapsuleContext(
@@ -476,8 +532,8 @@ def run_diagnostic(
                                     Path(run["model_path"]).resolve()
                                 ),
                                 checkpoint_sha256=str(run["model_sha256"]),
-                                git_head=str(episode_provenance["git_commit"]),
-                                dirty=bool(episode_provenance["dirty"]),
+                                git_head=str(evaluation_provenance["git_commit"]),
+                                dirty=bool(evaluation_provenance["dirty"]),
                                 source_checksums=dict(source_checksums),
                                 package_versions=dict(package_versions),
                                 formal_result_root=str(root.resolve()),
@@ -487,8 +543,20 @@ def run_diagnostic(
                     metrics, diagnostics = episode_runner(
                         model, env, **runner_kwargs
                     )
+                except BaseException as error:
+                    primary_error = error
+                    raise
                 finally:
-                    env.close()
+                    try:
+                        env.close()
+                    except BaseException as close_error:
+                        if primary_error is not None:
+                            primary_error.add_note(
+                                "environment close also failed: "
+                                f"{type(close_error).__name__}: {close_error}"
+                            )
+                        else:
+                            raise
                 diagnostics = dict(diagnostics)
                 action_trace = np.asarray(
                     diagnostics.pop("action_trace"), dtype=np.float32
@@ -524,12 +592,10 @@ def run_diagnostic(
     if len(rows) != 32:
         raise RuntimeError(f"diagnostic completed {len(rows)} of 32 required episodes")
     raw = pd.DataFrame(rows)
-    provenance = get_provenance()
     manifest = {
         "source_manifest": str(Path(source_manifest).resolve()),
-        "source_manifest_sha256": source_hashes["source_manifest_sha256"],
         "source_tasks_csv": str(Path(source_tasks_csv).resolve()),
-        "source_tasks_sha256": source_hashes["source_tasks_sha256"],
+        **evaluation_provenance,
         "source_suite_id": str(suite.suite_id),
         "source_suite_result_root": str(Path(suite.result_root).resolve()),
         "result_root": str(root),
@@ -538,8 +604,6 @@ def run_diagnostic(
         "inference_modes": list(MODES),
         "seeds": list(APPROVED_SEEDS),
         "device": device,
-        "git_commit": str(provenance["git_commit"]),
-        "dirty": bool(provenance["dirty"]),
         "python_version": platform.python_version(),
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
     }
