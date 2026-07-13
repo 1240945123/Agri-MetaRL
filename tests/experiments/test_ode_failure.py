@@ -123,6 +123,23 @@ def _rewrite_manifest(path: Path, transform) -> None:
     )
 
 
+def _rewrite_history_npz(path: Path, transform) -> None:
+    history_path = path / "history.npz"
+    with np.load(history_path, allow_pickle=False) as archive:
+        arrays = {name: np.array(archive[name], copy=True) for name in archive.files}
+    transform(arrays)
+    np.savez_compressed(history_path, **arrays)
+
+    def update(manifest):
+        manifest["files"]["history.npz"]["sha256"] = _sha256(history_path)
+        manifest["arrays"]["history"] = {
+            name: {"dtype": array.dtype.str, "shape": list(array.shape)}
+            for name, array in sorted(arrays.items())
+        }
+
+    _rewrite_manifest(path, update)
+
+
 def test_context_is_frozen_and_capacity_is_fixed(tmp_path):
     context = _context()
     with pytest.raises(FrozenInstanceError):
@@ -160,6 +177,36 @@ def test_record_step_requires_complete_numeric_diagnostic_transition(tmp_path):
     with pytest.raises((TypeError, ValueError), match="numeric"):
         recorder.record_step(
             0, np.zeros(2), 0.0, False, {"diagnostic_transition": transition}
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "policy_observation",
+        "raw_observation",
+        "requested_action",
+        "previous_control",
+        "executed_control",
+        "raw_next_observation",
+    ],
+)
+def test_recorder_rejects_non_finite_transition_arrays(tmp_path, field):
+    recorder = FailureCapsuleRecorder(tmp_path, _context())
+    transition = _transition(0)
+    policy_observation = np.zeros(2)
+    if field == "policy_observation":
+        policy_observation[0] = np.nan
+    else:
+        transition[field][0] = np.inf
+
+    with pytest.raises(ValueError, match="finite"):
+        recorder.record_step(
+            0,
+            policy_observation,
+            0.0,
+            False,
+            {"diagnostic_transition": transition},
         )
 
 
@@ -317,6 +364,49 @@ def test_loader_rejects_p_dyn_mismatch_with_updated_checksum(tmp_path):
         ),
     )
     with pytest.raises(ValueError, match="p_dyn"):
+        load_failure_capsule(path)
+
+
+def test_loader_rejects_non_finite_history_array_with_updated_checksum(tmp_path):
+    path = _record_failure(tmp_path)
+
+    def corrupt(arrays):
+        arrays["policy_observation"][0, 0] = np.nan
+
+    _rewrite_history_npz(path, corrupt)
+    with pytest.raises(ValueError, match="finite"):
+        load_failure_capsule(path)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["requested_action", "previous_control", "executed_control"],
+)
+def test_loader_rejects_malformed_history_action_control_dimensions(tmp_path, field):
+    path = _record_failure(tmp_path)
+
+    def corrupt(arrays):
+        arrays[field] = arrays[field].reshape(len(arrays[field]), 1, 1)
+
+    _rewrite_history_npz(path, corrupt)
+    with pytest.raises(ValueError, match="dimension|width"):
+        load_failure_capsule(path)
+
+
+def test_loader_rejects_manifest_failure_id_and_path_mismatch(tmp_path):
+    path = _record_failure(tmp_path)
+    wrong_id = "0" * 64
+    _rewrite_manifest(path, lambda manifest: manifest.update(failure_id=wrong_id))
+    renamed = path.with_name(wrong_id)
+    path.rename(renamed)
+    with pytest.raises(ValueError, match="failure ID"):
+        load_failure_capsule(renamed)
+
+
+def test_loader_rejects_extra_regular_file(tmp_path):
+    path = _record_failure(tmp_path)
+    (path / "unexpected.txt").write_text("not part of the capsule", encoding="utf-8")
+    with pytest.raises(ValueError, match="extra|unexpected|required"):
         load_failure_capsule(path)
 
 

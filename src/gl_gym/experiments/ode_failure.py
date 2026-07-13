@@ -273,7 +273,7 @@ class FailureCapsuleRecorder:
             raise TypeError("done must be boolean")
         entry: dict[str, Any] = {
             "step_index": step,
-            "policy_observation": _numeric_array(
+            "policy_observation": _finite_array(
                 policy_observation, "policy_observation"
             ),
             "reward": scalar_reward,
@@ -282,7 +282,7 @@ class FailureCapsuleRecorder:
         for name in TRANSITION_ARRAYS:
             if name not in transition:
                 raise KeyError(f"diagnostic_transition['{name}'] is required")
-            entry[name] = _numeric_array(transition[name], name)
+            entry[name] = _finite_array(transition[name], name)
         if "raw_next_observation_available" not in transition:
             raise KeyError(
                 "diagnostic_transition['raw_next_observation_available'] is required"
@@ -295,7 +295,7 @@ class FailureCapsuleRecorder:
         if available:
             if raw_next is None:
                 raise ValueError("available raw_next_observation cannot be None")
-            entry["raw_next_observation"] = _numeric_array(
+            entry["raw_next_observation"] = _finite_array(
                 raw_next, "raw_next_observation"
             )
         else:
@@ -586,7 +586,11 @@ def _validate_failure_inputs(arrays: dict[str, np.ndarray]) -> None:
         raise ValueError("p_dyn must exactly equal concat(weather, sampled_parameters)")
 
 
-def _validate_history(arrays: dict[str, np.ndarray], rows: tuple[dict, ...]) -> None:
+def _validate_history(
+    arrays: dict[str, np.ndarray],
+    rows: tuple[dict, ...],
+    failure_inputs: dict[str, np.ndarray],
+) -> None:
     if set(arrays) != set(HISTORY_ARRAYS):
         raise ValueError("history.npz has missing or unexpected arrays")
     lengths = {array.shape[0] if array.ndim else -1 for array in arrays.values()}
@@ -599,20 +603,25 @@ def _validate_history(arrays: dict[str, np.ndarray], rows: tuple[dict, ...]) -> 
     for name in ("done", "raw_next_observation_available"):
         if arrays[name].ndim != 1 or arrays[name].dtype.kind != "b":
             raise ValueError(f"invalid history {name}")
-    for name in (
+    payload_names = (
         "policy_observation",
         "raw_observation",
         "requested_action",
         "previous_control",
         "executed_control",
         "raw_next_observation",
-    ):
-        if arrays[name].ndim < 2:
-            raise ValueError(f"invalid dimensions for history {name}")
+    )
+    for name in payload_names:
+        if arrays[name].ndim != 2:
+            raise ValueError(f"invalid dimensions for history {name}; expected 2D")
+        if not np.isfinite(arrays[name]).all():
+            raise ValueError(f"history {name} must contain only finite values")
     if arrays["raw_next_observation"].shape != arrays["raw_observation"].shape:
         raise ValueError("history raw-next shape mismatch")
-    if not np.isfinite(arrays["raw_next_observation"]).all():
-        raise ValueError("history raw-next values must be finite")
+    nu = int(failure_inputs["nu"])
+    for name in ("requested_action", "previous_control", "executed_control"):
+        if arrays[name].shape[1] != nu:
+            raise ValueError(f"history {name} width must equal failure nu={nu}")
     unavailable = ~arrays["raw_next_observation_available"]
     if np.any(arrays["raw_next_observation"][unavailable] != 0):
         raise ValueError("unavailable raw-next rows must use zero fill")
@@ -639,6 +648,9 @@ def _load_failure_capsule(
     missing = REQUIRED_FILES - present
     if missing:
         raise ValueError(f"missing required capsule files: {sorted(missing)}")
+    extra = present - REQUIRED_FILES
+    if extra:
+        raise ValueError(f"unexpected extra capsule files: {sorted(extra)}")
     manifest = _read_json(capsule_path / "manifest.json")
     if (
         not isinstance(manifest, dict)
@@ -671,7 +683,7 @@ def _load_failure_capsule(
     except (UnicodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError(f"invalid strict JSON in history.jsonl: {error}") from error
     history_rows = tuple(rows)
-    _validate_history(history_arrays, history_rows)
+    _validate_history(history_arrays, history_rows, failure_inputs)
     if manifest.get("history_length") != len(history_rows):
         raise ValueError("manifest history length mismatch")
     context = manifest.get("context")
