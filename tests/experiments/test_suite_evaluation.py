@@ -1,0 +1,471 @@
+import subprocess
+import sys
+from dataclasses import FrozenInstanceError, replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from gl_gym.experiments.suite_schema import create_default_suite_config, write_suite_manifest
+from gl_gym.experiments.suite_evaluation import (
+    EvaluationMetricRow,
+    append_eval_raw,
+    completed_eval_keys,
+    evaluation_key,
+    run_deterministic_episode,
+    validate_completed_run_paths,
+    write_eval_raw,
+)
+
+
+def load_evaluate_suite_module():
+    script_path = Path(__file__).resolve().parents[2] / "experiments" / "scripts" / "evaluate_suite.py"
+    spec = __import__("importlib.util").util.spec_from_file_location("evaluate_suite", script_path)
+    module = __import__("importlib.util").util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+class FakeModel:
+    def predict(self, obs, deterministic=True):
+        return np.array([[0.0]]), None
+
+
+class HookedFakeModel(FakeModel):
+    def __init__(self, fail_predict=False):
+        self.events = []
+        self.fail_predict = fail_predict
+        self.predict_count = 0
+
+    def begin_inference_episode(self, mode):
+        self.events.append(("begin", mode))
+
+    def predict(self, obs, deterministic=True, **kwargs):
+        self.events.append(("predict", np.asarray(obs).copy()))
+        if self.fail_predict:
+            raise RuntimeError("predict failed")
+        action = np.array([[float(self.predict_count)]])
+        self.predict_count += 1
+        return action, None
+
+    def observe_inference_transition(
+        self, observation, action, reward, next_observation, done, info
+    ):
+        self.events.append(
+            (
+                "observe",
+                np.asarray(observation).copy(),
+                np.asarray(action).copy(),
+                float(reward),
+                np.asarray(next_observation).copy(),
+                bool(done),
+                info,
+            )
+        )
+
+    def inference_episode_diagnostics(self):
+        self.events.append(("diagnostics",))
+        return {
+            "support_ready_step": 1.0,
+            "context_norm_mean": 2.0,
+            "context_norm_max": 3.0,
+        }
+
+    def end_inference_episode(self):
+        self.events.append(("end",))
+
+
+class FakeEnv:
+    def __init__(self):
+        self.step_count = 0
+
+    def get_attr(self, name):
+        if name == "N":
+            return [3]
+        raise AttributeError(name)
+
+    def reset(self):
+        return np.array([[0.0]])
+
+    def step(self, actions):
+        self.step_count += 1
+        info = {
+            "EPI": 1.0,
+            "revenue": 2.0,
+            "heat_cost": 0.3,
+            "co2_cost": 0.2,
+            "elec_cost": 0.1,
+            "temp_violation": 1,
+            "co2_violation": 2,
+            "rh_violation": 3,
+        }
+        return np.array([[0.0]]), np.array([10.0]), np.array([self.step_count == 3]), [info]
+
+
+def test_run_deterministic_episode_sums_metrics():
+    metrics = run_deterministic_episode(FakeModel(), FakeEnv())
+
+    assert metrics["episode_return"] == 30.0
+    assert metrics["EPI"] == 3.0
+    assert metrics["revenue"] == 6.0
+    assert metrics["temp_violation"] == 3
+    assert metrics["co2_violation"] == 6
+    assert metrics["rh_violation"] == 9
+
+
+def test_deterministic_episode_invokes_online_hooks_in_lifecycle_order():
+    model = HookedFakeModel()
+
+    metrics, diagnostics = run_deterministic_episode(
+        model,
+        FakeEnv(),
+        inference_mode="online_context",
+        return_diagnostics=True,
+    )
+
+    assert [event[0] for event in model.events] == [
+        "begin",
+        "predict",
+        "observe",
+        "predict",
+        "observe",
+        "predict",
+        "observe",
+        "diagnostics",
+        "end",
+    ]
+    assert model.events[0] == ("begin", "online_context")
+    assert metrics["episode_return"] == 30.0
+    assert diagnostics["context_norm_max"] == 3.0
+    np.testing.assert_array_equal(
+        diagnostics["action_trace"],
+        np.array([[0.0], [1.0], [2.0]], dtype=np.float32),
+    )
+    assert diagnostics["action_trace"].dtype == np.float32
+
+
+def test_deterministic_episode_passes_executed_transition_and_terminal_observation():
+    class TransitionEnv(FakeEnv):
+        def reset(self):
+            return np.array([[1.0, 2.0]], dtype=np.float32)
+
+        def step(self, actions):
+            self.step_count += 1
+            done = self.step_count == 3
+            info = {"marker": self.step_count}
+            if done:
+                info["terminal_observation"] = np.array([99.0, 100.0], dtype=np.float32)
+            post_step_obs = np.array(
+                [[10.0 + self.step_count, 20.0 + self.step_count]], dtype=np.float32
+            )
+            return post_step_obs, np.array([self.step_count]), np.array([done]), [info]
+
+    model = HookedFakeModel()
+    run_deterministic_episode(model, TransitionEnv(), inference_mode="online_context")
+    observations = [event for event in model.events if event[0] == "observe"]
+
+    np.testing.assert_array_equal(observations[0][1], np.array([1.0, 2.0]))
+    np.testing.assert_array_equal(observations[0][2], np.array([0.0]))
+    assert observations[0][3] == 1.0
+    np.testing.assert_array_equal(observations[0][4], np.array([11.0, 21.0]))
+    assert observations[0][5] is False
+    assert observations[0][6]["marker"] == 1
+
+    np.testing.assert_array_equal(observations[-1][1], np.array([12.0, 22.0]))
+    np.testing.assert_array_equal(observations[-1][2], np.array([2.0]))
+    assert observations[-1][3] == 3.0
+    np.testing.assert_array_equal(observations[-1][4], np.array([99.0, 100.0]))
+    assert observations[-1][5] is True
+    assert observations[-1][6]["marker"] == 3
+
+
+def test_deterministic_episode_uses_post_step_observation_without_terminal_observation():
+    model = HookedFakeModel()
+    run_deterministic_episode(model, FakeEnv(), inference_mode="online_context")
+
+    final_observe = [event for event in model.events if event[0] == "observe"][-1]
+    np.testing.assert_array_equal(final_observe[4], np.array([0.0]))
+    assert final_observe[5] is True
+
+
+def test_deterministic_episode_cleans_up_when_prediction_fails():
+    model = HookedFakeModel(fail_predict=True)
+
+    with pytest.raises(RuntimeError, match="predict failed"):
+        run_deterministic_episode(model, FakeEnv(), inference_mode="online_context")
+
+    assert [event[0] for event in model.events] == ["begin", "predict", "end"]
+
+
+def test_explicit_inference_mode_lists_missing_model_hooks():
+    class ModelMissingHooks(FakeModel):
+        def begin_inference_episode(self, mode):
+            pass
+
+    with pytest.raises(TypeError) as exc_info:
+        run_deterministic_episode(
+            ModelMissingHooks(), FakeEnv(), inference_mode="online_context"
+        )
+
+    message = str(exc_info.value)
+    assert "observe_inference_transition" in message
+    assert "inference_episode_diagnostics" in message
+    assert "end_inference_episode" in message
+
+
+def test_plain_model_retains_existing_evaluation_contract():
+    metrics = run_deterministic_episode(FakeModel(), FakeEnv())
+
+    assert isinstance(metrics, dict)
+    assert metrics["episode_return"] == 30.0
+
+
+def test_plain_model_can_request_generic_action_trace_diagnostics():
+    metrics, diagnostics = run_deterministic_episode(
+        FakeModel(), FakeEnv(), return_diagnostics=True
+    )
+
+    assert metrics["episode_return"] == 30.0
+    assert set(diagnostics) == {"action_trace"}
+    np.testing.assert_array_equal(
+        diagnostics["action_trace"], np.zeros((3, 1), dtype=np.float32)
+    )
+
+
+def test_write_eval_raw_has_one_row_per_run_task(tmp_path: Path):
+    rows = [
+        EvaluationMetricRow(
+            suite_id="suite",
+            algorithm="ppo",
+            seed=42,
+            run_name="ppo_seed42",
+            task_id="fixed_2010_d59_u0p00_standard",
+            split="fixed",
+            weather_year=2010,
+            start_day=59,
+            uncertainty_scale=0.0,
+            economic_scenario="standard",
+            climate_constraint_scenario="standard",
+            episode_return=30.0,
+            EPI=3.0,
+            revenue=6.0,
+            heat_cost=0.9,
+            co2_cost=0.6,
+            elec_cost=0.3,
+            temp_violation=3.0,
+            co2_violation=6.0,
+            rh_violation=9.0,
+            twb_percent=float("nan"),
+            trajectory_path="",
+        )
+    ]
+
+    out = write_eval_raw(rows, tmp_path / "eval_raw.csv")
+    df = pd.read_csv(out)
+
+    assert len(df) == 1
+    assert df.loc[0, "algorithm"] == "ppo"
+    assert df.loc[0, "task_id"] == "fixed_2010_d59_u0p00_standard"
+    assert df.loc[0, "climate_constraint_scenario"] == "standard"
+
+
+def test_append_eval_raw_preserves_existing_rows_and_header(tmp_path: Path):
+    first = EvaluationMetricRow(
+        suite_id="suite",
+        algorithm="ppo",
+        seed=42,
+        run_name="ppo_seed42",
+        task_id="fixed",
+        split="fixed",
+        weather_year=2010,
+        start_day=59,
+        uncertainty_scale=0.0,
+        economic_scenario="standard",
+        climate_constraint_scenario="standard",
+        episode_return=30.0,
+        EPI=3.0,
+        revenue=6.0,
+        heat_cost=0.9,
+        co2_cost=0.6,
+        elec_cost=0.3,
+        temp_violation=3.0,
+        co2_violation=6.0,
+        rh_violation=9.0,
+        twb_percent=float("nan"),
+        trajectory_path="",
+    )
+    second = replace(first, seed=123, run_name="ppo_seed123")
+
+    out = tmp_path / "eval_raw.csv"
+    append_eval_raw(first, out)
+    append_eval_raw(second, out)
+    df = pd.read_csv(out)
+
+    assert len(df) == 2
+    assert df["seed"].tolist() == [42, 123]
+
+
+def test_completed_eval_keys_identifies_existing_run_task_pairs(tmp_path: Path):
+    row = EvaluationMetricRow(
+        suite_id="suite",
+        algorithm="ppo",
+        seed=42,
+        run_name="ppo_seed42",
+        task_id="fixed",
+        split="fixed",
+        weather_year=2010,
+        start_day=59,
+        uncertainty_scale=0.0,
+        economic_scenario="standard",
+        climate_constraint_scenario="standard",
+        episode_return=30.0,
+        EPI=3.0,
+        revenue=6.0,
+        heat_cost=0.9,
+        co2_cost=0.6,
+        elec_cost=0.3,
+        temp_violation=3.0,
+        co2_violation=6.0,
+        rh_violation=9.0,
+        twb_percent=float("nan"),
+        trajectory_path="",
+    )
+    out = append_eval_raw(row, tmp_path / "eval_raw.csv")
+
+    assert completed_eval_keys(out) == {evaluation_key("ppo", 42, "fixed")}
+
+
+def test_evaluation_metric_row_is_frozen_and_slotted():
+    row = EvaluationMetricRow(
+        suite_id="suite",
+        algorithm="ppo",
+        seed=42,
+        run_name="ppo_seed42",
+        task_id="fixed_2010_d59_u0p00_standard",
+        split="fixed",
+        weather_year=2010,
+        start_day=59,
+        uncertainty_scale=0.0,
+        economic_scenario="standard",
+        climate_constraint_scenario="standard",
+        episode_return=30.0,
+        EPI=3.0,
+        revenue=6.0,
+        heat_cost=0.9,
+        co2_cost=0.6,
+        elec_cost=0.3,
+        temp_violation=3.0,
+        co2_violation=6.0,
+        rh_violation=9.0,
+        twb_percent=float("nan"),
+        trajectory_path="",
+    )
+
+    assert hasattr(EvaluationMetricRow, "__slots__")
+
+    try:
+        row.algorithm = "recurrentppo"
+    except FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("EvaluationMetricRow should be frozen")
+
+
+def test_validate_completed_run_paths_fails_fast_for_missing_artifacts(tmp_path: Path):
+    run = SimpleNamespace(
+        status="completed",
+        model_path=str(tmp_path / "missing_model.zip"),
+        vecnormalize_path=str(tmp_path / "missing_vecnormalize.pkl"),
+    )
+
+    with pytest.raises(FileNotFoundError, match="model_path does not exist"):
+        validate_completed_run_paths(run)
+
+
+def test_validate_completed_run_paths_ignores_dry_run_missing_artifacts(tmp_path: Path):
+    run = SimpleNamespace(
+        status="dry_run",
+        model_path=str(tmp_path / "missing_model.zip"),
+        vecnormalize_path=str(tmp_path / "missing_vecnormalize.pkl"),
+    )
+
+    validate_completed_run_paths(run)
+
+
+def test_evaluate_suite_filters_tasks_for_smoke_runs():
+    module = load_evaluate_suite_module()
+    tasks = pd.DataFrame(
+        [
+            {"task_id": "fixed_2010_d59_u0p00_standard", "split": "fixed"},
+            {"task_id": "heldout_2011_d59_u0p00_standard", "split": "heldout"},
+            {"task_id": "economic_2011_d59_u0p00_high_energy_price", "split": "economic"},
+        ]
+    )
+
+    filtered = module.filter_tasks(tasks, splits=["heldout", "economic"], limit_tasks=1)
+
+    assert filtered["task_id"].tolist() == ["heldout_2011_d59_u0p00_standard"]
+
+
+def test_evaluate_suite_dry_run_only_writes_clear_message_without_eval_raw(tmp_path: Path):
+    result_root = tmp_path / "results"
+    suite = create_default_suite_config(result_root=result_root, model_root=tmp_path / "models")
+    manifest = write_suite_manifest(suite, result_root / "suite_manifest.json")
+    runs_csv = tmp_path / "runs.csv"
+    tasks_csv = tmp_path / "eval_tasks.csv"
+
+    pd.DataFrame(
+        [
+            {
+                "suite_id": suite.suite_id,
+                "algorithm": "ppo",
+                "seed": 42,
+                "run_name": "ppo_seed42",
+                "model_path": str(tmp_path / "missing_model.zip"),
+                "vecnormalize_path": str(tmp_path / "missing_vecnormalize.pkl"),
+                "status": "dry_run",
+                "train_steps": 0,
+                "wall_time_seconds": 0.0,
+                "best_eval_return": float("nan"),
+                "notes": "dry-run registry entry",
+            }
+        ]
+    ).to_csv(runs_csv, index=False)
+    pd.DataFrame(
+        [
+            {
+                "suite_id": suite.suite_id,
+                "task_id": "fixed_2010_d59_u0p00_standard",
+                "split": "fixed",
+                "weather_year": 2010,
+                "start_day": 59,
+                "uncertainty_scale": 0.0,
+                "economic_scenario": "standard",
+                "climate_constraint_scenario": "standard",
+            }
+        ]
+    ).to_csv(tasks_csv, index=False)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "experiments/scripts/evaluate_suite.py",
+            "--manifest",
+            str(manifest),
+            "--runs_csv",
+            str(runs_csv),
+            "--tasks_csv",
+            str(tasks_csv),
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "No completed runs to evaluate; eval_raw.csv was not written." in result.stdout
+    assert not (result_root / "eval_raw.csv").exists()
