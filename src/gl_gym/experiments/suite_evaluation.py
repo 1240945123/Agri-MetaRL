@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import inspect
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -37,16 +38,26 @@ class EvaluationMetricRow:
 
 
 def _predict(model: Any, obs: Any, states: Any, episode_starts: np.ndarray) -> tuple[Any, Any]:
-    try:
+    parameters = inspect.signature(model.predict).parameters.values()
+    supports_keyword_arguments = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
+    )
+    parameter_names = {parameter.name for parameter in parameters}
+    supports_recurrent_state = supports_keyword_arguments or {
+        "state",
+        "episode_start",
+    }.issubset(parameter_names)
+
+    if supports_recurrent_state:
         return model.predict(
             obs,
             state=states,
             episode_start=episode_starts,
             deterministic=True,
         )
-    except TypeError:
-        actions, _ = model.predict(obs, deterministic=True)
-        return actions, states
+
+    actions, _ = model.predict(obs, deterministic=True)
+    return actions, states
 
 
 def run_deterministic_episode(
@@ -85,10 +96,11 @@ def run_deterministic_episode(
     action_trace: list[np.ndarray] = []
     model_diagnostics: dict[str, Any] = {}
 
-    if use_inference_hooks:
-        model.begin_inference_episode(inference_mode)
-
+    primary_error: BaseException | None = None
     try:
+        if use_inference_hooks:
+            model.begin_inference_episode(inference_mode)
+
         reset_result = env.reset()
         obs = reset_result[0] if isinstance(reset_result, tuple) else reset_result
         states = None
@@ -115,9 +127,15 @@ def run_deterministic_episode(
 
             if use_inference_hooks:
                 done = bool(dones[0])
-                next_observation = (
-                    info.get("terminal_observation", obs[0]) if done else obs[0]
-                )
+                if done:
+                    next_observation = info.get("terminal_observation")
+                    if next_observation is None:
+                        raise ValueError(
+                            "done transition requires a non-None "
+                            "info['terminal_observation']"
+                        )
+                else:
+                    next_observation = obs[0]
                 model.observe_inference_transition(
                     previous_obs[0],
                     actions[0],
@@ -130,9 +148,16 @@ def run_deterministic_episode(
 
         if use_inference_hooks:
             model_diagnostics = dict(model.inference_episode_diagnostics())
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
         if use_inference_hooks:
-            model.end_inference_episode()
+            try:
+                model.end_inference_episode()
+            except Exception:
+                if primary_error is None:
+                    raise
 
     if not return_diagnostics:
         return totals

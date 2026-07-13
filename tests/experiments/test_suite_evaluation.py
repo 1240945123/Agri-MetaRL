@@ -102,7 +102,10 @@ class FakeEnv:
             "co2_violation": 2,
             "rh_violation": 3,
         }
-        return np.array([[0.0]]), np.array([10.0]), np.array([self.step_count == 3]), [info]
+        done = self.step_count == 3
+        if done:
+            info["terminal_observation"] = np.array([0.0])
+        return np.array([[0.0]]), np.array([10.0]), np.array([done]), [info]
 
 
 def test_run_deterministic_episode_sums_metrics():
@@ -182,13 +185,38 @@ def test_deterministic_episode_passes_executed_transition_and_terminal_observati
     assert observations[-1][6]["marker"] == 3
 
 
-def test_deterministic_episode_uses_post_step_observation_without_terminal_observation():
+def test_deterministic_episode_uses_post_step_observation_before_terminal_step():
     model = HookedFakeModel()
     run_deterministic_episode(model, FakeEnv(), inference_mode="online_context")
 
-    final_observe = [event for event in model.events if event[0] == "observe"][-1]
-    np.testing.assert_array_equal(final_observe[4], np.array([0.0]))
-    assert final_observe[5] is True
+    first_observe = [event for event in model.events if event[0] == "observe"][0]
+    np.testing.assert_array_equal(first_observe[4], np.array([0.0]))
+    assert first_observe[5] is False
+
+
+@pytest.mark.parametrize("terminal_observation", ["missing", None])
+def test_terminal_step_requires_usable_terminal_observation_and_cleans_up(
+    terminal_observation,
+):
+    class InvalidTerminalEnv(FakeEnv):
+        def step(self, actions):
+            obs, rewards, dones, infos = super().step(actions)
+            if bool(dones[0]):
+                if terminal_observation == "missing":
+                    infos[0].pop("terminal_observation")
+                else:
+                    infos[0]["terminal_observation"] = None
+            return obs, rewards, dones, infos
+
+    model = HookedFakeModel()
+
+    with pytest.raises(ValueError, match="terminal_observation"):
+        run_deterministic_episode(
+            model, InvalidTerminalEnv(), inference_mode="online_context"
+        )
+
+    assert [event[0] for event in model.events].count("observe") == 2
+    assert model.events[-1] == ("end",)
 
 
 def test_deterministic_episode_cleans_up_when_prediction_fails():
@@ -198,6 +226,67 @@ def test_deterministic_episode_cleans_up_when_prediction_fails():
         run_deterministic_episode(model, FakeEnv(), inference_mode="online_context")
 
     assert [event[0] for event in model.events] == ["begin", "predict", "end"]
+
+
+def test_predict_internal_type_error_is_not_retried_or_masked():
+    class InternalTypeErrorModel:
+        def __init__(self):
+            self.calls = 0
+
+        def predict(
+            self, obs, state=None, episode_start=None, deterministic=True
+        ):
+            self.calls += 1
+            raise TypeError("model internals broke")
+
+    model = InternalTypeErrorModel()
+
+    with pytest.raises(TypeError, match="model internals broke"):
+        run_deterministic_episode(model, FakeEnv())
+
+    assert model.calls == 1
+
+
+def test_begin_failure_still_ends_partially_initialized_episode():
+    class BeginFailureModel(HookedFakeModel):
+        def begin_inference_episode(self, mode):
+            self.events.append(("begin", mode))
+            raise RuntimeError("begin failed")
+
+    model = BeginFailureModel()
+
+    with pytest.raises(RuntimeError, match="begin failed"):
+        run_deterministic_episode(model, FakeEnv(), inference_mode="online_context")
+
+    assert [event[0] for event in model.events] == ["begin", "end"]
+
+
+def test_prediction_error_remains_primary_when_cleanup_also_fails():
+    class DoubleFailureModel(HookedFakeModel):
+        def end_inference_episode(self):
+            self.events.append(("end",))
+            raise RuntimeError("end failed")
+
+    model = DoubleFailureModel(fail_predict=True)
+
+    with pytest.raises(RuntimeError, match="predict failed"):
+        run_deterministic_episode(model, FakeEnv(), inference_mode="online_context")
+
+    assert model.events[-1] == ("end",)
+
+
+def test_cleanup_error_propagates_after_successful_episode():
+    class EndFailureModel(HookedFakeModel):
+        def end_inference_episode(self):
+            self.events.append(("end",))
+            raise RuntimeError("end failed")
+
+    model = EndFailureModel()
+
+    with pytest.raises(RuntimeError, match="end failed"):
+        run_deterministic_episode(model, FakeEnv(), inference_mode="online_context")
+
+    assert model.events[-1] == ("end",)
 
 
 def test_explicit_inference_mode_lists_missing_model_hooks():
