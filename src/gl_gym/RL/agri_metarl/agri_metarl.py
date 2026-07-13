@@ -297,14 +297,41 @@ class AgriMetaRL(RecurrentPPO):
         if self._inference_mode is None or self._inference_support_memory is None:
             raise RuntimeError("begin_inference_episode() must be called first")
 
-        observation_array = np.asarray(observation)
-        action_array = np.asarray(action)
-        next_observation_array = np.asarray(next_observation)
+        def canonicalize_single_env(value, expected_shape, name):
+            array = np.asarray(value)
+            if array.shape == (1, *expected_shape):
+                array = array[0]
+            elif array.shape != expected_shape:
+                raise ValueError(
+                    f"inference {name} shape must be {expected_shape} or "
+                    f"{(1, *expected_shape)}, got {array.shape}"
+                )
+            with np.errstate(over="ignore", invalid="ignore"):
+                return np.asarray(array, dtype=np.float32)
+
+        observation_array = canonicalize_single_env(
+            observation, tuple(self.raw_observation_space.shape), "observation"
+        )
+        action_array = canonicalize_single_env(
+            action, tuple(self.action_space.shape), "action"
+        )
+        next_observation_array = canonicalize_single_env(
+            next_observation,
+            tuple(self.raw_observation_space.shape),
+            "next observation",
+        )
+        reward_array = np.asarray(reward)
+        if reward_array.shape != ():
+            raise ValueError(
+                f"inference reward shape must be scalar, got {reward_array.shape}"
+            )
+        with np.errstate(over="ignore", invalid="ignore"):
+            reward_value = float(np.asarray(reward_array, dtype=np.float32))
         if (
             not np.isfinite(observation_array).all()
             or not np.isfinite(action_array).all()
             or not np.isfinite(next_observation_array).all()
-            or not np.isfinite(reward)
+            or not np.isfinite(reward_value)
         ):
             raise ValueError("inference transition must contain only finite values")
         if (
@@ -320,10 +347,10 @@ class AgriMetaRL(RecurrentPPO):
             raise ValueError("task identity changed inside one inference episode")
         self._inference_task_key = task_key
         transition = Transition(
-            observation=np.asarray(observation_array, dtype=np.float32),
-            action=np.asarray(action_array, dtype=np.float32).reshape(-1),
-            reward=float(reward),
-            next_observation=np.asarray(next_observation_array, dtype=np.float32),
+            observation=observation_array,
+            action=action_array.reshape(-1),
+            reward=reward_value,
+            next_observation=next_observation_array,
             done=bool(done),
         )
         self._inference_support_memory.observe(task_key, transition)

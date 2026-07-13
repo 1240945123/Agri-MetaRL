@@ -538,6 +538,90 @@ def test_online_transition_rejects_nonfinite_values(
         )
 
 
+@pytest.mark.parametrize(
+    "huge_field", ["observation", "action", "reward", "next_observation"]
+)
+def test_online_transition_rejects_float32_overflow_without_mutating_memory(
+    huge_field,
+):
+    model = make_tiny_agri_metarl(support_size=1)
+    model.begin_inference_episode("online_context")
+    values = {
+        "observation": np.zeros(3, dtype=np.float64),
+        "action": np.zeros(1, dtype=np.float64),
+        "reward": 1.0,
+        "next_observation": np.ones(3, dtype=np.float64),
+    }
+    if huge_field == "reward":
+        values[huge_field] = 1e300
+    else:
+        values[huge_field][0] = 1e300
+
+    with pytest.raises(ValueError, match="finite"):
+        model.observe_inference_transition(
+            values["observation"],
+            values["action"],
+            values["reward"],
+            values["next_observation"],
+            False,
+            _inference_info(),
+        )
+
+    assert model._inference_task_key is None
+    assert model._inference_step == 0
+    assert model._inference_support_memory.support("eval-task-1") == ()
+
+
+def test_online_transition_canonicalizes_singleton_evaluator_batch():
+    model = make_tiny_agri_metarl(support_size=1)
+    model.begin_inference_episode("online_context")
+
+    model.observe_inference_transition(
+        np.zeros((1, 3), dtype=np.float32),
+        np.zeros((1, 1), dtype=np.float32),
+        1.0,
+        np.ones((1, 3), dtype=np.float32),
+        False,
+        _inference_info(),
+    )
+
+    transition = model._inference_support_memory.support("eval-task-1")[0]
+    assert transition.observation.shape == (3,)
+    assert transition.next_observation.shape == (3,)
+    assert transition.action.shape == (1,)
+    assert model._inference_support_ready_step == 1
+    action, _ = model.predict(
+        np.ones((1, 3), dtype=np.float32), deterministic=True
+    )
+    assert action.shape == (1, 1)
+
+
+@pytest.mark.parametrize(
+    ("observation", "action", "next_observation"),
+    [
+        (np.zeros((2, 3)), np.zeros(1), np.ones(3)),
+        (np.zeros(3), np.zeros(1), np.ones((2, 3))),
+        (np.zeros(3), np.zeros(2), np.ones(3)),
+        (np.zeros(3), np.zeros((2, 1)), np.ones(3)),
+    ],
+)
+def test_online_transition_rejects_non_singleton_evaluator_shapes(
+    observation, action, next_observation
+):
+    model = make_tiny_agri_metarl()
+    model.begin_inference_episode("online_context")
+
+    with pytest.raises(ValueError, match="shape"):
+        model.observe_inference_transition(
+            observation,
+            action,
+            1.0,
+            next_observation,
+            False,
+            _inference_info(),
+        )
+
+
 def test_online_predict_rejects_more_than_one_evaluation_environment():
     model = make_tiny_agri_metarl()
     model.begin_inference_episode("online_context")
