@@ -998,6 +998,131 @@ def test_failure_capture_builds_per_episode_context_and_does_not_publish(
         assert not (root / name).exists()
 
 
+def test_failure_recorder_is_created_only_for_nonresumed_episode_keys(
+    tmp_path: Path,
+):
+    case = _fake_cli_case(tmp_path)
+    root = tmp_path / "diagnostic"
+    failure_root = tmp_path / ".diagnostic.work" / "failures"
+    trace = tmp_path / "resumed_trace.npy"
+    np.save(trace, np.ones((3, 1), dtype=np.float32))
+    first_run = case.runs[0]
+    resumed_key = (42, DIAGNOSTIC_TASK_IDS[0], MODES[0])
+    resumed_row = {
+        "seed": resumed_key[0],
+        "task_id": resumed_key[1],
+        "split": "fixed",
+        "inference_mode": resumed_key[2],
+        "checkpoint_steps": 196608,
+        "action_trace_path": str(trace.resolve()),
+        "support_ready_step": np.nan,
+        "context_norm_mean": 0.0,
+        "context_norm_max": 0.0,
+        "model_sha256": first_run["model_sha256"],
+        "vecnormalize_sha256": first_run["vecnormalize_sha256"],
+        "source_manifest_sha256": case.cli.sha256_file(case.source_manifest),
+        "source_tasks_sha256": case.cli.sha256_file(case.source_tasks_csv),
+        **{metric: 1.0 for metric in PAIR_METRICS},
+    }
+    progress_path = case.cli._progress_path(root.resolve())
+    progress_path.parent.mkdir(parents=True)
+    pd.DataFrame([resumed_row]).to_csv(progress_path, index=False)
+    contexts = []
+
+    def recorder_factory(path, context):
+        contexts.append(context)
+        return object()
+
+    def stop_first_executed(
+        model, env, *, inference_mode, return_diagnostics, failure_recorder
+    ):
+        raise RuntimeError("stop after resumed key")
+
+    with pytest.raises(RuntimeError, match="stop after resumed key"):
+        case.cli.run_diagnostic(
+            suite=case.suite,
+            tasks=case.tasks,
+            runs=case.runs,
+            result_root=root,
+            failure_root=failure_root,
+            source_manifest=case.source_manifest,
+            source_tasks_csv=case.source_tasks_csv,
+            device="cpu",
+            resume=True,
+            model_loader=case.model_loader,
+            env_loader=case.env_loader,
+            episode_runner=stop_first_executed,
+            recorder_factory=recorder_factory,
+            provenance_loader=lambda: {"git_commit": "b" * 40, "dirty": False},
+        )
+
+    assert len(contexts) == 1
+    executed_key = (contexts[0].seed, contexts[0].task_id, contexts[0].inference_mode)
+    assert executed_key == (42, DIAGNOSTIC_TASK_IDS[0], MODES[1])
+    assert executed_key != resumed_key
+
+
+def test_failure_contexts_reuse_one_provenance_snapshot_across_episodes(
+    tmp_path: Path,
+):
+    case = _fake_cli_case(tmp_path)
+    contexts = []
+    provenance_calls = 0
+    runner_calls = 0
+
+    def recorder_factory(path, context):
+        contexts.append(context)
+        return object()
+
+    def provenance_loader():
+        nonlocal provenance_calls
+        provenance_calls += 1
+        return {"git_commit": "c" * 40, "dirty": True}
+
+    def execute_then_stop(
+        model, env, *, inference_mode, return_diagnostics, failure_recorder
+    ):
+        nonlocal runner_calls
+        runner_calls += 1
+        if runner_calls == 2:
+            raise RuntimeError("stop after two contexts")
+        return case.episode_runner(
+            model,
+            env,
+            inference_mode=inference_mode,
+            return_diagnostics=return_diagnostics,
+        )
+
+    with pytest.raises(RuntimeError, match="stop after two contexts"):
+        case.cli.run_diagnostic(
+            suite=case.suite,
+            tasks=case.tasks,
+            runs=case.runs,
+            result_root=tmp_path / "diagnostic",
+            failure_root=tmp_path / ".diagnostic.work" / "failures",
+            source_manifest=case.source_manifest,
+            source_tasks_csv=case.source_tasks_csv,
+            device="cpu",
+            resume=False,
+            model_loader=case.model_loader,
+            env_loader=case.env_loader,
+            episode_runner=execute_then_stop,
+            recorder_factory=recorder_factory,
+            provenance_loader=provenance_loader,
+        )
+
+    assert provenance_calls == 1
+    assert len(contexts) == 2
+    assert {(context.git_head, context.dirty) for context in contexts} == {
+        ("c" * 40, True)
+    }
+    assert [context.task_id for context in contexts] == [
+        DIAGNOSTIC_TASK_IDS[0],
+        DIAGNOSTIC_TASK_IDS[0],
+    ]
+    assert [context.inference_mode for context in contexts] == list(MODES)
+
+
 @pytest.mark.parametrize("failure_stage", ["mid_run", "final_publish"])
 def test_diagnostic_failure_preserves_published_root_and_resumable_work(
     tmp_path: Path, monkeypatch, failure_stage: str

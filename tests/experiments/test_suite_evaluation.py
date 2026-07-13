@@ -246,6 +246,60 @@ def test_enable_failure_avoids_disable_and_still_ends_inference_episode():
     assert [event[0] for event in model.events] == ["begin", "end"]
 
 
+def test_reset_error_remains_primary_when_both_cleanups_fail_in_order():
+    events = []
+
+    class ResetFailureEnv:
+        def get_attr(self, name):
+            assert name == "N"
+            return [3]
+
+        def env_method(self, name, enabled):
+            assert name == "set_ode_diagnostics_enabled"
+            events.append(("diagnostics", enabled))
+            if not enabled:
+                raise RuntimeError("disable failed")
+
+        def reset(self):
+            events.append(("reset",))
+            raise RuntimeError("reset failed")
+
+    class CleanupFailureModel:
+        def begin_inference_episode(self, mode):
+            events.append(("begin", mode))
+
+        def observe_inference_transition(self, *args):
+            raise AssertionError("no transition should be observed")
+
+        def inference_episode_diagnostics(self):
+            raise AssertionError("no diagnostics should be requested")
+
+        def end_inference_episode(self):
+            events.append(("end",))
+            raise RuntimeError("end failed")
+
+        def predict(self, *args, **kwargs):
+            raise AssertionError("prediction should not run")
+
+    with pytest.raises(RuntimeError, match="reset failed") as captured:
+        run_deterministic_episode(
+            CleanupFailureModel(),
+            ResetFailureEnv(),
+            inference_mode="online_context",
+            failure_recorder=RecordingFailureRecorder(),
+        )
+
+    assert events == [
+        ("begin", "online_context"),
+        ("diagnostics", True),
+        ("reset",),
+        ("diagnostics", False),
+        ("end",),
+    ]
+    assert any("disable failed" in note for note in captured.value.__notes__)
+    assert any("end failed" in note for note in captured.value.__notes__)
+
+
 def test_primary_error_keeps_priority_over_disable_and_inference_cleanup_errors():
     class CleanupFailModel(HookedFakeModel):
         def end_inference_episode(self):
