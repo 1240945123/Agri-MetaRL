@@ -37,9 +37,14 @@ def _capsule(tmp_path: Path):
     (capsule_dir / "manifest.json").write_text("{}", encoding="utf-8")
     weather = np.array([10.0, 11.0])
     params = np.array([12.0])
-    requested = np.array([1.0, -1.0])
-    previous = np.array([0.4, 0.6])
-    control = np.clip(previous + requested * 0.2, [0.0, 0.0], [1.0, 1.0])
+    requested = np.array([1.0, -1.0], dtype=np.float32)
+    previous = np.array([0.4, 0.6], dtype=np.float32)
+    delta = np.ones(2, dtype=np.float32) * 0.2
+    control = np.clip(
+        previous + requested * delta,
+        np.array([0.0, 0.0], dtype=np.float32),
+        np.array([1.0, 1.0], dtype=np.float32),
+    )
     return SimpleNamespace(
         path=capsule_dir,
         manifest={
@@ -50,6 +55,7 @@ def _capsule(tmp_path: Path):
             "source_checksums": {"tomato_env.py": "c" * 64},
             "git_head": "d" * 40,
             "dirty": True,
+            "solver": {"options": dict(cli.FORMAL_CVODES_OPTIONS)},
             "context": {
                 "formal_result_root": str(formal),
                 "checkpoint_path": "models/agent.zip",
@@ -155,15 +161,25 @@ def test_failure_then_fixed_candidates_selects_first_success(tmp_path):
     assert all(
         np.array_equal(call["p"], [10.0, 11.0, 12.0]) for call in integrator_calls
     )
+    previous = np.array([0.4, 0.6], dtype=np.float32)
+    delta = np.ones(2, dtype=np.float32) * 0.2
+    u_min = np.array([0.0, 0.0], dtype=np.float32)
+    u_max = np.array([1.0, 1.0], dtype=np.float32)
+    requested = np.array([1.0, -1.0], dtype=np.float32)
+    reference = cli.control_to_reference_action(np.array([0.4, 0.6]), previous, delta)
     expected_actions = [
-        (1.0 - lam) * np.array([1.0, -1.0]) for lam in cli.DEFAULT_LAMBDAS[:3]
+        (1.0 - lam) * requested.astype(np.float64) + lam * reference
+        for lam in cli.DEFAULT_LAMBDAS[:3]
     ]
     expected_controls = [
-        np.clip(np.array([0.4, 0.6]) + action * 0.2, 0.0, 1.0)
-        for action in expected_actions
+        np.clip(previous + action * delta, u_min, u_max) for action in expected_actions
     ]
     assert all(
         np.array_equal(call["u"], expected)
+        for call, expected in zip(integrator_calls[1:], expected_controls, strict=True)
+    )
+    assert all(
+        call["u"].dtype == expected.dtype
         for call, expected in zip(integrator_calls[1:], expected_controls, strict=True)
     )
     assert {path.name for path in result.iterdir()} == {
@@ -183,7 +199,7 @@ def test_failure_then_fixed_candidates_selects_first_success(tmp_path):
         True,
     ]
     assert payload["outcome"] == "continue_to_context_ab"
-    assert payload["delta_u_max"] == [0.2, 0.2]
+    assert payload["delta_u_max"] == delta.tolist()
     decision = json.loads((result / "decision.json").read_text(encoding="utf-8"))
     assert set(decision) == {"outcome", "conditions", "selected_lambda"}
     assert all(decision["conditions"].values())
@@ -255,6 +271,122 @@ def test_invalid_inputs_and_overlap_fail_before_factories(tmp_path):
             controller_factory=lambda: calls.append("controller"),
         )
     assert calls == []
+
+
+def test_float32_capsule_reconstruction_preserves_exact_numpy_semantics(tmp_path):
+    capsule = _capsule(tmp_path)
+    config = _config(tmp_path / "env.yml", delta=0.1)
+    requested = np.array([0.1234567, -0.1234567], dtype=np.float32)
+    previous = np.array([0.4, 0.6], dtype=np.float32)
+    u_min = np.array([0.0, 0.0], dtype=np.float32)
+    u_max = np.array([1.0, 1.0], dtype=np.float32)
+    delta = np.ones(2, dtype=np.float32) * 0.1
+    stored = np.clip(previous + requested * delta, u_min, u_max)
+    capsule.failure_inputs["requested_action"] = requested
+    capsule.failure_inputs["previous_control"] = previous
+    capsule.failure_inputs["u"] = stored
+    observed = []
+
+    def factory(**kwargs):
+        def integrate(**inputs):
+            observed.append(np.array(inputs["u"], copy=True))
+            return {"xf": np.array([4.0, 5.0, 6.0])}
+
+        return integrate
+
+    output = tmp_path / "float32"
+    cli.run_stage1(
+        capsule.path / "manifest.json",
+        config,
+        output,
+        capsule_loader=lambda _: capsule,
+        integrator_factory=factory,
+        controller_factory=lambda: (_ for _ in ()).throw(
+            AssertionError("controller must not run")
+        ),
+    )
+    assert len(observed) == 1
+    assert observed[0].dtype == stored.dtype == np.float32
+    assert np.array_equal(observed[0], stored)
+
+
+@pytest.mark.parametrize(
+    "solver",
+    [
+        None,
+        {},
+        {"options": {"abstol": 0.0001, "reltol": 0.0001}},
+        {
+            "options": {
+                "abstol": 0.0001,
+                "reltol": 0.0001,
+                "max_num_steps": 70000,
+                "extra": 1,
+            }
+        },
+        {
+            "options": {
+                "abstol": True,
+                "reltol": 0.0001,
+                "max_num_steps": 70000,
+            }
+        },
+        {
+            "options": {
+                "abstol": float("nan"),
+                "reltol": 0.0001,
+                "max_num_steps": 70000,
+            }
+        },
+        {
+            "options": {
+                "abstol": 0.0001,
+                "reltol": 0.0001,
+                "max_num_steps": 70001,
+            }
+        },
+    ],
+)
+def test_invalid_formal_solver_provenance_rejected_before_factories(tmp_path, solver):
+    capsule = _capsule(tmp_path)
+    capsule.manifest["solver"] = solver
+    config = _config(tmp_path / "env.yml")
+    calls = []
+    output = tmp_path / "out"
+    with pytest.raises(ValueError, match="solver"):
+        cli.run_stage1(
+            capsule.path / "manifest.json",
+            config,
+            output,
+            capsule_loader=lambda _: capsule,
+            integrator_factory=lambda **kwargs: calls.append("integrator"),
+            controller_factory=lambda: calls.append("controller"),
+        )
+    assert calls == []
+    assert not output.exists()
+
+
+def test_requested_action_outside_closed_unit_interval_rejected_before_factories(
+    tmp_path,
+):
+    capsule = _capsule(tmp_path)
+    capsule.failure_inputs["requested_action"] = np.array(
+        [np.nextafter(1.0, 2.0), -1.0]
+    )
+    config = _config(tmp_path / "env.yml")
+    calls = []
+    output = tmp_path / "out"
+    with pytest.raises(ValueError, match="requested_action"):
+        cli.run_stage1(
+            capsule.path / "manifest.json",
+            config,
+            output,
+            capsule_loader=lambda _: capsule,
+            integrator_factory=lambda **kwargs: calls.append("integrator"),
+            controller_factory=lambda: calls.append("controller"),
+        )
+    assert calls == []
+    assert not output.exists()
 
 
 def test_malformed_integrator_output_and_baseexception_propagate_without_output(

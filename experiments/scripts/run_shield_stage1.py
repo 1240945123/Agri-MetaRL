@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+from numbers import Integral, Real
 import os
 from pathlib import Path
 import shutil
@@ -193,7 +194,7 @@ def _finite_vector(value: Any, *, name: str, size: int) -> np.ndarray:
     raw = np.asarray(value)
     if raw.shape != (size,) or raw.dtype.kind not in "iuf":
         raise ValueError(f"{name} must be an exact finite vector of shape ({size},)")
-    result = np.array(raw, dtype=np.float64, copy=True)
+    result = np.array(raw, copy=True)
     if not np.isfinite(result).all():
         raise ValueError(f"{name} must be an exact finite vector of shape ({size},)")
     return result
@@ -247,6 +248,10 @@ def _snapshot_inputs(source: Mapping[str, Any]) -> dict[str, Any]:
     result["x0"] = _finite_vector(source["x0"], name="x0", size=nx)
     for name in ("u", "previous_control", "requested_action"):
         result[name] = _finite_vector(source[name], name=name, size=nu)
+    if np.any(result["requested_action"] < -1) or np.any(
+        result["requested_action"] > 1
+    ):
+        raise ValueError("requested_action must lie within [-1, 1]")
     result["weather"] = _finite_vector(source["weather"], name="weather", size=nd)
     result["sampled_parameters"] = _finite_vector(
         source["sampled_parameters"], name="sampled_parameters", size=n_params
@@ -277,8 +282,19 @@ def _load_env_config(
     ):
         raise ValueError("environment config requires a GreenLightEnv mapping")
     env = loaded["GreenLightEnv"]
-    u_min = _finite_vector(env.get("u_min"), name="u_min", size=nu)
-    u_max = _finite_vector(env.get("u_max"), name="u_max", size=nu)
+    raw_u_min = np.asarray(env.get("u_min"))
+    raw_u_max = np.asarray(env.get("u_max"))
+    for raw, name in ((raw_u_min, "u_min"), (raw_u_max, "u_max")):
+        if (
+            raw.shape != (nu,)
+            or raw.dtype.kind not in "iuf"
+            or not np.isfinite(raw).all()
+        ):
+            raise ValueError(f"{name} must be an exact finite vector of shape ({nu},)")
+    u_min = np.array(env["u_min"], dtype=np.float32)
+    u_max = np.array(env["u_max"], dtype=np.float32)
+    if not np.isfinite(u_min).all() or not np.isfinite(u_max).all():
+        raise ValueError("u_min and u_max must remain finite as float32 vectors")
     if not np.all(u_min < u_max):
         raise ValueError("u_min must be strictly less than u_max in every channel")
     raw_delta = env.get("delta_u_max")
@@ -288,7 +304,10 @@ def _load_env_config(
     delta_scalar = float(delta_array)
     if not math.isfinite(delta_scalar) or delta_scalar <= 0.0:
         raise ValueError("delta_u_max must be a positive finite scalar")
-    return config_path, u_min, u_max, np.full(nu, delta_scalar, dtype=np.float64)
+    delta = np.ones(nu, dtype=np.float32) * delta_scalar
+    if not np.isfinite(delta).all() or np.any(delta <= 0):
+        raise ValueError("delta_u_max must remain positive and finite as float32")
+    return config_path, u_min, u_max, delta
 
 
 def _state_from_result(result: Any, nx: int) -> np.ndarray:
@@ -324,6 +343,34 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validate_formal_solver_provenance(manifest: Mapping[str, Any]) -> None:
+    solver = manifest.get("solver")
+    if not isinstance(solver, Mapping) or set(solver) != {"options"}:
+        raise ValueError("capsule solver must contain exactly the options mapping")
+    options = solver["options"]
+    expected = dict(FORMAL_CVODES_OPTIONS)
+    if not isinstance(options, Mapping) or set(options) != set(expected):
+        raise ValueError("capsule solver options must use the exact formal key set")
+    for name in ("abstol", "reltol"):
+        value = options[name]
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, Real)
+            or not math.isfinite(float(value))
+            or value != expected[name]
+        ):
+            raise ValueError(f"capsule solver option {name} must match formal settings")
+    max_steps = options["max_num_steps"]
+    if (
+        isinstance(max_steps, (bool, np.bool_))
+        or not isinstance(max_steps, Integral)
+        or max_steps != expected["max_num_steps"]
+    ):
+        raise ValueError(
+            "capsule solver option max_num_steps must match formal settings"
+        )
 
 
 def _provenance(manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -645,6 +692,7 @@ def run_stage1(
     _, output, _ = _validate_paths(
         manifest_path, capsule, output_root, formal_result_root
     )
+    _validate_formal_solver_provenance(capsule.manifest)
     inputs = _snapshot_inputs(capsule.failure_inputs)
     config_path, u_min, u_max, delta = _load_env_config(env_config, inputs["nu"])
     expected_control = _control(
