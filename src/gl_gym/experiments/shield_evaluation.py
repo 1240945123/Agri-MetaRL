@@ -547,7 +547,13 @@ def _scalar_is_missing(value: Any) -> bool:
 def _check_frame(frame: pd.DataFrame, *, name: str, duplicate_check: bool) -> pd.DataFrame:
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         raise ValueError(f"{name} must be a nonempty DataFrame")
-    nullable = {column for column in frame.columns if column == "first_intervention_step" or column.endswith("_first_intervention_step")}
+    nullable = {
+        column
+        for column in frame.columns
+        if column == "first_intervention_step"
+        or column.endswith("_first_intervention_step")
+        or (name == "raw" and column == "support_ready_step")
+    }
     validated = frame.copy(deep=True)
     for column in frame.columns:
         normalized: list[Any] = []

@@ -181,7 +181,53 @@ def test_diagnostics_reject_trace_record_cross_mismatch_before_writes():
         malformed = dict(base)
         malformed[field] = np.ones((1, 2), dtype=np.float32)
         with pytest.raises(ValueError, match="record|trace"):
-            cli._strict_diagnostics(malformed)
+            cli._strict_diagnostics(malformed, inference_mode="zero_context", metric_names=set())
+
+
+def test_real_context_diagnostics_are_mode_aware_and_collision_safe():
+    record = {
+        "schema_version": "minimal-feasibility-action-shield-v1", "intervened": False,
+        "requested_action": [0.0], "reference_action": None, "executed_action": [0.0],
+        "selected_lambda": 0.0, "candidate_attempts": [], "intervention_l1": 0.0,
+        "intervention_l2": 0.0, "intervention_linf": 0.0,
+        "per_channel_changed": [False], "extra_solver_attempts": 0,
+        "elapsed_seconds": 0.0, "original_failure": None,
+    }
+    base = {"action_trace": np.zeros((3, 1)), "requested_action_trace": np.zeros((3, 1)),
+            "action_shield_records": [dict(record) for _ in range(3)],
+            "context_norm_mean": 0.0, "context_norm_max": 0.0}
+    zero = dict(base, support_ready_step=np.nan)
+    assert np.isnan(cli._strict_diagnostics(
+        zero, inference_mode="zero_context", metric_names={"episode_return"}
+    )[3]["support_ready_step"])
+    online = dict(base, support_ready_step=1.0)
+    assert cli._strict_diagnostics(
+        online, inference_mode="online_context", metric_names={"episode_return"}
+    )[3]["support_ready_step"] == 1
+    for mode, readiness in (("zero_context", 1.0), ("online_context", np.nan)):
+        with pytest.raises(ValueError, match="support_ready_step"):
+            cli._strict_diagnostics(
+                dict(base, support_ready_step=readiness), inference_mode=mode,
+                metric_names={"episode_return"},
+            )
+    for collision in ("episode_return", "intervention_count"):
+        with pytest.raises(ValueError, match="collide"):
+            cli._strict_diagnostics(
+                dict(zero, **{collision: 99}), inference_mode="zero_context",
+                metric_names={"episode_return"},
+            )
+
+
+def test_behavior_hashes_change_on_one_byte_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(cli, "ROOT", tmp_path)
+    for _, relative in cli.BEHAVIOR_SOURCE_FIELDS:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"a")
+    before = cli._behavior_source_hashes()
+    (tmp_path / cli.BEHAVIOR_SOURCE_FIELDS[0][1]).write_bytes(b"b")
+    after = cli._behavior_source_hashes()
+    assert before != after
 
 
 def _explicit_comparator_rows():
@@ -427,8 +473,10 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
         assert return_diagnostics and failure_recorder is not None
         return ({"episode_return": 100.0, "EPI": 1.0, "temp_violation": 1.0,
                  "co2_violation": 1.0, "rh_violation": 1.0},
-                {"action_trace": np.zeros((1, 2)), "requested_action_trace": np.zeros((1, 2)),
-                 "action_shield_records": [dict(record)]})
+                {"action_trace": np.zeros((3, 2)), "requested_action_trace": np.zeros((3, 2)),
+                 "action_shield_records": [dict(record) for _ in range(3)],
+                 "support_ready_step": np.nan if inference_mode == "zero_context" else 1,
+                 "context_norm_mean": 0.0, "context_norm_max": 0.0})
 
     attempt = {"count": 0}
 
@@ -499,6 +547,25 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
         recorder_factory=lambda root, context: object(),
     )
     assert len(calls) == 1
+
+    for alias_kind in ("cross_key", "within_key"):
+        aliased = pd.read_csv(progress_path)
+        if alias_kind == "cross_key":
+            aliased.loc[0, "executed_action_trace_path"] = aliased.loc[1, "executed_action_trace_path"]
+        else:
+            aliased.loc[0, "requested_action_trace_path"] = aliased.loc[0, "executed_action_trace_path"]
+        aliased.to_csv(progress_path, index=False)
+        calls.clear()
+        cli.run_shielded_diagnostic(
+            suite=suite, tasks=tasks, runs=runs, source_manifest=manifest_path,
+            source_tasks_csv=tasks_path, stage1_root=stage["root"],
+            unshielded_result_root=unshielded_root, result_root=tmp_path / "shielded",
+            failure_root=tmp_path / "failures", device="cpu", resume=True,
+            model_loader=lambda path, device: Model(), env_loader=env_loader,
+            episode_runner=episode_runner, provenance_loader=lambda: provenance,
+            recorder_factory=lambda root, context: object(),
+        )
+        assert len(calls) == 1
 
     for trace_column in ("requested_action_trace_path", "executed_action_trace_path"):
         refreshed = pd.read_csv(progress_path)

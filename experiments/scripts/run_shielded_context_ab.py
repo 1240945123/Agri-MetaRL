@@ -76,6 +76,14 @@ ENV_CONFIG_PATH = ROOT / "configs" / "envs" / "TomatoEnv.yml"
 DEFAULT_RESULT_ROOT = Path(
     "artifacts/results/AgriControl_C_2026-07-10-v3-shielded-context-ab"
 )
+BEHAVIOR_SOURCE_FIELDS = (
+    ("action_shield_source_sha256", Path("src/gl_gym/environments/action_shield.py")),
+    ("shielded_tomato_env_source_sha256", Path("src/gl_gym/environments/shielded_tomato_env.py")),
+    ("suite_evaluation_source_sha256", Path("src/gl_gym/experiments/suite_evaluation.py")),
+    ("shield_evaluation_source_sha256", Path("src/gl_gym/experiments/shield_evaluation.py")),
+    ("shielded_context_runner_source_sha256", Path("experiments/scripts/run_shielded_context_ab.py")),
+    ("context_ab_runner_source_sha256", Path("experiments/scripts/run_context_ab.py")),
+)
 HASH_FIELDS = (
     "model_sha256",
     "vecnormalize_sha256",
@@ -91,7 +99,19 @@ HASH_FIELDS = (
     "stage1_states_sha256",
     "stage1_decision_sha256",
     "stage1_capsule_identity_sha256",
+    *(name for name, _ in BEHAVIOR_SOURCE_FIELDS),
     "shield_fingerprint",
+)
+
+INTERVENTION_SUMMARY_FIELDS = frozenset(
+    {
+        "total_steps", "intervention_count", "intervention_rate",
+        "first_intervention_step", "selected_lambda_mean", "selected_lambda_max",
+        "intervention_l1_mean", "intervention_l1_max", "intervention_l2_mean",
+        "intervention_l2_max", "intervention_linf_mean", "intervention_linf_max",
+        "per_channel_intervention_counts", "extra_solver_attempts",
+        "shield_elapsed_seconds", "ode_failure_count",
+    }
 )
 
 
@@ -304,6 +324,10 @@ def _canonical_bytes(value: Any) -> bytes:
 
 def _fingerprint(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_bytes(dict(payload))).hexdigest()
+
+
+def _behavior_source_hashes() -> dict[str, str]:
+    return {name: sha256_file(ROOT / path) for name, path in BEHAVIOR_SOURCE_FIELDS}
 
 
 def _stage2_decision(gate: Mapping[str, Any]) -> dict[str, Any]:
@@ -595,7 +619,13 @@ def _validate_trace_record_consistency(
     return executed, requested, records
 
 
-def resume_row_is_complete(row: Mapping[str, Any], *, expected: Mapping[str, Any], work_root: Path) -> bool:
+def resume_row_is_complete(
+    row: Mapping[str, Any],
+    *,
+    expected: Mapping[str, Any],
+    work_root: Path,
+    key: tuple[int, str, str],
+) -> bool:
     required = {"seed", "task_id", "inference_mode", "checkpoint_steps", "completed", "executed_action_trace_path", "requested_action_trace_path", "intervention_records_path", "method", *HASH_FIELDS, *REQUIRED_METRICS}
     completed_value = row.get("completed")
     if (
@@ -609,7 +639,8 @@ def resume_row_is_complete(row: Mapping[str, Any], *, expected: Mapping[str, Any
         if any(str(row[name]) != str(expected[name]) for name in HASH_FIELDS):
             return False
         paths = [Path(str(row[name])).resolve() for name in ("executed_action_trace_path", "requested_action_trace_path", "intervention_records_path")]
-        if any(not path.is_relative_to(work_root.resolve()) for path in paths):
+        canonical_paths = [path.resolve() for path in _trace_paths(work_root, *key)]
+        if paths != canonical_paths or len(set(paths)) != 3:
             return False
         executed, requested, records = _validate_trace_record_consistency(
             np.load(paths[0], allow_pickle=False),
@@ -644,7 +675,12 @@ def _write_progress(rows: list[dict[str, Any]], path: Path) -> None:
     os.replace(temporary, path)
 
 
-def _strict_diagnostics(diagnostics: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]], dict[str, Any]]:
+def _strict_diagnostics(
+    diagnostics: Mapping[str, Any],
+    *,
+    inference_mode: str,
+    metric_names: set[str],
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]], dict[str, Any]]:
     diagnostics = dict(diagnostics)
     missing = {"action_trace", "requested_action_trace", "action_shield_records"}.difference(diagnostics)
     if missing:
@@ -656,18 +692,57 @@ def _strict_diagnostics(diagnostics: Mapping[str, Any]) -> tuple[np.ndarray, np.
         executed_value, requested_value, raw_records, decorate_steps=True
     )
     normalized: dict[str, Any] = {}
-    reserved = {"seed", "task_id", "inference_mode", "method", *HASH_FIELDS}
-    if reserved.intersection(diagnostics):
-        raise ValueError("model diagnostics collide with Stage-2 raw fields")
+    reserved = {
+        "seed", "task_id", "split", "inference_mode", "method", "status",
+        "completed", "checkpoint_steps", "executed_action_trace_path",
+        "requested_action_trace_path", "intervention_records_path",
+        "stage1_selected_lambda", *HASH_FIELDS, *INTERVENTION_SUMMARY_FIELDS,
+        *metric_names,
+    }
+    collisions = reserved.intersection(diagnostics)
+    if collisions:
+        raise ValueError(f"model diagnostics collide with Stage-2 raw fields: {sorted(collisions)}")
+    required_context = {"support_ready_step", "context_norm_mean", "context_norm_max"}
+    missing_context = required_context.difference(diagnostics)
+    if missing_context:
+        raise KeyError(f"model diagnostics are missing required context fields: {sorted(missing_context)}")
     for name, value in diagnostics.items():
-        if value is None:
-            normalized[name] = ""
+        if name == "support_ready_step" and value is None:
+            normalized[name] = None
         elif isinstance(value, np.generic):
             normalized[name] = value.item()
-        elif isinstance(value, (str, bool, int, float)) and (not isinstance(value, float) or np.isfinite(value)):
+        elif isinstance(value, (str, bool, int, float)):
             normalized[name] = value
         else:
             raise TypeError(f"model diagnostic {name!r} must be a finite CSV scalar")
+    readiness = normalized["support_ready_step"]
+    if inference_mode == "zero_context":
+        if readiness is None or (isinstance(readiness, float) and np.isnan(readiness)):
+            normalized["support_ready_step"] = float("nan")
+        else:
+            raise ValueError("zero_context support_ready_step must be NaN")
+    elif inference_mode == "online_context":
+        if isinstance(readiness, bool) or not isinstance(readiness, (int, float)):
+            raise ValueError("online_context support_ready_step must be a finite integer")
+        numeric_readiness = float(readiness)
+        if (
+            not np.isfinite(numeric_readiness)
+            or not numeric_readiness.is_integer()
+            or not 1 <= numeric_readiness < executed.shape[0]
+        ):
+            raise ValueError("online_context support_ready_step must be within the episode")
+        normalized["support_ready_step"] = int(numeric_readiness)
+    else:
+        raise ValueError(f"unsupported inference_mode: {inference_mode}")
+    for name, value in normalized.items():
+        if name == "support_ready_step":
+            continue
+        if isinstance(value, float) and not np.isfinite(value):
+            raise ValueError(f"model diagnostic {name!r} must be finite")
+    for name in ("context_norm_mean", "context_norm_max"):
+        value = normalized[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(float(value)):
+            raise ValueError(f"model diagnostic {name!r} must be finite numeric")
     return executed, requested, records, normalized
 
 
@@ -701,6 +776,7 @@ def run_shielded_diagnostic(
     evaluation = _evaluation_provenance(source_manifest, source_tasks_csv, provenance)
     params, rule_sha = _load_rule_params(rule_config_path)
     env_sha = sha256_file(env_config_path)
+    behavior_hashes = _behavior_source_hashes()
     validate_stage1_provenance(
         stage1, runs=runs, source_manifest=source_manifest,
         source_tasks_csv=source_tasks_csv, evaluation_provenance=evaluation,
@@ -740,6 +816,7 @@ def run_shielded_diagnostic(
         "schema_version": SCHEMA_VERSION, "method": METHOD,
         "checkpoints": [{name: str(run[name]) for name in ("seed", "model_path", "vecnormalize_path", "model_sha256", "vecnormalize_sha256")} for run in runs],
         **evaluation, "rule_config_sha256": rule_sha, "env_config_sha256": env_sha,
+        **behavior_hashes,
         "formal_solver_options": dict(FORMAL_CVODES_OPTIONS), "fixed_lambdas": list(DEFAULT_LAMBDAS),
         "stage1_results_sha256": stage1["stage1_results_sha256"],
         "stage1_selected_lambda": stage1["selected_lambda"],
@@ -760,6 +837,7 @@ def run_shielded_diagnostic(
         int(run["seed"]): {
             "model_sha256": run["model_sha256"], "vecnormalize_sha256": run["vecnormalize_sha256"],
             **evaluation, "rule_config_sha256": rule_sha, "env_config_sha256": env_sha,
+            **behavior_hashes,
             "formal_solver_options_sha256": formal_solver_sha,
             "fixed_lambdas_sha256": fixed_lambdas_sha,
             "stage1_results_sha256": stage1["stage1_results_sha256"],
@@ -777,7 +855,12 @@ def run_shielded_diagnostic(
             key = (int(row["seed"]), str(row["task_id"]), str(row["inference_mode"]))
         except (KeyError, TypeError, ValueError):
             continue
-        if key in targets and resume_row_is_complete(row, expected=evidence_by_seed[key[0]], work_root=work):
+        if key in targets and resume_row_is_complete(
+            row,
+            expected=evidence_by_seed[key[0]],
+            work_root=work,
+            key=key,
+        ):
             completed[key] = row
     source_checksums = {
         str((ROOT / path).resolve()): evaluation[name]
@@ -824,7 +907,11 @@ def run_shielded_diagnostic(
                             primary.add_note(f"environment close also failed: {type(close_error).__name__}: {close_error}")
                         else:
                             raise
-                executed, requested, records, model_diagnostics = _strict_diagnostics(diagnostics)
+                executed, requested, records, model_diagnostics = _strict_diagnostics(
+                    diagnostics,
+                    inference_mode=mode,
+                    metric_names=set(metrics),
+                )
                 summary = aggregate_episode_interventions(records, executed.shape[1])
                 executed_path, requested_path, records_path = _trace_paths(work, *key)
                 executed_path.parent.mkdir(parents=True, exist_ok=True)
@@ -865,6 +952,8 @@ def run_shielded_diagnostic(
             raw.at[index, column] = relative
             if column == "intervention_records_path":
                 interventions.at[index, column] = relative
+    if len(evidence_files) != 3 * len(raw):
+        raise RuntimeError("publication evidence destinations must be globally unique")
     decision = _stage2_decision(gate)
     manifest = {
         **fingerprint_payload, "shield_fingerprint": shield_fingerprint,
