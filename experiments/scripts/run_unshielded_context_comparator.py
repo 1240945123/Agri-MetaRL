@@ -258,6 +258,26 @@ def _replace_progress(rows: list[dict[str, Any]], path: Path) -> None:
             temporary.unlink()
 
 
+def _validate_scoring_metrics(
+    row: Mapping[str, Any], *, expected: str
+) -> None:
+    names = [
+        *REQUIRED_METRICS,
+        *(
+            name
+            for name in EPISODE_SCORING_METRICS
+            if name not in REQUIRED_METRICS and name in row
+        ),
+    ]
+    try:
+        values = np.asarray([float(row[name]) for name in names], dtype=float)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("episode scoring metrics are missing or nonnumeric") from error
+    valid = np.isfinite(values).all() if expected == "finite" else np.isnan(values).all()
+    if not valid:
+        raise ValueError(f"episode scoring metrics must all be {expected}")
+
+
 def _finite_metrics(metrics: Any) -> dict[str, Any]:
     if not isinstance(metrics, Mapping):
         raise TypeError("episode metrics must be a mapping")
@@ -265,23 +285,7 @@ def _finite_metrics(metrics: Any) -> dict[str, Any]:
     missing = set(REQUIRED_METRICS).difference(normalized)
     if missing:
         raise KeyError(f"episode metrics are missing required keys: {sorted(missing)}")
-    try:
-        values = np.asarray(
-            [float(normalized[name]) for name in REQUIRED_METRICS], dtype=float
-        )
-    except (TypeError, ValueError) as error:
-        raise TypeError("required episode metrics must be numeric scalars") from error
-    if not np.isfinite(values).all():
-        raise ValueError("successful episode metrics must be finite")
-    for name in EPISODE_SCORING_METRICS:
-        if name not in normalized:
-            continue
-        try:
-            value = float(normalized[name])
-        except (TypeError, ValueError) as error:
-            raise TypeError(f"episode scoring metric {name!r} must be numeric") from error
-        if not np.isfinite(value):
-            raise ValueError(f"episode scoring metric {name!r} must be finite")
+    _validate_scoring_metrics(normalized, expected="finite")
     for name, value in list(normalized.items()):
         try:
             scalar = float(value)
@@ -357,20 +361,10 @@ def _validate_completed_row(row: Mapping[str, Any]) -> None:
         or not evidence_is_empty
     ):
         raise ValueError("completed comparator row has an invalid status schema")
-    scoring_names = [
-        *REQUIRED_METRICS,
-        *(
-            name
-            for name in EPISODE_SCORING_METRICS
-            if name not in REQUIRED_METRICS and name in row
-        ),
-    ]
     try:
-        metrics = np.asarray([float(row[name]) for name in scoring_names], dtype=float)
+        _validate_scoring_metrics(row, expected="finite")
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("completed comparator row has invalid scoring metrics") from error
-    if not np.isfinite(metrics).all():
-        raise ValueError("completed comparator row scoring metrics must be finite")
 
 
 def _valid_readiness(row: Mapping[str, Any], trace_length: int) -> bool:
@@ -527,7 +521,7 @@ def _failed_row_is_valid(
             or int(row["ode_failure_count"]) != 1
         ):
             return False
-        metrics = np.asarray([float(row[name]) for name in REQUIRED_METRICS])
+        _validate_scoring_metrics(row, expected="NaN")
         diagnostics = np.asarray(
             [
                 float(row["support_ready_step"]),
@@ -535,7 +529,7 @@ def _failed_row_is_valid(
                 float(row["context_norm_max"]),
             ]
         )
-        if not np.isnan(metrics).all() or not np.isnan(diagnostics).all():
+        if not np.isnan(diagnostics).all():
             return False
         trace_value = row["action_trace_path"]
         if not (
@@ -814,7 +808,10 @@ def run_unshielded_comparator(
                         )
                         raise error
                     row = _signed_row({
-                        **{name: float("nan") for name in REQUIRED_METRICS},
+                        **{
+                            name: float("nan")
+                            for name in EPISODE_SCORING_METRICS
+                        },
                         "support_ready_step": float("nan"),
                         "context_norm_mean": float("nan"),
                         "context_norm_max": float("nan"),

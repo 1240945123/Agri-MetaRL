@@ -204,7 +204,7 @@ def test_exact_early_wrapper_with_one_matching_capsule_continues_multiple_failur
     assert len(failed) == 2 and len(calls) == 32
     assert failed.status.eq("ode_failure").all()
     assert failed.ode_failure_count.eq(1).all()
-    assert failed[list(cli.REQUIRED_METRICS)].isna().all(axis=None)
+    assert failed[list(cli.EPISODE_SCORING_METRICS)].isna().all(axis=None)
     assert failed.action_trace_path.eq("").all()
     assert all(Path(path).name == "manifest.json" for path in failed.failure_evidence_path)
 
@@ -564,6 +564,42 @@ def test_resume_skips_valid_failed_capsule(tmp_path):
     assert (~resumed.completed).sum() == 1
 
 
+def test_resume_recomputes_failed_row_with_finite_optional_scoring_metrics(tmp_path):
+    key = (42, cli.DIAGNOSTIC_TASK_IDS[0], cli.MODES[0])
+    kwargs, calls, _ = _inputs(tmp_path, failure_modes={key})
+    cli.run_unshielded_comparator(**kwargs)
+    progress_path = _progress_path(kwargs)
+    progress = pd.read_csv(progress_path)
+    failed_index = progress.index[progress.status.eq("ode_failure")][0]
+    progress.loc[failed_index, "EPI"] = 1.0
+    progress.loc[failed_index, "revenue"] = 2.0
+    progress.loc[failed_index, "row_identity_sha256"] = cli._row_identity(
+        progress.loc[failed_index].to_dict()
+    )
+    progress.to_csv(progress_path, index=False)
+    calls.clear()
+    kwargs["resume"] = True
+
+    def successful_runner(model, env, **runner_kwargs):
+        recorder = runner_kwargs["failure_recorder"]
+        calls.append(
+            (recorder.context.seed, recorder.context.task_id, runner_kwargs["inference_mode"])
+        )
+        metrics = {name: 1.0 for name in cli.EPISODE_SCORING_METRICS}
+        return metrics, {
+            "support_ready_step": (
+                np.nan if runner_kwargs["inference_mode"] == "zero_context" else 1.0
+            ),
+            "context_norm_mean": 0.5,
+            "context_norm_max": 1.0,
+            "action_trace": np.ones((3, 2)),
+        }
+
+    kwargs["episode_runner"] = successful_runner
+    cli.run_unshielded_comparator(**kwargs)
+    assert calls == [key]
+
+
 def test_resume_recomputes_failed_row_when_capsule_identity_changes(tmp_path):
     key = (42, cli.DIAGNOSTIC_TASK_IDS[0], cli.MODES[0])
     kwargs, calls, _ = _inputs(tmp_path, failure_modes={key})
@@ -720,6 +756,19 @@ def test_legacy_import_rejects_stale_runtime_source_tree(tmp_path):
     legacy = _progress_path(old)
     row = _legacy_row(frame)
     row["runtime_source_tree_sha256"] = "f" * 64
+    row.to_csv(legacy, index=False)
+
+    new, calls, _ = _inputs(tmp_path / "new")
+    new["legacy_progress"] = legacy
+    cli.run_unshielded_comparator(**new)
+    assert len(calls) == 32
+
+
+def test_real_legacy_schema_without_runtime_fingerprint_is_recomputed(tmp_path):
+    old, _, _ = _inputs(tmp_path / "old")
+    frame = cli.run_unshielded_comparator(**old)
+    legacy = _progress_path(old)
+    row = _legacy_row(frame).drop(columns=["runtime_source_tree_sha256"])
     row.to_csv(legacy, index=False)
 
     new, calls, _ = _inputs(tmp_path / "new")
