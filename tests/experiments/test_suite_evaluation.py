@@ -761,6 +761,242 @@ def test_load_task_env_closes_base_env_when_vecnormalize_load_fails(
     assert env.closed
 
 
+def test_load_task_env_default_retains_suite_env_id_and_original_params(
+    tmp_path: Path, monkeypatch
+):
+    import gl_gym.RL.utils as rl_utils
+    import gl_gym.common.utils as common_utils
+    import gl_gym.experiments.suite_tasks as suite_tasks
+    from stable_baselines3.common.vec_env import VecNormalize
+
+    base = {"base": [1]}
+    specific = {"specific": {"value": 2}}
+    captured = {}
+    vec_path = tmp_path / "vec.pkl"
+    vec_path.write_bytes(b"vec")
+    monkeypatch.setattr(common_utils, "load_env_params", lambda *args: (base, specific))
+    monkeypatch.setattr(
+        suite_tasks, "apply_task_to_env_params", lambda loaded_base, loaded_specific, task: (
+            loaded_base,
+            loaded_specific,
+        )
+    )
+
+    class Env:
+        def close(self):
+            raise AssertionError("successful environment must not be closed")
+
+    env = Env()
+
+    def fake_make(env_id, env_base_params, env_specific_params, **kwargs):
+        captured.update(
+            env_id=env_id,
+            base=env_base_params,
+            specific=env_specific_params,
+            kwargs=kwargs,
+        )
+        return env
+
+    normalized = SimpleNamespace(training=True, norm_reward=True)
+    monkeypatch.setattr(rl_utils, "make_vec_env", fake_make)
+    monkeypatch.setattr(VecNormalize, "load", lambda path, base_env: normalized)
+
+    result = suite_evaluation.load_task_env(
+        SimpleNamespace(env_id="TomatoEnv"), SimpleNamespace(), vec_path
+    )
+
+    assert result is normalized
+    assert captured["env_id"] == "TomatoEnv"
+    assert captured["base"] is base
+    assert captured["specific"] is specific
+    assert "action_shield_params" not in captured["specific"]
+    assert normalized.training is False
+    assert normalized.norm_reward is False
+
+
+def test_load_task_env_selects_shield_and_detaches_all_injected_params(
+    tmp_path: Path, monkeypatch
+):
+    import gl_gym.RL.utils as rl_utils
+    import gl_gym.common.utils as common_utils
+    import gl_gym.experiments.suite_tasks as suite_tasks
+    from stable_baselines3.common.vec_env import VecNormalize
+
+    source_specific = {"nested": {"values": [1]}}
+    shield_params = {"controller": {"values": [2]}}
+    captured = {}
+    vec_path = tmp_path / "vec.pkl"
+    vec_path.write_bytes(b"vec")
+    monkeypatch.setattr(
+        common_utils, "load_env_params", lambda env_id, path: ({}, source_specific)
+    )
+    monkeypatch.setattr(
+        suite_tasks, "apply_task_to_env_params", lambda base, specific, task: (base, specific)
+    )
+
+    class Env:
+        pass
+
+    env = Env()
+
+    def fake_make(env_id, base, specific, **kwargs):
+        captured.update(env_id=env_id, specific=specific)
+        return env
+
+    normalized = SimpleNamespace(training=True, norm_reward=True)
+    monkeypatch.setattr(rl_utils, "make_vec_env", fake_make)
+    monkeypatch.setattr(VecNormalize, "load", lambda path, base_env: normalized)
+
+    suite_evaluation.load_task_env(
+        SimpleNamespace(env_id="TomatoEnv"),
+        SimpleNamespace(),
+        vec_path,
+        shield_params=shield_params,
+    )
+
+    assert captured["env_id"] == "ShieldedTomatoEnv"
+    assert captured["specific"] == {
+        "nested": {"values": [1]},
+        "action_shield_params": {"controller": {"values": [2]}},
+    }
+    assert captured["specific"] is not source_specific
+    assert source_specific == {"nested": {"values": [1]}}
+    assert shield_params == {"controller": {"values": [2]}}
+    source_specific["nested"]["values"].append(9)
+    shield_params["controller"]["values"].append(9)
+    assert captured["specific"]["nested"]["values"] == [1]
+    assert captured["specific"]["action_shield_params"]["controller"]["values"] == [2]
+
+
+def test_load_task_env_rejects_non_mapping_shield_before_env_construction(
+    tmp_path: Path, monkeypatch
+):
+    import gl_gym.RL.utils as rl_utils
+
+    monkeypatch.setattr(
+        rl_utils,
+        "make_vec_env",
+        lambda *args, **kwargs: pytest.fail("environment construction must not run"),
+    )
+
+    with pytest.raises(TypeError, match="shield_params must be a mapping"):
+        suite_evaluation.load_task_env(
+            SimpleNamespace(env_id="TomatoEnv"),
+            SimpleNamespace(),
+            tmp_path / "missing.pkl",
+            shield_params=[],
+        )
+
+
+def test_shielded_episode_uses_executed_action_and_returns_detached_provenance():
+    class ShieldEnv(FakeEnv):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def step(self, actions):
+            obs, rewards, dones, infos = super().step(actions)
+            requested = np.asarray(actions[0], dtype=np.float32).copy()
+            record = {
+                "requested_action": requested.tolist(),
+                "executed_action": [0.25],
+                "selected_lambda": 0.5,
+                "nested": {"attempts": [1]},
+            }
+            infos[0]["action_shield"] = record
+            self.records.append(record)
+            return obs, rewards, dones, infos
+
+    env = ShieldEnv()
+    model = HookedFakeModel()
+    _, diagnostics = run_deterministic_episode(
+        model, env, inference_mode="online_context", return_diagnostics=True
+    )
+
+    np.testing.assert_array_equal(
+        diagnostics["action_trace"], np.full((3, 1), 0.25, dtype=np.float32)
+    )
+    np.testing.assert_array_equal(
+        diagnostics["requested_action_trace"],
+        np.array([[0.0], [1.0], [2.0]], dtype=np.float32),
+    )
+    observations = [event for event in model.events if event[0] == "observe"]
+    np.testing.assert_array_equal(observations[0][2], np.array([0.25], dtype=np.float32))
+    assert isinstance(diagnostics["action_shield_records"], tuple)
+    assert diagnostics["action_shield_records"][0]["selected_lambda"] == 0.5
+    env.records[0]["nested"]["attempts"].append(99)
+    assert diagnostics["action_shield_records"][0]["nested"]["attempts"] == [1]
+
+
+def test_no_intervention_action_shield_record_still_marks_episode_as_shielded():
+    class ShieldEnv(FakeEnv):
+        def step(self, actions):
+            obs, rewards, dones, infos = super().step(actions)
+            requested = np.asarray(actions[0], dtype=np.float32).copy()
+            infos[0]["action_shield"] = {
+                "requested_action": requested.tolist(),
+                "executed_action": requested.tolist(),
+                "selected_lambda": 1.0,
+            }
+            return obs, rewards, dones, infos
+
+    _, diagnostics = run_deterministic_episode(
+        FakeModel(), ShieldEnv(), return_diagnostics=True
+    )
+
+    assert set(diagnostics) == {
+        "action_trace",
+        "requested_action_trace",
+        "action_shield_records",
+    }
+    assert len(diagnostics["action_shield_records"]) == 3
+
+
+@pytest.mark.parametrize(
+    ("record", "message"),
+    [
+        (None, "mapping"),
+        ({}, "executed_action"),
+        ({"executed_action": [float("nan")]}, "finite"),
+        ({"executed_action": [[0.0]]}, "shape"),
+        ({"executed_action": [1.00000001]}, "within"),
+        ({"executed_action": [0.0], "requested_action": [0.5]}, "requested_action"),
+    ],
+)
+def test_malformed_action_shield_evidence_fails_before_observe_or_next_predict(
+    record, message
+):
+    class MalformedShieldEnv(FakeEnv):
+        def step(self, actions):
+            obs, rewards, dones, infos = super().step(actions)
+            infos[0]["action_shield"] = record
+            return obs, rewards, dones, infos
+
+    model = HookedFakeModel()
+    with pytest.raises(ValueError, match=message):
+        run_deterministic_episode(
+            model, MalformedShieldEnv(), inference_mode="online_context"
+        )
+
+    assert [event[0] for event in model.events] == ["begin", "predict", "end"]
+
+
+def test_mixed_shield_presence_is_rejected_as_provenance_corruption():
+    class MixedEnv(FakeEnv):
+        def step(self, actions):
+            obs, rewards, dones, infos = super().step(actions)
+            if self.step_count == 1:
+                requested = np.asarray(actions[0], dtype=np.float32).copy()
+                infos[0]["action_shield"] = {
+                    "requested_action": requested.tolist(),
+                    "executed_action": requested.tolist(),
+                }
+            return obs, rewards, dones, infos
+
+    with pytest.raises(ValueError, match="mixed action_shield presence"):
+        run_deterministic_episode(FakeModel(), MixedEnv())
+
+
 def test_evaluate_suite_filters_tasks_for_smoke_runs():
     module = load_evaluate_suite_module()
     tasks = pd.DataFrame(

@@ -5,6 +5,8 @@ from __future__ import annotations
 import csv
 import inspect
 import os
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -55,8 +57,17 @@ def task_from_row(row: Any) -> EvaluationTaskRecord:
     )
 
 
-def load_task_env(suite: Any, task: EvaluationTaskRecord, vecnormalize_path: str | Path):
+def load_task_env(
+    suite: Any,
+    task: EvaluationTaskRecord,
+    vecnormalize_path: str | Path,
+    *,
+    shield_params: Mapping[str, Any] | None = None,
+):
     """Build one fresh normalized evaluation environment for a suite task."""
+
+    if shield_params is not None and not isinstance(shield_params, Mapping):
+        raise TypeError("shield_params must be a mapping")
 
     from stable_baselines3.common.vec_env import VecNormalize
 
@@ -73,8 +84,13 @@ def load_task_env(suite: Any, task: EvaluationTaskRecord, vecnormalize_path: str
         env_specific_params,
         task,
     )
+    env_id = suite.env_id
+    if shield_params is not None:
+        env_id = "ShieldedTomatoEnv"
+        env_specific_params = deepcopy(env_specific_params)
+        env_specific_params["action_shield_params"] = deepcopy(dict(shield_params))
     env = make_vec_env(
-        suite.env_id,
+        env_id,
         env_base_params,
         env_specific_params,
         seed=666,
@@ -95,6 +111,63 @@ def load_task_env(suite: Any, task: EvaluationTaskRecord, vecnormalize_path: str
     env.training = False
     env.norm_reward = False
     return env
+
+
+def _validated_action_vector(
+    value: Any,
+    *,
+    name: str,
+    expected_shape: tuple[int, ...],
+    bounded: bool,
+) -> np.ndarray:
+    raw = np.asarray(value)
+    if not np.issubdtype(raw.dtype, np.number) or np.issubdtype(
+        raw.dtype, np.complexfloating
+    ):
+        raise ValueError(f"action_shield {name} must be a numeric vector")
+    vector = np.array(raw, dtype=np.float64, copy=True)
+    if vector.ndim != 1 or vector.shape != expected_shape:
+        raise ValueError(
+            f"action_shield {name} must have exact shape {expected_shape}"
+        )
+    if not np.all(np.isfinite(vector)):
+        raise ValueError(f"action_shield {name} must contain only finite values")
+    if bounded and (np.any(vector < -1.0) or np.any(vector > 1.0)):
+        raise ValueError(f"action_shield {name} must be within [-1, 1]")
+    return vector.astype(np.float32)
+
+
+def _shielded_executed_action(
+    record: Any, requested_action: np.ndarray
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if not isinstance(record, Mapping):
+        raise ValueError("info['action_shield'] must be a mapping")
+    if "executed_action" not in record:
+        raise ValueError("info['action_shield'] must contain executed_action")
+
+    executed_action = _validated_action_vector(
+        record["executed_action"],
+        name="executed_action",
+        expected_shape=requested_action.shape,
+        bounded=True,
+    )
+    if "requested_action" in record:
+        recorded_requested = _validated_action_vector(
+            record["requested_action"],
+            name="requested_action",
+            expected_shape=requested_action.shape,
+            bounded=False,
+        )
+        if not np.allclose(
+            recorded_requested,
+            requested_action,
+            rtol=0.0,
+            atol=np.finfo(np.float32).eps,
+        ):
+            raise ValueError(
+                "action_shield requested_action does not match the policy action"
+            )
+    return executed_action, deepcopy(dict(record))
 
 
 def _predict(model: Any, obs: Any, states: Any, episode_starts: np.ndarray) -> tuple[Any, Any]:
@@ -155,6 +228,9 @@ def run_deterministic_episode(
         "twb_percent": float("nan"),
     }
     action_trace: list[np.ndarray] = []
+    requested_action_trace: list[np.ndarray] = []
+    action_shield_records: list[dict[str, Any]] = []
+    shield_presence: bool | None = None
     model_diagnostics: dict[str, Any] = {}
 
     primary_error: BaseException | None = None
@@ -176,7 +252,7 @@ def run_deterministic_episode(
             previous_obs = obs
             actions, states = _predict(model, obs, states, episode_starts)
             obs, rewards, dones, infos = env.step(actions)
-            action_trace.append(np.asarray(actions[0], dtype=np.float32).copy())
+            requested_action = np.asarray(actions[0], dtype=np.float32).copy()
             totals["episode_return"] += float(rewards[0])
             info = infos[0]
             done = bool(dones[0])
@@ -221,6 +297,23 @@ def run_deterministic_episode(
             if capture_error is not None:
                 raise capture_error
 
+            has_action_shield = "action_shield" in info
+            if shield_presence is None:
+                shield_presence = has_action_shield
+            elif shield_presence != has_action_shield:
+                raise ValueError(
+                    "mixed action_shield presence within one evaluation episode"
+                )
+
+            executed_action = requested_action
+            if has_action_shield:
+                executed_action, detached_record = _shielded_executed_action(
+                    info["action_shield"], requested_action
+                )
+                requested_action_trace.append(requested_action)
+                action_shield_records.append(detached_record)
+            action_trace.append(executed_action)
+
             if use_inference_hooks:
                 if done:
                     next_observation = info.get("terminal_observation")
@@ -233,7 +326,7 @@ def run_deterministic_episode(
                     next_observation = obs[0]
                 model.observe_inference_transition(
                     previous_obs[0],
-                    actions[0],
+                    executed_action,
                     rewards[0],
                     next_observation,
                     done,
@@ -285,7 +378,15 @@ def run_deterministic_episode(
         if action_trace
         else np.empty((0,), dtype=np.float32)
     )
-    return totals, {**model_diagnostics, "action_trace": stacked_actions}
+    diagnostics = {**model_diagnostics, "action_trace": stacked_actions}
+    if action_shield_records:
+        diagnostics.update(
+            requested_action_trace=np.stack(requested_action_trace).astype(
+                np.float32, copy=False
+            ),
+            action_shield_records=tuple(action_shield_records),
+        )
+    return totals, diagnostics
 
 
 def validate_completed_run_paths(run: Any) -> None:
