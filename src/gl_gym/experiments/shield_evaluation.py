@@ -195,6 +195,16 @@ def aggregate_episode_interventions(
         if intervened:
             if not isinstance(original_failure, Mapping):
                 raise ValueError("original_failure must be a mapping for intervention")
+            if set(original_failure) != {"exception_type", "exception_message"}:
+                raise ValueError(
+                    "original_failure must contain exactly exception_type and exception_message"
+                )
+            exception_type = original_failure["exception_type"]
+            exception_message = original_failure["exception_message"]
+            if not isinstance(exception_type, str) or not exception_type:
+                raise ValueError("original_failure exception_type must be a nonempty string")
+            if not isinstance(exception_message, str):
+                raise ValueError("original_failure exception_message must be a string")
         elif original_failure is not None:
             raise ValueError("original_failure must be None without intervention")
 
@@ -555,16 +565,26 @@ def write_shield_artifacts_atomic(
                 old_moved = False
             raise
         if old_moved:
-            shutil.rmtree(backup)
-            old_moved = False
+            try:
+                shutil.rmtree(backup)
+            except Exception:
+                # Publication is already committed. A stale hidden backup is
+                # preferable to reporting failure while retaining the new root.
+                pass
+            else:
+                old_moved = False
     finally:
         if stage.exists():
-            shutil.rmtree(stage, ignore_errors=True)
-        if backup.exists():
-            if old_moved and not root.exists():
+            try:
+                shutil.rmtree(stage, ignore_errors=True)
+            except Exception:
+                pass
+        if backup.exists() and not published and old_moved and not root.exists():
+            try:
                 os.replace(backup, root)
-            elif published or root.exists():
-                shutil.rmtree(backup, ignore_errors=True)
+            except Exception:
+                # Never remove the only remaining copy of the prior root.
+                pass
 
     return {
         "eval_raw": root / "eval_raw.csv",

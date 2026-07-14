@@ -49,7 +49,10 @@ def _record(step=0, *, intervened=True, selected_lambda=0.125):
         "per_channel_changed": (difference != 0).tolist(),
         "extra_solver_attempts": len(attempts),
         "elapsed_seconds": 0.25,
-        "original_failure": {"exception_type": "RuntimeError"} if intervened else None,
+        "original_failure": {
+            "exception_type": "RuntimeError",
+            "exception_message": "failed",
+        } if intervened else None,
     }
 
 
@@ -124,6 +127,35 @@ def test_aggregate_rejects_nonfinite_elapsed_sum():
     records[1]["elapsed_seconds"] = np.finfo(float).max
     with pytest.raises(ValueError, match="aggregate"):
         aggregate_episode_interventions(records, 2)
+
+
+@pytest.mark.parametrize(
+    "original_failure",
+    [
+        {},
+        {"exception_type": "RuntimeError"},
+        {"exception_message": "failed"},
+        {"exception_type": "RuntimeError", "exception_message": "failed", "extra": 1},
+        {"exception_type": "", "exception_message": "failed"},
+        {"exception_type": 1, "exception_message": "failed"},
+        {"exception_type": "RuntimeError", "exception_message": None},
+    ],
+)
+def test_aggregate_rejects_malformed_original_failure_schema(original_failure):
+    record = _record(0)
+    record["original_failure"] = original_failure
+    with pytest.raises((TypeError, ValueError), match="original_failure"):
+        aggregate_episode_interventions([record], 2)
+
+
+def test_aggregate_accepts_empty_original_exception_message():
+    record = _record(0)
+    record["original_failure"] = {
+        "exception_type": "RuntimeError",
+        "exception_message": "",
+    }
+    result = aggregate_episode_interventions([record], 2)
+    assert result["intervention_count"] == 1
 
 
 @pytest.mark.parametrize(
@@ -349,6 +381,57 @@ def test_atomic_publish_replace_failure_restores_old_root_without_partial_final(
         write_shield_artifacts_atomic(raw, paired, interventions, {}, {}, root)
     assert set(path.name for path in root.iterdir()) == {"old.txt"}
     assert list(tmp_path.iterdir()) == [root]
+
+
+def test_post_commit_backup_cleanup_failure_is_best_effort(monkeypatch, tmp_path):
+    raw, paired, interventions = _artifact_frames()
+    root = tmp_path / "shield"
+    root.mkdir()
+    (root / "old.txt").write_text("old", encoding="utf-8")
+    real_rmtree = shield_module.shutil.rmtree
+
+    def fail_backup_cleanup(path, *args, **kwargs):
+        if ".backup-" in Path(path).name:
+            raise OSError("injected cleanup failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shield_module.shutil, "rmtree", fail_backup_cleanup)
+    paths = write_shield_artifacts_atomic(raw, paired, interventions, {}, {}, root)
+
+    assert set(path.name for path in root.iterdir()) == {
+        "eval_raw.csv", "paired_deltas.csv", "interventions.csv",
+        "shield_manifest.json", "decision.json",
+    }
+    assert all(path.is_file() for path in paths.values())
+    backups = [path for path in tmp_path.iterdir() if ".backup-" in path.name]
+    assert len(backups) == 1
+    real_rmtree(backups[0])
+
+
+def test_failed_publish_never_deletes_only_backup_when_restore_also_fails(monkeypatch, tmp_path):
+    raw, paired, interventions = _artifact_frames()
+    root = tmp_path / "shield"
+    root.mkdir()
+    (root / "old.txt").write_text("old", encoding="utf-8")
+    real_replace = shield_module.os.replace
+
+    def fail_publish_and_restore(source, destination):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if destination_path == root and (
+            ".stage-" in source_path.name or ".backup-" in source_path.name
+        ):
+            raise OSError("injected replace failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(shield_module.os, "replace", fail_publish_and_restore)
+    with pytest.raises(OSError, match="injected"):
+        write_shield_artifacts_atomic(raw, paired, interventions, {}, {}, root)
+
+    backups = [path for path in tmp_path.iterdir() if ".backup-" in path.name]
+    assert not root.exists()
+    assert len(backups) == 1
+    assert (backups[0] / "old.txt").read_text(encoding="utf-8") == "old"
 
 
 def test_atomic_writer_rejects_empty_nonfinite_duplicates_and_file_root(tmp_path):
