@@ -243,6 +243,42 @@ def test_comparator_capsule_identity_and_paths_are_protected(tmp_path: Path):
         cli._validate_comparator_capsules([], stage1)
 
 
+def test_multiple_distinct_comparator_failures_are_protected_and_counted(tmp_path: Path):
+    failure_root = tmp_path / "capsules"
+    first = failure_root / ("a" * 64)
+    second = failure_root / ("c" * 64)
+    first.mkdir(parents=True)
+    second.mkdir()
+    evidence = [
+        {"manifest_path": first / "manifest.json", "capsule_dir": first,
+         "capsule_identity_sha256": "b" * 64, "failure_id": "a" * 64},
+        {"manifest_path": second / "manifest.json", "capsule_dir": second,
+         "capsule_identity_sha256": "d" * 64, "failure_id": "c" * 64},
+    ]
+    stage1 = {"report": {"capsule_identity_sha256": "b" * 64, "failure_id": "a" * 64}}
+    protected = cli._validate_comparator_capsules(evidence, stage1)
+    assert first.resolve() in protected
+    assert second.resolve() in protected
+
+    keys = sorted(cli._expected_keys())
+    shielded = pd.DataFrame([
+        {"seed": seed, "task_id": task, "inference_mode": mode, "completed": True,
+         "ode_failure_count": 0, "total_steps": 1000, "intervention_count": 0,
+         "episode_return": 100.0, "EPI": 1.0, "temp_violation": 1.0,
+         "co2_violation": 1.0, "rh_violation": 1.0}
+        for seed, task, mode in keys
+    ])
+    unshielded = shielded.drop(columns=["total_steps", "intervention_count"]).copy()
+    unshielded.loc[:1, "completed"] = False
+    unshielded.loc[:1, "ode_failure_count"] = 1
+    unshielded.loc[:1, list(cli.REQUIRED_METRICS)] = np.nan
+    decision = cli.evaluate_shield_gate(shielded, unshielded, set(keys))
+    assert decision["evidence"]["unshielded_ode_failure_count"] == 2
+
+    with pytest.raises(ValueError, match="duplicate"):
+        cli._validate_comparator_capsules([evidence[0], dict(evidence[0])], stage1)
+
+
 @pytest.mark.parametrize("capsule_case", ["bogus", "mismatch"])
 def test_comparator_rejects_bogus_or_mismatched_failure_capsule(
     tmp_path: Path, capsule_case: str

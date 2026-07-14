@@ -320,30 +320,46 @@ def _stage2_decision(gate: Mapping[str, Any]) -> dict[str, Any]:
 def _validate_comparator_capsules(
     evidence: list[Mapping[str, Any]], stage1: Mapping[str, Any]
 ) -> list[Path]:
-    unique: dict[tuple[str, str, Path], Mapping[str, Any]] = {}
+    seen_dirs: set[Path] = set()
+    seen_pairs: set[tuple[str, str]] = set()
+    failure_identities: dict[str, str] = {}
+    identity_failures: dict[str, str] = {}
+    normalized: list[tuple[str, str, Path]] = []
     for item in evidence:
         capsule_dir = Path(item["capsule_dir"]).resolve()
-        key = (
-            str(item["capsule_identity_sha256"]),
-            str(item["failure_id"]),
-            capsule_dir,
-        )
-        unique[key] = item
-    if len(unique) != 1:
-        raise ValueError("comparator must load exactly one unique known failure capsule")
-    (identity, failure_id, capsule_dir), _ = next(iter(unique.items()))
+        identity = str(item["capsule_identity_sha256"])
+        failure_id = str(item["failure_id"])
+        pair = (identity, failure_id)
+        if capsule_dir in seen_dirs or pair in seen_pairs:
+            raise ValueError("comparator contains duplicate failure capsule evidence")
+        if failure_id in failure_identities and failure_identities[failure_id] != identity:
+            raise ValueError("comparator contains conflicting capsule identity for failure_id")
+        if identity in identity_failures and identity_failures[identity] != failure_id:
+            raise ValueError("comparator contains conflicting failure_id for capsule identity")
+        seen_dirs.add(capsule_dir)
+        seen_pairs.add(pair)
+        failure_identities[failure_id] = identity
+        identity_failures[identity] = failure_id
+        normalized.append((identity, failure_id, capsule_dir))
     report = stage1["report"]
-    if (
-        identity != report.get("capsule_identity_sha256")
-        or failure_id != report.get("failure_id")
-    ):
-        raise ValueError("comparator capsule identity/failure_id does not match Stage-1")
-    protected = [capsule_dir]
-    common_failure_root = capsule_dir.parent
-    anchor = Path(common_failure_root.anchor)
-    if common_failure_root != anchor and common_failure_root.parent != common_failure_root:
-        protected.append(common_failure_root)
-    return protected
+    matches = [
+        item
+        for item in normalized
+        if item[0] == report.get("capsule_identity_sha256")
+        and item[1] == report.get("failure_id")
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "comparator must contain exactly one capsule matching Stage-1 identity/failure_id"
+        )
+    protected: list[Path] = []
+    for _, _, capsule_dir in normalized:
+        protected.append(capsule_dir)
+        failure_root = capsule_dir.parent
+        anchor = Path(failure_root.anchor)
+        if failure_root != anchor and failure_root.parent != failure_root:
+            protected.append(failure_root)
+    return list(dict.fromkeys(protected))
 
 
 def validate_stage1_provenance(
