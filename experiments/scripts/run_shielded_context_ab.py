@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 from typing import Any, Callable, Mapping
 
@@ -100,6 +101,7 @@ HASH_FIELDS = (
     "stage1_decision_sha256",
     "stage1_capsule_identity_sha256",
     *(name for name, _ in BEHAVIOR_SOURCE_FIELDS),
+    "runtime_source_tree_sha256",
     "shield_fingerprint",
 )
 
@@ -328,6 +330,34 @@ def _fingerprint(payload: Mapping[str, Any]) -> str:
 
 def _behavior_source_hashes() -> dict[str, str]:
     return {name: sha256_file(ROOT / path) for name, path in BEHAVIOR_SOURCE_FIELDS}
+
+
+def _runtime_source_tree_sha256(root: str | Path = ROOT) -> str:
+    source_root = Path(root).resolve() / "src" / "gl_gym"
+    if not source_root.is_dir() or source_root.is_symlink():
+        raise ValueError("runtime source tree must be a regular directory")
+    python_files: list[tuple[str, Path]] = []
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    for path in source_root.rglob("*"):
+        metadata = path.lstat()
+        attributes = getattr(metadata, "st_file_attributes", 0)
+        if path.is_symlink() or attributes & reparse_flag:
+            raise ValueError(f"runtime source tree contains symlink/reparse entry: {path}")
+        if path.suffix == ".py":
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"runtime Python source must be a regular file: {path}")
+            python_files.append((path.relative_to(source_root).as_posix(), path))
+    if not python_files:
+        raise ValueError("runtime source tree contains no Python files")
+    digest = hashlib.sha256()
+    for relative, path in sorted(python_files):
+        path_bytes = relative.encode("utf-8")
+        content = path.read_bytes()
+        digest.update(len(path_bytes).to_bytes(8, "big"))
+        digest.update(path_bytes)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
 
 
 def _stage2_decision(gate: Mapping[str, Any]) -> dict[str, Any]:
@@ -625,8 +655,9 @@ def resume_row_is_complete(
     expected: Mapping[str, Any],
     work_root: Path,
     key: tuple[int, str, str],
+    checkpoint_steps: int | None = None,
 ) -> bool:
-    required = {"seed", "task_id", "inference_mode", "checkpoint_steps", "completed", "executed_action_trace_path", "requested_action_trace_path", "intervention_records_path", "method", *HASH_FIELDS, *REQUIRED_METRICS}
+    required = {"seed", "task_id", "inference_mode", "checkpoint_steps", "completed", "executed_action_trace_path", "requested_action_trace_path", "intervention_records_path", "method", "support_ready_step", "context_norm_mean", "context_norm_max", *HASH_FIELDS, *REQUIRED_METRICS}
     completed_value = row.get("completed")
     if (
         not required.issubset(row)
@@ -636,6 +667,17 @@ def resume_row_is_complete(
     ):
         return False
     try:
+        row_checkpoint_steps = row["checkpoint_steps"]
+        if (
+            isinstance(row_checkpoint_steps, (bool, np.bool_))
+            or not isinstance(row_checkpoint_steps, (int, np.integer))
+            or int(row_checkpoint_steps) < 0
+            or (
+                checkpoint_steps is not None
+                and int(row_checkpoint_steps) != checkpoint_steps
+            )
+        ):
+            return False
         if any(str(row[name]) != str(expected[name]) for name in HASH_FIELDS):
             return False
         paths = [Path(str(row[name])).resolve() for name in ("executed_action_trace_path", "requested_action_trace_path", "intervention_records_path")]
@@ -647,6 +689,11 @@ def resume_row_is_complete(
             np.load(paths[1], allow_pickle=False),
             _json_records(paths[2]),
             decorate_steps=False,
+        )
+        _validated_context_diagnostics(
+            row,
+            inference_mode=key[2],
+            episode_steps=executed.shape[0],
         )
         summary = aggregate_episode_interventions(records, executed.shape[1])
         for name, value in summary.items():
@@ -664,7 +711,7 @@ def resume_row_is_complete(
                 return False
         metrics = np.asarray([float(row[name]) for name in REQUIRED_METRICS])
         return bool(np.isfinite(metrics).all())
-    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+    except Exception:
         return False
 
 
@@ -673,6 +720,43 @@ def _write_progress(rows: list[dict[str, Any]], path: Path) -> None:
     temporary = path.with_suffix(".tmp")
     pd.DataFrame(rows).to_csv(temporary, index=False)
     os.replace(temporary, path)
+
+
+def _validated_context_diagnostics(
+    values: Mapping[str, Any], *, inference_mode: str, episode_steps: int
+) -> dict[str, int | float]:
+    required = {"support_ready_step", "context_norm_mean", "context_norm_max"}
+    missing = required.difference(values)
+    if missing:
+        raise KeyError(f"model diagnostics are missing required context fields: {sorted(missing)}")
+    readiness = values["support_ready_step"]
+    if isinstance(readiness, np.generic):
+        readiness = readiness.item()
+    if inference_mode == "zero_context":
+        if readiness is None or (isinstance(readiness, float) and np.isnan(readiness)):
+            normalized_readiness: int | float = float("nan")
+        else:
+            raise ValueError("zero_context support_ready_step must be NaN")
+    elif inference_mode == "online_context":
+        if isinstance(readiness, bool) or not isinstance(readiness, (int, float)):
+            raise ValueError("online_context support_ready_step must be a finite integer")
+        numeric_readiness = float(readiness)
+        if not np.isfinite(numeric_readiness) or not numeric_readiness.is_integer() or not 1 <= numeric_readiness < episode_steps:
+            raise ValueError("online_context support_ready_step must be within the episode")
+        normalized_readiness = int(numeric_readiness)
+    else:
+        raise ValueError(f"unsupported inference_mode: {inference_mode}")
+    norms: dict[str, float] = {}
+    for name in ("context_norm_mean", "context_norm_max"):
+        value = values[name]
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(float(value)) or float(value) < 0.0:
+            raise ValueError(f"model diagnostic {name!r} must be finite nonnegative numeric")
+        norms[name] = float(value)
+    if norms["context_norm_max"] < norms["context_norm_mean"]:
+        raise ValueError("context_norm_max must be at least context_norm_mean")
+    return {"support_ready_step": normalized_readiness, **norms}
 
 
 def _strict_diagnostics(
@@ -702,10 +786,6 @@ def _strict_diagnostics(
     collisions = reserved.intersection(diagnostics)
     if collisions:
         raise ValueError(f"model diagnostics collide with Stage-2 raw fields: {sorted(collisions)}")
-    required_context = {"support_ready_step", "context_norm_mean", "context_norm_max"}
-    missing_context = required_context.difference(diagnostics)
-    if missing_context:
-        raise KeyError(f"model diagnostics are missing required context fields: {sorted(missing_context)}")
     for name, value in diagnostics.items():
         if name == "support_ready_step" and value is None:
             normalized[name] = None
@@ -715,34 +795,16 @@ def _strict_diagnostics(
             normalized[name] = value
         else:
             raise TypeError(f"model diagnostic {name!r} must be a finite CSV scalar")
-    readiness = normalized["support_ready_step"]
-    if inference_mode == "zero_context":
-        if readiness is None or (isinstance(readiness, float) and np.isnan(readiness)):
-            normalized["support_ready_step"] = float("nan")
-        else:
-            raise ValueError("zero_context support_ready_step must be NaN")
-    elif inference_mode == "online_context":
-        if isinstance(readiness, bool) or not isinstance(readiness, (int, float)):
-            raise ValueError("online_context support_ready_step must be a finite integer")
-        numeric_readiness = float(readiness)
-        if (
-            not np.isfinite(numeric_readiness)
-            or not numeric_readiness.is_integer()
-            or not 1 <= numeric_readiness < executed.shape[0]
-        ):
-            raise ValueError("online_context support_ready_step must be within the episode")
-        normalized["support_ready_step"] = int(numeric_readiness)
-    else:
-        raise ValueError(f"unsupported inference_mode: {inference_mode}")
+    normalized.update(
+        _validated_context_diagnostics(
+            normalized, inference_mode=inference_mode, episode_steps=executed.shape[0]
+        )
+    )
     for name, value in normalized.items():
         if name == "support_ready_step":
             continue
         if isinstance(value, float) and not np.isfinite(value):
             raise ValueError(f"model diagnostic {name!r} must be finite")
-    for name in ("context_norm_mean", "context_norm_max"):
-        value = normalized[name]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(float(value)):
-            raise ValueError(f"model diagnostic {name!r} must be finite numeric")
     return executed, requested, records, normalized
 
 
@@ -777,6 +839,7 @@ def run_shielded_diagnostic(
     params, rule_sha = _load_rule_params(rule_config_path)
     env_sha = sha256_file(env_config_path)
     behavior_hashes = _behavior_source_hashes()
+    runtime_source_tree_sha = _runtime_source_tree_sha256()
     validate_stage1_provenance(
         stage1, runs=runs, source_manifest=source_manifest,
         source_tasks_csv=source_tasks_csv, evaluation_provenance=evaluation,
@@ -817,6 +880,7 @@ def run_shielded_diagnostic(
         "checkpoints": [{name: str(run[name]) for name in ("seed", "model_path", "vecnormalize_path", "model_sha256", "vecnormalize_sha256")} for run in runs],
         **evaluation, "rule_config_sha256": rule_sha, "env_config_sha256": env_sha,
         **behavior_hashes,
+        "runtime_source_tree_sha256": runtime_source_tree_sha,
         "formal_solver_options": dict(FORMAL_CVODES_OPTIONS), "fixed_lambdas": list(DEFAULT_LAMBDAS),
         "stage1_results_sha256": stage1["stage1_results_sha256"],
         "stage1_selected_lambda": stage1["selected_lambda"],
@@ -838,6 +902,7 @@ def run_shielded_diagnostic(
             "model_sha256": run["model_sha256"], "vecnormalize_sha256": run["vecnormalize_sha256"],
             **evaluation, "rule_config_sha256": rule_sha, "env_config_sha256": env_sha,
             **behavior_hashes,
+            "runtime_source_tree_sha256": runtime_source_tree_sha,
             "formal_solver_options_sha256": formal_solver_sha,
             "fixed_lambdas_sha256": fixed_lambdas_sha,
             "stage1_results_sha256": stage1["stage1_results_sha256"],
@@ -872,13 +937,28 @@ def run_shielded_diagnostic(
     checkpoint_records: list[dict[str, Any]] = []
     for run in runs:
         model = load_model(Path(run["model_path"]), device)
-        checkpoint_steps = int(model.num_timesteps)
+        model_checkpoint_steps = model.num_timesteps
+        if (
+            isinstance(model_checkpoint_steps, (bool, np.bool_))
+            or not isinstance(model_checkpoint_steps, (int, np.integer))
+            or int(model_checkpoint_steps) < 0
+        ):
+            raise ValueError("model num_timesteps must be a nonnegative integer")
+        checkpoint_steps = int(model_checkpoint_steps)
         checkpoint_records.append({**{name: str(run[name]) for name in ("model_path", "vecnormalize_path", "model_sha256", "vecnormalize_sha256")}, "seed": int(run["seed"]), "checkpoint_steps": checkpoint_steps})
         for task in task_records:
             for mode in MODES:
                 key = (int(run["seed"]), task.task_id, mode)
-                if key in completed and int(completed[key]["checkpoint_steps"]) == checkpoint_steps:
-                    continue
+                if key in completed:
+                    if resume_row_is_complete(
+                        completed[key],
+                        expected=evidence_by_seed[key[0]],
+                        work_root=work,
+                        key=key,
+                        checkpoint_steps=checkpoint_steps,
+                    ):
+                        continue
+                    completed.pop(key, None)
                 env = env_loader(suite, task, Path(run["vecnormalize_path"]), shield_params=params)
                 primary: BaseException | None = None
                 try:

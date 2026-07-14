@@ -230,6 +230,39 @@ def test_behavior_hashes_change_on_one_byte_edit(tmp_path: Path, monkeypatch: py
     assert before != after
 
 
+def test_runtime_tree_hash_frames_all_transitive_agrimetarl_sources(tmp_path: Path):
+    required = (
+        "RL/agri_metarl/agri_metarl.py", "RL/agri_metarl/memory.py",
+        "RL/agri_metarl/calibration.py", "RL/agri_metarl/diagnostics.py",
+    )
+    source = tmp_path / "src" / "gl_gym"
+    for relative in required:
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(relative, encoding="utf-8")
+    first = cli._runtime_source_tree_sha256(tmp_path)
+    changed = source / required[1]
+    changed.write_text(changed.read_text(encoding="utf-8") + "!", encoding="utf-8")
+    second = cli._runtime_source_tree_sha256(tmp_path)
+    assert first != second
+    changed.rename(changed.with_name("renamed.py"))
+    assert cli._runtime_source_tree_sha256(tmp_path) != second
+
+
+def test_runtime_tree_hash_rejects_symlink(tmp_path: Path):
+    source = tmp_path / "src" / "gl_gym"
+    source.mkdir(parents=True)
+    target = source / "real.py"
+    target.write_text("x", encoding="utf-8")
+    link = source / "linked.py"
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"symlink unavailable: {error}")
+    with pytest.raises(ValueError, match="symlink|reparse|regular"):
+        cli._runtime_source_tree_sha256(tmp_path)
+
+
 def _explicit_comparator_rows():
     return pd.DataFrame([
         {"seed": seed, "task_id": task, "inference_mode": mode,
@@ -533,6 +566,39 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
     assert calls == []
 
     progress_path = tmp_path / ".shielded.work" / "progress.csv"
+    for bad_checkpoint in (1.5, "nonnumeric", -1, 999):
+        malformed = pd.read_csv(progress_path)
+        malformed["checkpoint_steps"] = malformed["checkpoint_steps"].astype(object)
+        malformed.loc[0, "checkpoint_steps"] = bad_checkpoint
+        malformed.to_csv(progress_path, index=False)
+        calls.clear()
+        cli.run_shielded_diagnostic(
+            suite=suite, tasks=tasks, runs=runs, source_manifest=manifest_path,
+            source_tasks_csv=tasks_path, stage1_root=stage["root"],
+            unshielded_result_root=unshielded_root, result_root=tmp_path / "shielded",
+            failure_root=tmp_path / "failures", device="cpu", resume=True,
+            model_loader=lambda path, device: Model(), env_loader=env_loader,
+            episode_runner=episode_runner, provenance_loader=lambda: provenance,
+            recorder_factory=lambda root, context: object(),
+        )
+        assert calls
+
+    for diagnostic, value in (("context_norm_mean", np.nan), ("context_norm_max", np.inf)):
+        malformed = pd.read_csv(progress_path)
+        malformed.loc[0, diagnostic] = value
+        malformed.to_csv(progress_path, index=False)
+        calls.clear()
+        cli.run_shielded_diagnostic(
+            suite=suite, tasks=tasks, runs=runs, source_manifest=manifest_path,
+            source_tasks_csv=tasks_path, stage1_root=stage["root"],
+            unshielded_result_root=unshielded_root, result_root=tmp_path / "shielded",
+            failure_root=tmp_path / "failures", device="cpu", resume=True,
+            model_loader=lambda path, device: Model(), env_loader=env_loader,
+            episode_runner=episode_runner, provenance_loader=lambda: provenance,
+            recorder_factory=lambda root, context: object(),
+        )
+        assert calls
+
     stale = pd.read_csv(progress_path)
     stale.loc[0, "shield_fingerprint"] = "0" * 64
     stale.to_csv(progress_path, index=False)
