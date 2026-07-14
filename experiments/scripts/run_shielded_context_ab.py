@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
@@ -618,8 +619,13 @@ def _validate_trace_record_consistency(
         or not np.isfinite(requested).all()
     ):
         raise ValueError("executed/requested action traces must be matching finite 2D arrays")
-    if not isinstance(raw_records, list) or len(raw_records) != executed.shape[0]:
+    if (
+        isinstance(raw_records, (str, bytes, Mapping))
+        or not isinstance(raw_records, Sequence)
+        or len(raw_records) != executed.shape[0]
+    ):
         raise ValueError("action_shield_records must contain one record per executed step")
+    raw_records = list(raw_records)
     records: list[dict[str, Any]] = []
     for step, record in enumerate(raw_records):
         if not isinstance(record, Mapping):
@@ -736,7 +742,12 @@ def _validated_context_diagnostics(
         if readiness is None or (isinstance(readiness, float) and np.isnan(readiness)):
             normalized_readiness: int | float = float("nan")
         else:
-            raise ValueError("zero_context support_ready_step must be NaN")
+            if isinstance(readiness, bool) or not isinstance(readiness, (int, float)):
+                raise ValueError("zero_context support_ready_step must be NaN or a finite integer")
+            numeric_readiness = float(readiness)
+            if not np.isfinite(numeric_readiness) or not numeric_readiness.is_integer() or not 1 <= numeric_readiness < episode_steps:
+                raise ValueError("zero_context support_ready_step must be NaN or within the episode")
+            normalized_readiness = int(numeric_readiness)
     elif inference_mode == "online_context":
         if isinstance(readiness, bool) or not isinstance(readiness, (int, float)):
             raise ValueError("online_context support_ready_step must be a finite integer")
@@ -756,6 +767,10 @@ def _validated_context_diagnostics(
         norms[name] = float(value)
     if norms["context_norm_max"] < norms["context_norm_mean"]:
         raise ValueError("context_norm_max must be at least context_norm_mean")
+    if inference_mode == "zero_context" and (
+        norms["context_norm_mean"] != 0.0 or norms["context_norm_max"] != 0.0
+    ):
+        raise ValueError("zero_context context_norm diagnostics must be exactly zero")
     return {"support_ready_step": normalized_readiness, **norms}
 
 

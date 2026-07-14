@@ -194,7 +194,7 @@ def test_real_context_diagnostics_are_mode_aware_and_collision_safe():
         "elapsed_seconds": 0.0, "original_failure": None,
     }
     base = {"action_trace": np.zeros((3, 1)), "requested_action_trace": np.zeros((3, 1)),
-            "action_shield_records": [dict(record) for _ in range(3)],
+            "action_shield_records": tuple(dict(record) for _ in range(3)),
             "context_norm_mean": 0.0, "context_norm_max": 0.0}
     zero = dict(base, support_ready_step=np.nan)
     assert np.isnan(cli._strict_diagnostics(
@@ -204,12 +204,21 @@ def test_real_context_diagnostics_are_mode_aware_and_collision_safe():
     assert cli._strict_diagnostics(
         online, inference_mode="online_context", metric_names={"episode_return"}
     )[3]["support_ready_step"] == 1
-    for mode, readiness in (("zero_context", 1.0), ("online_context", np.nan)):
+    zero_ready = dict(base, support_ready_step=1.0)
+    assert cli._strict_diagnostics(
+        zero_ready, inference_mode="zero_context", metric_names=set()
+    )[3]["support_ready_step"] == 1
+    for mode, readiness in (("zero_context", np.inf), ("online_context", np.nan)):
         with pytest.raises(ValueError, match="support_ready_step"):
             cli._strict_diagnostics(
                 dict(base, support_ready_step=readiness), inference_mode=mode,
                 metric_names={"episode_return"},
             )
+    with pytest.raises(ValueError, match="zero_context|context_norm"):
+        cli._strict_diagnostics(
+            dict(zero, context_norm_mean=0.1, context_norm_max=0.1),
+            inference_mode="zero_context", metric_names=set(),
+        )
     for collision in ("episode_return", "intervention_count"):
         with pytest.raises(ValueError, match="collide"):
             cli._strict_diagnostics(
