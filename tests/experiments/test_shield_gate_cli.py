@@ -63,7 +63,8 @@ def test_exact_key_validation_rejects_duplicate_extra_and_missing(tmp_path):
 
 
 def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield_return=100.0,
-               shield_violation=1.0, ode_failures=0, tamper=None):
+               shield_violation=1.0, ode_failures=0, tamper=None,
+               unshield_failure=False):
     suite = create_default_suite_config(result_root=tmp_path / "suite-source")
     tasks = pd.DataFrame(vars(item) for item in build_evaluation_tasks(suite))
     manifest_path = write_suite_manifest(suite, tmp_path / "suite_manifest.json")
@@ -97,12 +98,6 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
     stage2_identity = evaluator.load_stage2_evidence(stage2_decision)["stage2_identity_sha256"]
     seeds = (42, 123)
     checkpoint_map = {int(item["seed"]): item for item in stage2_manifest["checkpoints"]}
-    source_inputs = {
-        "runtime_source_tree_sha256": stage2_source._runtime_source_tree_sha256(),
-        "evaluator_source_sha256": evaluator._sha(Path(evaluator.__file__)),
-        "gate_source_sha256": evaluator._sha(Path(cli.__file__)),
-    }
-    source_fingerprint = evaluator._canonical_hash(source_inputs)
     descriptors = [
         {**row._asdict(), "seed": seed, "suite_id": suite.suite_id}
         for seed in seeds for row in tasks.itertuples(index=False)
@@ -127,13 +122,36 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
         def load(path, device): return Model()
     class Env:
         def close(self): pass
+    unshield_calls = 0
+
+    def unshield_runner(model, env, *, failure_recorder):
+        nonlocal unshield_calls
+        unshield_calls += 1
+        if unshield_failure and unshield_calls == 1:
+            from tests.experiments.test_ode_failure import _info
+            info = _info(8, failure=True)
+            info["integration_failure"]["solver_options"] = dict(
+                stage2_source.FORMAL_CVODES_OPTIONS
+            )
+            failure_recorder.record_step(
+                8, np.array([8.0, 10.0]), -1.0, True, info
+            )
+            raise RuntimeError("CVODES failed deterministically")
+        return {
+            "episode_return": 100.0, "temp_violation": 1.0,
+            "co2_violation": 1.0, "rh_violation": 1.0,
+        }
     evaluator.run(
         unshield_args, model_map={"agri_metarl": Loader},
         env_loader=lambda *args, **kwargs: Env(),
-        episode_runner=lambda model, env: {"episode_return": 100.0, "temp_violation": 1.0,
-                                           "co2_violation": 1.0, "rh_violation": 1.0},
+        episode_runner=unshield_runner,
     )
     unshield_path = unshield_root / "eval_raw.csv"
+    unshield_manifest = json.loads(
+        (unshield_root / "evaluation_manifest.json").read_text(encoding="utf-8")
+    )
+    source_inputs = unshield_manifest["source_fingerprint_inputs"]
+    source_fingerprint = unshield_manifest["source_fingerprint_sha256"]
     work = tmp_path / "shield-work"; work.mkdir()
     shield_rows, intervention_rows = [], []
     base_record = {
@@ -182,6 +200,9 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
             "vecnormalize_sha256": checkpoint_map[row["seed"]]["vecnormalize_sha256"],
             "checkpoint_steps": 10, "source_fingerprint_sha256": source_fingerprint,
             "runtime_source_tree_sha256": stage2_source._runtime_source_tree_sha256(),
+            "source_manifest_sha256": source_inputs["source_manifest_sha256"],
+            "runs_csv_sha256": source_inputs["runs_csv_sha256"],
+            "tasks_csv_sha256": source_inputs["tasks_csv_sha256"],
             "stage2_identity_sha256": stage2_identity,
             "completed": ode_failures == 0 or bool(shield_rows),
             "formal_complete": True, "ode_failure_count": 0,
@@ -195,6 +216,7 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
             "algorithm", "method", "model_sha256", "vecnormalize_sha256", "checkpoint_steps",
             "source_fingerprint_sha256", "stage2_identity_sha256", "suite_id", "seed", "task_id",
             "runtime_source_tree_sha256",
+            "source_manifest_sha256", "runs_csv_sha256", "tasks_csv_sha256",
             "split", "weather_year", "start_day", "uncertainty_scale", "economic_scenario",
             "climate_constraint_scenario", "episode_return", "temp_violation", "co2_violation",
             "rh_violation", "executed_action_trace_sha256", "requested_action_trace_sha256",
@@ -213,6 +235,9 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
             "runtime_source_tree_sha256": stage2_source._runtime_source_tree_sha256(),
             "evaluator_source_sha256": evaluator._sha(Path(evaluator.__file__)),
             "gate_source_sha256": evaluator._sha(Path(cli.__file__)),
+            "source_manifest_sha256": source_inputs["source_manifest_sha256"],
+            "runs_csv_sha256": source_inputs["runs_csv_sha256"],
+            "tasks_csv_sha256": source_inputs["tasks_csv_sha256"],
             "source_fingerprint_inputs": source_inputs,
         },
     )
@@ -236,6 +261,54 @@ def test_full_91_by_2_gate_ready_and_writes_only_stage3_artifacts(tmp_path, monk
         "paired_deltas.csv", "summary.csv", "shield_manifest.json", "decision.json"
     }
     assert len(pd.read_csv(output / "paired_deltas.csv")) == 182
+
+
+def test_gate_accepts_a_real_capsule_backed_integration_failure(tmp_path, monkeypatch):
+    cli = _module()
+    decision, _ = _gate_case(cli, tmp_path, monkeypatch, unshield_failure=True)
+    assert decision["outcome"] == "paper_evidence_ready"
+    assert decision["evidence"]["unshielded_ode_failure_count"] == 1
+
+
+def test_gate_rejects_tampered_failure_capsule(tmp_path, monkeypatch):
+    cli = _module()
+
+    def tamper(paths):
+        frame = pd.read_csv(paths["unshielded_eval"])
+        capsule_manifest = (
+            paths["unshielded_eval"].parent
+            / frame.loc[~frame["completed"], "failure_evidence_path"].iloc[0]
+        )
+        with (capsule_manifest.parent / "history.npz").open("ab") as handle:
+            handle.write(b"tamper")
+
+    with pytest.raises(ValueError, match="checksum|hash|capsule"):
+        _gate_case(
+            cli, tmp_path, monkeypatch, unshield_failure=True, tamper=tamper
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["source_manifest_sha256", "runs_csv_sha256", "tasks_csv_sha256"],
+)
+def test_gate_rejects_self_consistent_input_source_hash_tamper(
+    tmp_path, monkeypatch, field
+):
+    cli = _module()
+
+    def tamper(paths):
+        manifest_path = paths["unshielded_eval"].parent / "evaluation_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["source_fingerprint_inputs"][field] = "0" * 64
+        manifest[field] = "0" * 64
+        manifest["source_fingerprint_sha256"] = evaluator._canonical_hash(
+            manifest["source_fingerprint_inputs"]
+        )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="input source|runs CSV|manifest/tasks"):
+        _gate_case(cli, tmp_path, monkeypatch, tamper=tamper)
 
 
 @pytest.mark.parametrize(

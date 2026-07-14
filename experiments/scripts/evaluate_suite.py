@@ -42,6 +42,11 @@ from gl_gym.experiments.shield_evaluation import (
     build_paired_shield_deltas,
     evaluate_shield_gate,
 )
+from gl_gym.experiments.ode_failure import (
+    CapsuleContext,
+    FailureCapsuleRecorder,
+    load_failure_capsule,
+)
 
 
 SHIELD_METHOD = "minimal_feasibility_shield_v1"
@@ -61,6 +66,55 @@ ALG_MAP = {
     "context_recurrentppo": ContextRecurrentPPO,
     "agri_metarl": AgriMetaRL,
 }
+
+
+def _formal_source_checksums(args: argparse.Namespace, payload: Mapping[str, str]) -> dict[str, str]:
+    return {
+        str(Path(args.manifest).resolve()): payload["source_manifest_sha256"],
+        str(Path(args.runs_csv).resolve()): payload["runs_csv_sha256"],
+        str(Path(args.tasks_csv).resolve()): payload["tasks_csv_sha256"],
+        str(Path(__file__).resolve()): payload["evaluator_source_sha256"],
+        str((ROOT / "experiments/scripts/evaluate_shield_gate.py").resolve()): payload[
+            "gate_source_sha256"
+        ],
+        "runtime_source_tree": payload["runtime_source_tree_sha256"],
+    }
+
+
+def _validate_attempt_capsule(
+    manifest_path: Path,
+    *,
+    expected_context: CapsuleContext,
+    expected_solver_options: Mapping[str, Any],
+    error: Exception,
+) -> tuple[str, Any]:
+    capsule = load_failure_capsule(manifest_path.parent)
+    expected = {
+        "seed": int(expected_context.seed),
+        "task_id": expected_context.task_id,
+        "inference_mode": expected_context.inference_mode,
+        "task": expected_context.task,
+        "checkpoint_path": expected_context.checkpoint_path,
+        "checkpoint_sha256": expected_context.checkpoint_sha256,
+        "git_head": expected_context.git_head,
+        "dirty": expected_context.dirty,
+        "source_checksums": expected_context.source_checksums,
+        "package_versions": expected_context.package_versions,
+        "formal_result_root": expected_context.formal_result_root,
+    }
+    manifest = capsule.manifest
+    if manifest.get("context") != expected:
+        raise ValueError("failure capsule context does not match this evaluation attempt")
+    exception = manifest.get("exception", {})
+    if exception != {"type": type(error).__name__, "message": str(error)}:
+        raise ValueError("failure capsule exception does not match the caught exception")
+    solver_options = manifest.get("solver", {}).get("options")
+    if solver_options != dict(expected_solver_options) or not solver_options:
+        raise ValueError("failure capsule does not prove a configured solver call")
+    identity = manifest.get("content_identity_sha256")
+    if not isinstance(identity, str) or len(identity) != 64:
+        raise ValueError("failure capsule content identity is invalid")
+    return identity, capsule
 
 
 def filter_tasks(
@@ -611,8 +665,8 @@ def run_shield_evaluation(
     from experiments.scripts import run_shielded_context_ab as stage2
     shield_params, rule_sha = stage2._load_rule_params()
     source_payload = {
-        "manifest_sha256": _sha(args.manifest), "runs_sha256": _sha(args.runs_csv),
-        "tasks_sha256": _sha(args.tasks_csv), "rule_config_sha256": rule_sha,
+        "source_manifest_sha256": _sha(args.manifest), "runs_csv_sha256": _sha(args.runs_csv),
+        "tasks_csv_sha256": _sha(args.tasks_csv), "rule_config_sha256": rule_sha,
         "env_config_sha256": _sha(stage2.ENV_CONFIG_PATH),
         "runtime_source_tree_sha256": stage2._runtime_source_tree_sha256(),
         "evaluator_source_sha256": _sha(Path(__file__)),
@@ -620,7 +674,8 @@ def run_shield_evaluation(
     }
     source_identity_inputs = {
         name: source_payload[name] for name in (
-            "runtime_source_tree_sha256", "evaluator_source_sha256", "gate_source_sha256"
+            "source_manifest_sha256", "runs_csv_sha256", "tasks_csv_sha256",
+            "runtime_source_tree_sha256", "evaluator_source_sha256", "gate_source_sha256",
         )
     }
     source_fingerprint = _canonical_hash(source_identity_inputs)
@@ -652,6 +707,9 @@ def run_shield_evaluation(
             "checkpoint_steps": int(checkpoint_steps), "source_fingerprint_sha256": source_fingerprint,
             "stage2_identity_sha256": stage2_identity,
             "runtime_source_tree_sha256": source_payload["runtime_source_tree_sha256"],
+            "source_manifest_sha256": source_payload["source_manifest_sha256"],
+            "runs_csv_sha256": source_payload["runs_csv_sha256"],
+            "tasks_csv_sha256": source_payload["tasks_csv_sha256"],
         }
         published_checkpoints[int(run_row.seed)] = {
             "seed": int(run_row.seed), "model_sha256": model_sha,
@@ -775,23 +833,29 @@ def run_formal_unshielded_evaluation(
     from experiments.scripts import run_shielded_context_ab as source
     runtime_sha = source._runtime_source_tree_sha256()
     source_payload = {
-        "manifest_sha256": _sha(args.manifest), "runs_sha256": _sha(args.runs_csv),
-        "tasks_sha256": _sha(args.tasks_csv), "runtime_source_tree_sha256": runtime_sha,
+        "source_manifest_sha256": _sha(args.manifest), "runs_csv_sha256": _sha(args.runs_csv),
+        "tasks_csv_sha256": _sha(args.tasks_csv), "runtime_source_tree_sha256": runtime_sha,
         "evaluator_source_sha256": _sha(Path(__file__)),
         "gate_source_sha256": _sha(ROOT / "experiments/scripts/evaluate_shield_gate.py"),
     }
     source_identity_inputs = {
         name: source_payload[name] for name in (
-            "runtime_source_tree_sha256", "evaluator_source_sha256", "gate_source_sha256"
+            "source_manifest_sha256", "runs_csv_sha256", "tasks_csv_sha256",
+            "runtime_source_tree_sha256", "evaluator_source_sha256", "gate_source_sha256",
         )
     }
     source_fingerprint = _canonical_hash(source_identity_inputs)
+    from experiments.scripts.run_context_ab import _package_versions, _provenance
+    execution_provenance = _provenance()
+    package_versions = _package_versions()
+    source_checksums = _formal_source_checksums(args, source_payload)
     completed: dict[tuple[int, str], dict[str, Any]] = {}
     required_progress = {
         "seed", "task_id", "algorithm", "method", "model_sha256", "vecnormalize_sha256",
         "checkpoint_steps", "source_fingerprint_sha256", "runtime_source_tree_sha256",
+        "source_manifest_sha256", "runs_csv_sha256", "tasks_csv_sha256",
         "stage2_identity_sha256", "episode_evidence_identity_sha256", "completed", "status",
-        "ode_failure_count", "failure_evidence_path",
+        "ode_failure_count", "failure_evidence_path", "failure_evidence_identity_sha256",
     }
     if not progress.empty and (
         not required_progress.issubset(progress.columns) or progress.duplicated(["seed", "task_id"]).any()
@@ -820,6 +884,9 @@ def run_formal_unshielded_evaluation(
                 "model_sha256": model_sha, "vecnormalize_sha256": vec_sha,
                 "checkpoint_steps": int(checkpoint_steps), "source_fingerprint_sha256": source_fingerprint,
                 "runtime_source_tree_sha256": runtime_sha,
+                "source_manifest_sha256": source_payload["source_manifest_sha256"],
+                "runs_csv_sha256": source_payload["runs_csv_sha256"],
+                "tasks_csv_sha256": source_payload["tasks_csv_sha256"],
                 "stage2_identity_sha256": stage2_decision["stage2_identity_sha256"],
             }
             try:
@@ -831,20 +898,50 @@ def run_formal_unshielded_evaluation(
         for task in task_records:
             key = (int(run_row.seed), task.task_id)
             if key in completed: continue
+            attempt_token = _canonical_hash({"seed": key[0], "task_id": key[1]})
+            # Keep the isolated recorder root short enough for legacy Windows path limits.
+            attempt_root = root.parent / f".f-{attempt_token[:12]}"
+            if attempt_root.exists():
+                shutil.rmtree(attempt_root)
+            context = CapsuleContext(
+                seed=key[0], task_id=task.task_id, inference_mode="stage3_unshielded",
+                task=dict(vars(task)), checkpoint_path=str(Path(run_row.model_path).resolve()),
+                checkpoint_sha256=model_sha, git_head=execution_provenance["git_commit"],
+                dirty=execution_provenance["dirty"], source_checksums=source_checksums,
+                package_versions=package_versions,
+                formal_result_root=str(root.resolve()),
+            )
+            recorder = FailureCapsuleRecorder(attempt_root, context)
             env = env_loader(suite, task, run_row.vecnormalize_path)
-            error: BaseException | None = None
+            error: Exception | None = None
             try:
-                metrics = episode_runner(model, env)
-            except BaseException as caught:
-                error = caught
-                metrics = {name: None for name in ("episode_return", "temp_violation", "co2_violation", "rh_violation")}
+                try:
+                    metrics = episode_runner(model, env, failure_recorder=recorder)
+                except Exception as caught:
+                    error = caught
+                    metrics = {name: None for name in ("episode_return", "temp_violation", "co2_violation", "rh_violation")}
             finally:
-                close_environment(env, error)
+                close_environment(env, sys.exception() or error)
+            manifests = sorted(attempt_root.rglob("manifest.json")) if attempt_root.exists() else []
             failure_path = ""
+            failure_identity = ""
             if error is not None:
-                failure_file = work / "failure_evidence" / f"seed{key[0]}__{key[1]}.json"
-                _atomic_json(failure_file, {"exception_type": type(error).__name__, "exception_message": str(error)})
-                failure_path = str(failure_file.resolve())
+                try:
+                    if len(manifests) != 1:
+                        raise ValueError(
+                            f"expected exactly one new failure capsule, found {len(manifests)}"
+                        )
+                    failure_identity, _ = _validate_attempt_capsule(
+                        manifests[0], expected_context=context,
+                        expected_solver_options=stage2_manifest["formal_solver_options"],
+                        error=error,
+                    )
+                    failure_path = str(manifests[0].resolve())
+                except Exception as capsule_error:
+                    error.add_note(f"ODE failure classification rejected: {capsule_error}")
+                    raise error
+            elif manifests:
+                raise ValueError("successful formal episode unexpectedly produced a failure capsule")
             row = {
                 "suite_id": suite.suite_id, "algorithm": "agri_metarl", "method": FORMAL_UNSHIELDED_METHOD,
                 "seed": key[0], "run_name": run_row.run_name, "task_id": task.task_id,
@@ -853,9 +950,13 @@ def run_formal_unshielded_evaluation(
                 "climate_constraint_scenario": task.climate_constraint_scenario,
                 **metrics, "completed": error is None, "status": "completed" if error is None else "ode_failure",
                 "ode_failure_count": 0 if error is None else 1, "failure_evidence_path": failure_path,
+                "failure_evidence_identity_sha256": failure_identity,
                 "model_sha256": model_sha, "vecnormalize_sha256": vec_sha,
                 "checkpoint_steps": int(checkpoint_steps), "source_fingerprint_sha256": source_fingerprint,
                 "runtime_source_tree_sha256": runtime_sha,
+                "source_manifest_sha256": source_payload["source_manifest_sha256"],
+                "runs_csv_sha256": source_payload["runs_csv_sha256"],
+                "tasks_csv_sha256": source_payload["tasks_csv_sha256"],
                 "stage2_identity_sha256": stage2_decision["stage2_identity_sha256"],
             }
             row["episode_evidence_identity_sha256"] = _canonical_hash(row)
@@ -867,29 +968,58 @@ def run_formal_unshielded_evaluation(
     final = pd.DataFrame([completed[key] for key in sorted(completed)])
     stage = Path(tempfile.mkdtemp(prefix=f".{root.name}.stage-", dir=root.parent))
     try:
-        published = final.copy(); evidence_hashes = {}
+        published = final.copy(); evidence_hashes = {}; capsule_identities = {}
+        source_attempt_roots: set[Path] = set()
         for index, row in final.loc[~final["completed"]].iterrows():
-            source_path = Path(row.failure_evidence_path)
-            relative = Path("failure_evidence") / source_path.name
-            (stage / relative).parent.mkdir(parents=True, exist_ok=True); shutil.copy2(source_path, stage / relative)
-            published.at[index, "failure_evidence_path"] = relative.as_posix()
-            evidence_hashes[relative.as_posix()] = _sha(stage / relative)
+            source_path = Path(row.failure_evidence_path).parent
+            attempt_root = source_path.parents[3]
+            if attempt_root.parent != root.parent or not attempt_root.name.startswith(".f-"):
+                raise ValueError("failure capsule is not contained in its isolated attempt root")
+            source_attempt_roots.add(attempt_root)
+            relative_dir = (
+                Path("failure_evidence")
+                / f"seed{int(row.seed)}__{_canonical_hash(str(row.task_id))[:12]}"
+                / source_path.name
+            )
+            shutil.copytree(source_path, stage / relative_dir)
+            relative_manifest = relative_dir / "manifest.json"
+            published.at[index, "failure_evidence_path"] = relative_manifest.as_posix()
+            capsule_identities[relative_manifest.as_posix()] = row.failure_evidence_identity_sha256
+            for evidence_file in sorted((stage / relative_dir).iterdir()):
+                evidence_hashes[evidence_file.relative_to(stage).as_posix()] = _sha(evidence_file)
+        for index, row in published.iterrows():
+            identity_payload = {}
+            for name, value in row.to_dict().items():
+                if name == "episode_evidence_identity_sha256":
+                    continue
+                if pd.isna(value):
+                    value = None
+                elif hasattr(value, "item"):
+                    value = value.item()
+                identity_payload[name] = value
+            published.at[index, "episode_evidence_identity_sha256"] = _canonical_hash(
+                identity_payload
+            )
         published.to_csv(stage / "eval_raw.csv", index=False)
         manifest = {
             "schema_version": "formal-unshielded-evaluation-v1", "result_root": str(root),
             "formal_complete": True, "method": FORMAL_UNSHIELDED_METHOD,
             "eval_raw_sha256": _sha(stage / "eval_raw.csv"), "checkpoints": checkpoint_records,
             "source_fingerprint_sha256": source_fingerprint, "runtime_source_tree_sha256": runtime_sha,
-            "source_fingerprint_inputs": source_identity_inputs,
+            **source_payload, "source_fingerprint_inputs": source_identity_inputs,
             "stage2_identity_sha256": stage2_decision["stage2_identity_sha256"],
             "evaluator_source_sha256": source_payload["evaluator_source_sha256"],
-            "gate_source_sha256": source_payload["gate_source_sha256"], "failure_evidence_sha256": evidence_hashes,
+            "gate_source_sha256": source_payload["gate_source_sha256"],
+            "failure_evidence_sha256": evidence_hashes,
+            "failure_capsule_identities": capsule_identities,
         }
         _atomic_json(stage / "evaluation_manifest.json", manifest)
         replace_directory_atomic(stage, root)
-    except BaseException:
-        if stage.exists(): shutil.rmtree(stage, ignore_errors=True)
-        raise
+        for source_attempt_root in source_attempt_roots:
+            shutil.rmtree(source_attempt_root, ignore_errors=True)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
     return len(final)
 
 

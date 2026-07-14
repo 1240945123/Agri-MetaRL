@@ -124,6 +124,173 @@ def _stage2_fixture(cli, root: Path) -> Path:
     return decision_path
 
 
+def _formal_unshielded_fixture(cli, tmp_path: Path):
+    from experiments.scripts import run_shielded_context_ab as stage2_source
+
+    suite = create_default_suite_config(result_root=tmp_path / "suite-source")
+    manifest_path = write_suite_manifest(suite, tmp_path / "suite.json")
+    tasks = pd.DataFrame(vars(item) for item in build_evaluation_tasks(suite))
+    tasks_path = tmp_path / "tasks.csv"
+    tasks.to_csv(tasks_path, index=False)
+    models, vecs = {}, {}
+    for seed in (42, 123):
+        models[seed] = tmp_path / f"model-{seed}.zip"
+        vecs[seed] = tmp_path / f"vec-{seed}.pkl"
+        models[seed].write_bytes(f"model-{seed}".encode())
+        vecs[seed].write_bytes(f"vec-{seed}".encode())
+    runs = pd.DataFrame([
+        {
+            "suite_id": suite.suite_id,
+            "algorithm": "agri_metarl",
+            "seed": seed,
+            "run_name": f"agri_metarl_seed{seed}",
+            "model_path": str(models[seed]),
+            "vecnormalize_path": str(vecs[seed]),
+            "status": "completed",
+        }
+        for seed in (42, 123)
+    ])
+    runs_path = tmp_path / "runs.csv"
+    runs.to_csv(runs_path, index=False)
+    decision = _stage2_fixture(cli, tmp_path / "stage2")
+    stage2_manifest_path = decision.parent / "shield_manifest.json"
+    stage2_manifest = json.loads(stage2_manifest_path.read_text(encoding="utf-8"))
+    _, rule_sha = stage2_source._load_rule_params()
+    stage2_manifest.update({
+        "source_manifest_sha256": cli._sha(manifest_path),
+        "source_tasks_sha256": cli._sha(tasks_path),
+        "rule_config_sha256": rule_sha,
+        "env_config_sha256": cli._sha(stage2_source.ENV_CONFIG_PATH),
+        "runtime_source_tree_sha256": stage2_source._runtime_source_tree_sha256(),
+        "evaluator_source_sha256": cli._sha(Path(cli.__file__)),
+        "gate_source_sha256": cli._sha(
+            Path(cli.__file__).with_name("evaluate_shield_gate.py")
+        ),
+        "fixed_lambdas": list(stage2_source.DEFAULT_LAMBDAS),
+        "formal_solver_options": dict(stage2_source.FORMAL_CVODES_OPTIONS),
+        "checkpoints": [
+            {
+                "seed": seed,
+                "model_sha256": cli._sha(models[seed]),
+                "vecnormalize_sha256": cli._sha(vecs[seed]),
+                "checkpoint_steps": 10,
+            }
+            for seed in (42, 123)
+        ],
+        **stage2_source._behavior_source_hashes(),
+    })
+    stage2_manifest_path.write_text(json.dumps(stage2_manifest), encoding="utf-8")
+    root = tmp_path / "formal-unshielded"
+    args = SimpleNamespace(
+        manifest=str(manifest_path),
+        runs_csv=str(runs_path),
+        tasks_csv=str(tasks_path),
+        algorithms=["agri_metarl"],
+        seeds=[42, 123],
+        splits=None,
+        task_ids=None,
+        limit_tasks=None,
+        resume_eval=False,
+        action_shield=False,
+        formal_unshielded_provenance=True,
+        stage2_decision=str(decision),
+        result_root=str(root),
+        interventions_out=None,
+    )
+
+    class Model:
+        num_timesteps = 10
+
+    class Loader:
+        @staticmethod
+        def load(path, device):
+            return Model()
+
+    class Env:
+        def close(self):
+            pass
+
+    return args, root, {"agri_metarl": Loader}, lambda *unused: Env()
+
+
+@pytest.mark.parametrize("message", ["model prediction failed", "episode terminated early"])
+def test_formal_unshielded_rejects_ordinary_failure_without_new_capsule(tmp_path, message):
+    cli = _module()
+    args, root, model_map, env_loader = _formal_unshielded_fixture(cli, tmp_path)
+
+    def fail_without_capsule(model, env, *, failure_recorder):
+        raise RuntimeError(message)
+
+    with pytest.raises(RuntimeError, match=message):
+        cli.run(
+            args,
+            model_map=model_map,
+            env_loader=env_loader,
+            episode_runner=fail_without_capsule,
+        )
+    assert not root.exists()
+    assert not (root.parent / f".{root.name}.work" / "eval_raw.csv").exists()
+
+
+def test_formal_unshielded_never_classifies_keyboard_interrupt(tmp_path):
+    cli = _module()
+    args, root, model_map, env_loader = _formal_unshielded_fixture(cli, tmp_path)
+
+    def interrupt(model, env, *, failure_recorder):
+        raise KeyboardInterrupt("stop")
+
+    with pytest.raises(KeyboardInterrupt, match="stop"):
+        cli.run(
+            args,
+            model_map=model_map,
+            env_loader=env_loader,
+            episode_runner=interrupt,
+        )
+    assert not root.exists()
+    assert not (root.parent / f".{root.name}.work" / "eval_raw.csv").exists()
+
+
+def test_formal_unshielded_accepts_exactly_one_matching_failure_capsule(tmp_path):
+    from tests.experiments.test_ode_failure import _info
+
+    cli = _module()
+    args, root, model_map, env_loader = _formal_unshielded_fixture(cli, tmp_path)
+    calls = 0
+
+    def one_solver_failure(model, env, *, failure_recorder):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            from experiments.scripts.run_shielded_context_ab import FORMAL_CVODES_OPTIONS
+            info = _info(8, failure=True)
+            info["integration_failure"]["solver_options"] = dict(FORMAL_CVODES_OPTIONS)
+            failure_recorder.record_step(
+                8, np.array([8.0, 10.0]), -1.0, True, info
+            )
+            raise RuntimeError("CVODES failed deterministically")
+        return {
+            "episode_return": 100.0,
+            "temp_violation": 1.0,
+            "co2_violation": 1.0,
+            "rh_violation": 1.0,
+        }
+
+    assert cli.run(
+        args,
+        model_map=model_map,
+        env_loader=env_loader,
+        episode_runner=one_solver_failure,
+    ) == 182
+    frame = pd.read_csv(root / "eval_raw.csv")
+    failed = frame.loc[~frame["completed"]]
+    assert len(failed) == 1
+    assert failed.iloc[0].status == "ode_failure"
+    capsule_manifest = root / failed.iloc[0].failure_evidence_path
+    assert capsule_manifest.name == "manifest.json"
+    from gl_gym.experiments.ode_failure import load_failure_capsule
+    load_failure_capsule(capsule_manifest.parent)
+
+
 def test_stage2_five_artifact_identity_recomputes_gate_and_rejects_forgery(tmp_path):
     cli = _module()
     decision = _stage2_fixture(cli, tmp_path / "stage2")
