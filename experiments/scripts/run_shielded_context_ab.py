@@ -39,7 +39,11 @@ from gl_gym.experiments.context_ab import (
     MODES,
     select_diagnostic_tasks,
 )
-from gl_gym.experiments.ode_failure import CapsuleContext, FailureCapsuleRecorder
+from gl_gym.experiments.ode_failure import (
+    CapsuleContext,
+    FailureCapsuleRecorder,
+    load_failure_capsule,
+)
 from gl_gym.experiments.shield_evaluation import (
     REQUIRED_METRICS,
     aggregate_episode_interventions,
@@ -212,6 +216,29 @@ def _overlaps(first: Path, second: Path) -> bool:
     return first == second or first in second.parents or second in first.parents
 
 
+def _inside_lifecycle_namespace(candidate: Path, protected: Path) -> bool:
+    for component in (candidate, *candidate.parents):
+        if component.parent != protected.parent:
+            continue
+        if component.name == f".{protected.name}.work" or component.name.startswith(
+            (
+                f".{protected.name}.stage-",
+                f".{protected.name}.staging-",
+                f".{protected.name}.backup-",
+            )
+        ):
+            return True
+    return False
+
+
+def _collides(first: Path, second: Path) -> bool:
+    return (
+        _overlaps(first, second)
+        or _inside_lifecycle_namespace(first, second)
+        or _inside_lifecycle_namespace(second, first)
+    )
+
+
 def validate_output_roots(
     result_root: str | Path,
     failure_root: str | Path,
@@ -224,7 +251,7 @@ def validate_output_roots(
     failure = Path(failure_root).resolve()
     work = result.parent / f".{result.name}.work"
     generated = (result, failure, work)
-    if any(_overlaps(left, right) for index, left in enumerate(generated) for right in generated[index + 1 :]):
+    if _collides(result, failure) or _collides(work, failure):
         raise ValueError("result, work, and failure roots must be mutually disjoint")
     if failure.parent == result.parent and failure.name.startswith(
         (f".{result.name}.stage-", f".{result.name}.staging-", f".{result.name}.backup-")
@@ -237,7 +264,7 @@ def validate_output_roots(
                 protected.parent == result.parent
                 and protected.name.startswith((f".{result.name}.stage-", f".{result.name}.staging-", f".{result.name}.backup-"))
             )
-            if _overlaps(candidate, protected) or staging_collision:
+            if _collides(candidate, protected) or staging_collision:
                 raise ValueError("all Stage-2 output roots must be disjoint from protected roots")
     for candidate in (result, failure):
         if candidate.exists() and not candidate.is_dir():
@@ -277,6 +304,17 @@ def _canonical_bytes(value: Any) -> bytes:
 
 def _fingerprint(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_bytes(dict(payload))).hexdigest()
+
+
+def _stage2_decision(gate: Mapping[str, Any]) -> dict[str, Any]:
+    decision = dict(gate)
+    decision["stage"] = "stage2_shielded_context_ab"
+    decision["outcome"] = (
+        "continue_to_full_suite"
+        if gate.get("outcome") == "pass"
+        else "redesign_action_shield"
+    )
+    return decision
 
 
 def validate_stage1_provenance(
@@ -332,6 +370,7 @@ def load_unshielded_comparator(
     *,
     expected_provenance: Mapping[str, Any],
     expected_checkpoints: Mapping[int, Mapping[str, str]] | None = None,
+    capsule_loader: Callable[[str | Path], Any] = load_failure_capsule,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Load an immutable exact-key unshielded comparator, never rerunning it."""
 
@@ -371,35 +410,69 @@ def load_unshielded_comparator(
             for column in ("model_sha256", "vecnormalize_sha256"):
                 if set(seed_rows[column].astype(str)) != {str(expected_hashes[column])}:
                     raise ValueError(f"unshielded comparator checkpoint mismatch for seed {seed}: {column}")
-    if "completed" in table:
-        completed = table["completed"]
-        if not completed.map(lambda value: isinstance(value, (bool, np.bool_))).all():
-            raise ValueError("unshielded completed values must be strict booleans")
-        table["completed"] = completed.astype(bool)
-    elif "status" in table:
-        allowed = {"completed", "failed"}
-        if not set(table["status"]).issubset(allowed):
-            raise ValueError("unshielded status must be completed or failed")
-        table["completed"] = table["status"].eq("completed")
-    else:
-        missing = [name for name in REQUIRED_METRICS if name not in table]
-        if missing:
-            raise ValueError(f"unshielded completed table is missing metrics: {missing}")
-        values = table[list(REQUIRED_METRICS)].apply(pd.to_numeric, errors="coerce").to_numpy(float)
-        if not np.isfinite(values).all():
-            raise ValueError("unshielded table without statuses must be fully completed")
-        table["completed"] = True
-    if "ode_failure_count" not in table:
-        table["ode_failure_count"] = 0
-    incomplete = table.loc[~table["completed"]]
-    if not incomplete.empty:
-        evidence_columns = [name for name in ("failure_path", "failure_evidence_path", "error", "error_type") if name in table]
-        for _, row in incomplete.iterrows():
-            evidenced = int(row["ode_failure_count"]) > 0 or any(
-                isinstance(row[name], str) and bool(row[name].strip()) for name in evidence_columns
+    required_protocol = {
+        "completed", "status", "ode_failure_count", "failure_evidence_path",
+        *REQUIRED_METRICS,
+    }
+    missing_protocol = sorted(required_protocol.difference(table.columns))
+    if missing_protocol:
+        raise ValueError(f"unshielded comparator is missing explicit protocol columns: {missing_protocol}")
+    completed_values = list(table["completed"].array)
+    if any(not isinstance(value, (bool, np.bool_)) for value in completed_values):
+        raise ValueError("unshielded completed values must be strict booleans")
+    table["completed"] = [bool(value) for value in completed_values]
+    for _, row in table.iterrows():
+        count = row["ode_failure_count"]
+        if isinstance(count, (bool, np.bool_)) or not isinstance(count, (int, np.integer)) or int(count) < 0:
+            raise ValueError("unshielded ode_failure_count must be a nonnegative integer")
+        completed = bool(row["completed"])
+        status = row["status"]
+        evidence_value = row["failure_evidence_path"]
+        evidence_empty = pd.isna(evidence_value) or (isinstance(evidence_value, str) and not evidence_value.strip())
+        metrics = pd.to_numeric(row[list(REQUIRED_METRICS)], errors="coerce").to_numpy(dtype=float)
+        if completed:
+            if status != "completed" or int(count) != 0 or not evidence_empty or not np.isfinite(metrics).all():
+                raise ValueError("completed unshielded rows require completed status, zero failures, empty evidence, and finite metrics")
+            continue
+        if status != "ode_failure" or int(count) < 1 or evidence_empty or not np.isnan(metrics).all():
+            raise ValueError("incomplete unshielded rows must be explicit ode_failure evidence with non-scoring metrics")
+        evidence_path = Path(str(evidence_value))
+        if not evidence_path.is_absolute():
+            evidence_path = directory / evidence_path
+        evidence_path = evidence_path.resolve()
+        if evidence_path.name != "manifest.json" or not evidence_path.is_file():
+            raise ValueError("failure_evidence_path must point to an existing manifest.json")
+        try:
+            capsule = capsule_loader(evidence_path.parent)
+        except Exception as error:
+            raise ValueError("failure_evidence_path is not a valid failure capsule") from error
+        context = capsule.manifest.get("context")
+        if not isinstance(context, Mapping):
+            raise ValueError("failure capsule context is missing")
+        seed = int(row["seed"])
+        expected_checkpoint = expected_checkpoints.get(seed) if expected_checkpoints is not None else None
+        identity_matches = (
+            context.get("seed") == seed
+            and context.get("task_id") == row["task_id"]
+            and context.get("inference_mode") == row["inference_mode"]
+            and isinstance(context.get("task"), Mapping)
+            and context["task"].get("task_id") == row["task_id"]
+            and context.get("git_head") == expected_provenance.get("git_commit")
+            and context.get("dirty") == expected_provenance.get("dirty")
+            and Path(str(context.get("formal_result_root"))).resolve() == directory
+        )
+        if expected_checkpoint is not None:
+            identity_matches = identity_matches and (
+                context.get("checkpoint_sha256") == expected_checkpoint["model_sha256"]
+                and context.get("checkpoint_sha256") == str(row["model_sha256"])
+                and Path(str(context.get("checkpoint_path"))).resolve()
+                == Path(expected_checkpoint["model_path"]).resolve()
             )
-            if not evidenced:
-                raise ValueError("each incomplete unshielded row requires explicit failure evidence")
+        source_values = set(context.get("source_checksums", {}).values()) if isinstance(context.get("source_checksums"), Mapping) else set()
+        for name in ("source_manifest_sha256", "source_tasks_sha256"):
+            identity_matches = identity_matches and expected_provenance.get(name) in source_values
+        if not identity_matches:
+            raise ValueError("failure capsule identity/provenance does not match comparator row")
     return table, manifest
 
 
@@ -487,6 +560,20 @@ def _strict_diagnostics(diagnostics: Mapping[str, Any]) -> tuple[np.ndarray, np.
         if "step_index" in detached and detached["step_index"] != step:
             raise ValueError("action shield step_index is inconsistent")
         detached["step_index"] = step
+        try:
+            record_executed = np.asarray(detached["executed_action"], dtype=np.float32)
+            record_requested = np.asarray(detached["requested_action"], dtype=np.float32)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("action shield record actions must be numeric vectors") from error
+        if (
+            record_executed.shape != (executed.shape[1],)
+            or record_requested.shape != (requested.shape[1],)
+            or not np.isfinite(record_executed).all()
+            or not np.isfinite(record_requested).all()
+            or not np.array_equal(executed[step], record_executed)
+            or not np.array_equal(requested[step], record_requested)
+        ):
+            raise ValueError("action traces must exactly match each shield record")
         records.append(detached)
     normalized: dict[str, Any] = {}
     reserved = {"seed", "task_id", "inference_mode", "method", *HASH_FIELDS}
@@ -554,6 +641,7 @@ def run_shielded_diagnostic(
             int(run["seed"]): {
                 "model_sha256": str(run["model_sha256"]),
                 "vecnormalize_sha256": str(run["vecnormalize_sha256"]),
+                "model_path": str(Path(run["model_path"]).resolve()),
             }
             for run in runs
         },
@@ -689,7 +777,7 @@ def run_shielded_diagnostic(
             raw.at[index, column] = relative
             if column == "intervention_records_path":
                 interventions.at[index, column] = relative
-    decision = {**gate, "stage": "stage2_shielded_context_ab", "outcome": "continue_to_full_suite" if gate["outcome"] == "pass" else "redesign_action_shield"}
+    decision = _stage2_decision(gate)
     manifest = {
         **fingerprint_payload, "shield_fingerprint": shield_fingerprint,
         "source_manifest": str(Path(source_manifest).resolve()),
