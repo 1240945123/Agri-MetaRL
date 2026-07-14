@@ -21,6 +21,7 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RULE_CONFIG_PATH = ROOT / "configs" / "agents" / "rule_based.yml"
 SOURCE_ROOT = str(ROOT / "src")
 if SOURCE_ROOT not in sys.path:
     sys.path.insert(0, SOURCE_ROOT)
@@ -269,12 +270,13 @@ def _snapshot_inputs(source: Mapping[str, Any]) -> dict[str, Any]:
 
 def _load_env_config(
     path: str | Path, nu: int
-) -> tuple[Path, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[str, np.ndarray, np.ndarray, np.ndarray]:
     unresolved = Path(path).expanduser().absolute()
     _reject_reparse_components(unresolved, include_leaf=True)
     config_path = unresolved.resolve()
     try:
-        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        snapshot = config_path.read_bytes()
+        loaded = yaml.safe_load(snapshot.decode("utf-8", errors="strict"))
     except (OSError, UnicodeError, yaml.YAMLError) as error:
         raise ValueError(f"invalid environment config: {error}") from error
     if not isinstance(loaded, Mapping) or not isinstance(
@@ -307,7 +309,55 @@ def _load_env_config(
     delta = np.ones(nu, dtype=np.float32) * delta_scalar
     if not np.isfinite(delta).all() or np.any(delta <= 0):
         raise ValueError("delta_u_max must remain positive and finite as float32")
-    return config_path, u_min, u_max, delta
+    return hashlib.sha256(snapshot).hexdigest(), u_min, u_max, delta
+
+
+def _stat_signature(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+    )
+
+
+def _snapshot_rule_config(
+    path: str | Path = RULE_CONFIG_PATH,
+) -> tuple[str, tuple[int, int, int, int]]:
+    unresolved = Path(path).expanduser().absolute()
+    _reject_reparse_components(unresolved, include_leaf=True)
+    config_path = unresolved.resolve()
+    try:
+        with config_path.open("rb") as stream:
+            snapshot = stream.read()
+            signature = _stat_signature(os.fstat(stream.fileno()))
+        loaded = yaml.safe_load(snapshot.decode("utf-8", errors="strict"))
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        raise ValueError(f"invalid rule controller config: {error}") from error
+    if (
+        not isinstance(loaded, Mapping)
+        or not isinstance(loaded.get("TomatoEnv"), Mapping)
+        or not loaded["TomatoEnv"]
+    ):
+        raise ValueError(
+            "rule controller config requires a nonempty TomatoEnv parameter mapping"
+        )
+    return hashlib.sha256(snapshot).hexdigest(), signature
+
+
+def _require_unchanged_rule_config(
+    path: str | Path, expected_signature: tuple[int, int, int, int]
+) -> None:
+    candidate = Path(path).expanduser().absolute()
+    try:
+        _reject_reparse_components(candidate, include_leaf=True)
+        observed = _stat_signature(candidate.lstat())
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "rule controller config changed before construction"
+        ) from error
+    if observed != expected_signature:
+        raise ValueError("rule controller config changed before construction")
 
 
 def _state_from_result(result: Any, nx: int) -> np.ndarray:
@@ -335,14 +385,6 @@ def _control(
     u_max: np.ndarray,
 ) -> np.ndarray:
     return np.clip(previous + action * delta, u_min, u_max)
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _validate_formal_solver_provenance(manifest: Mapping[str, Any]) -> None:
@@ -443,6 +485,8 @@ def _factory_kwargs(inputs: Mapping[str, Any]) -> dict[str, Any]:
 def _run_original(inputs: Mapping[str, Any], integrator_factory: Callable[..., Any]):
     started = perf_counter()
     integrator = integrator_factory(**_factory_kwargs(inputs))
+    if not callable(integrator):
+        raise TypeError("integrator_factory must return a callable integrator")
     try:
         result = integrator(
             x0=np.array(inputs["x0"], copy=True),
@@ -694,7 +738,8 @@ def run_stage1(
     )
     _validate_formal_solver_provenance(capsule.manifest)
     inputs = _snapshot_inputs(capsule.failure_inputs)
-    config_path, u_min, u_max, delta = _load_env_config(env_config, inputs["nu"])
+    env_config_sha256, u_min, u_max, delta = _load_env_config(env_config, inputs["nu"])
+    rule_config_sha256, rule_config_signature = _snapshot_rule_config(RULE_CONFIG_PATH)
     expected_control = _control(
         inputs["requested_action"], inputs["previous_control"], delta, u_min, u_max
     )
@@ -714,6 +759,8 @@ def run_stage1(
     attempts: list[dict[str, Any]] = []
 
     if reproduced:
+        if controller_factory is build_rule_based_controller:
+            _require_unchanged_rule_config(RULE_CONFIG_PATH, rule_config_signature)
         controller = controller_factory()
         environment = SimpleNamespace(
             nu=inputs["nu"],
@@ -746,6 +793,10 @@ def run_stage1(
                 )
                 candidate_controls.append(np.array(control, copy=True))
                 integrator = integrator_factory(**_factory_kwargs(inputs))
+                if not callable(integrator):
+                    raise TypeError(
+                        "integrator_factory must return a callable integrator"
+                    )
             except Exception as error:
                 raise _ConstructionFailure(error) from None
             result = integrator(
@@ -805,8 +856,8 @@ def run_stage1(
         **provenance,
         "failure_timestep": inputs["timestep"],
         "formal_solver_options": dict(FORMAL_CVODES_OPTIONS),
-        "env_config_sha256": _sha256(config_path),
-        "rule_config_sha256": _sha256(ROOT / "configs" / "agents" / "rule_based.yml"),
+        "env_config_sha256": env_config_sha256,
+        "rule_config_sha256": rule_config_sha256,
         "fixed_lambdas": list(DEFAULT_LAMBDAS),
         "delta_u_max": delta.tolist(),
         "original_outcome": original,

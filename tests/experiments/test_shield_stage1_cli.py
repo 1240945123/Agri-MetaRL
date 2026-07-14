@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -386,6 +387,147 @@ def test_requested_action_outside_closed_unit_interval_rejected_before_factories
             controller_factory=lambda: calls.append("controller"),
         )
     assert calls == []
+    assert not output.exists()
+
+
+def test_config_and_rule_hashes_use_pre_execution_byte_snapshots(tmp_path, monkeypatch):
+    capsule = _capsule(tmp_path)
+    env_config = _config(tmp_path / "env.yml")
+    rule_config = tmp_path / "rule_based.yml"
+    rule_config.write_text("TomatoEnv:\n  lamps_on: 0\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "RULE_CONFIG_PATH", rule_config)
+    env_bytes = env_config.read_bytes()
+    rule_bytes = rule_config.read_bytes()
+
+    def factory(**kwargs):
+        env_config.unlink()
+        rule_config.write_text("TomatoEnv:\n  lamps_on: 99\n", encoding="utf-8")
+        return lambda **inputs: {"xf": np.array([4.0, 5.0, 6.0])}
+
+    output = tmp_path / "snapshot"
+    cli.run_stage1(
+        capsule.path / "manifest.json",
+        env_config,
+        output,
+        capsule_loader=lambda _: capsule,
+        integrator_factory=factory,
+        controller_factory=lambda: (_ for _ in ()).throw(
+            AssertionError("controller must not run")
+        ),
+    )
+    payload = json.loads((output / "stage1_results.json").read_text(encoding="utf-8"))
+    assert payload["env_config_sha256"] == hashlib.sha256(env_bytes).hexdigest()
+    assert payload["rule_config_sha256"] == hashlib.sha256(rule_bytes).hexdigest()
+
+
+def test_default_controller_rejects_rule_mutation_before_construction(
+    tmp_path, monkeypatch
+):
+    capsule = _capsule(tmp_path)
+    env_config = _config(tmp_path / "env.yml")
+    rule_config = tmp_path / "rule_based.yml"
+    rule_config.write_text("TomatoEnv:\n  lamps_on: 0\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "RULE_CONFIG_PATH", rule_config)
+    real_default = cli.build_rule_based_controller
+
+    def factory(**kwargs):
+        rule_config.write_text("TomatoEnv:\n  lamps_on: 99\n", encoding="utf-8")
+        return lambda **inputs: (_ for _ in ()).throw(RuntimeError("original"))
+
+    output = tmp_path / "mutated-default"
+    with pytest.raises(ValueError, match="rule controller config changed"):
+        cli.run_stage1(
+            capsule.path / "manifest.json",
+            env_config,
+            output,
+            capsule_loader=lambda _: capsule,
+            integrator_factory=factory,
+            controller_factory=real_default,
+        )
+    assert not output.exists()
+
+
+def test_injected_controller_mutation_does_not_change_snapshotted_hashes(
+    tmp_path, monkeypatch
+):
+    capsule = _capsule(tmp_path)
+    env_config = _config(tmp_path / "env.yml")
+    rule_config = tmp_path / "rule_based.yml"
+    rule_config.write_text("TomatoEnv:\n  lamps_on: 0\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "RULE_CONFIG_PATH", rule_config)
+    env_bytes = env_config.read_bytes()
+    rule_bytes = rule_config.read_bytes()
+    factory_calls = 0
+
+    def factory(**kwargs):
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls == 1:
+            return lambda **inputs: (_ for _ in ()).throw(RuntimeError("original"))
+        return lambda **inputs: {"xf": np.array([4.0, 5.0, 6.0])}
+
+    def controller_factory():
+        env_config.unlink()
+        rule_config.write_text("TomatoEnv:\n  lamps_on: 99\n", encoding="utf-8")
+        return SimpleNamespace(predict=lambda *args: np.array([0.4, 0.6]))
+
+    output = tmp_path / "controller-snapshot"
+    cli.run_stage1(
+        capsule.path / "manifest.json",
+        env_config,
+        output,
+        capsule_loader=lambda _: capsule,
+        integrator_factory=factory,
+        controller_factory=controller_factory,
+    )
+    payload = json.loads((output / "stage1_results.json").read_text(encoding="utf-8"))
+    assert payload["env_config_sha256"] == hashlib.sha256(env_bytes).hexdigest()
+    assert payload["rule_config_sha256"] == hashlib.sha256(rule_bytes).hexdigest()
+
+
+def test_noncallable_original_integrator_is_construction_error(tmp_path):
+    capsule = _capsule(tmp_path)
+    config = _config(tmp_path / "env.yml")
+    output = tmp_path / "noncallable-original"
+    with pytest.raises(TypeError, match="callable"):
+        cli.run_stage1(
+            capsule.path / "manifest.json",
+            config,
+            output,
+            capsule_loader=lambda _: capsule,
+            integrator_factory=lambda **kwargs: object(),
+            controller_factory=lambda: (_ for _ in ()).throw(
+                AssertionError("controller must not run")
+            ),
+        )
+    assert not output.exists()
+
+
+def test_noncallable_candidate_integrator_is_construction_error(tmp_path):
+    capsule = _capsule(tmp_path)
+    config = _config(tmp_path / "env.yml")
+    output = tmp_path / "noncallable-candidate"
+    calls = 0
+
+    def factory(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return lambda **inputs: (_ for _ in ()).throw(RuntimeError("original"))
+        return object()
+
+    with pytest.raises(TypeError, match="callable"):
+        cli.run_stage1(
+            capsule.path / "manifest.json",
+            config,
+            output,
+            capsule_loader=lambda _: capsule,
+            integrator_factory=factory,
+            controller_factory=lambda: SimpleNamespace(
+                predict=lambda *args: np.array([0.4, 0.6])
+            ),
+        )
+    assert calls == 2
     assert not output.exists()
 
 
