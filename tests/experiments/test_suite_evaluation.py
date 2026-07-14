@@ -961,6 +961,18 @@ def test_no_intervention_action_shield_record_still_marks_episode_as_shielded():
         ({"executed_action": [[0.0]]}, "shape"),
         ({"executed_action": [1.00000001]}, "within"),
         ({"executed_action": [0.0], "requested_action": [0.5]}, "requested_action"),
+        (
+            {"executed_action": [0.0], "requested_action": [1e-7]},
+            "requested_action",
+        ),
+        (
+            {"executed_action": [0.0], "requested_action": [[0.0]]},
+            "shape",
+        ),
+        (
+            {"executed_action": [0.0], "requested_action": [float("nan")]},
+            "finite",
+        ),
     ],
 )
 def test_malformed_action_shield_evidence_fails_before_observe_or_next_predict(
@@ -976,6 +988,55 @@ def test_malformed_action_shield_evidence_fails_before_observe_or_next_predict(
     with pytest.raises(ValueError, match=message):
         run_deterministic_episode(
             model, MalformedShieldEnv(), inference_mode="online_context"
+        )
+
+    assert [event[0] for event in model.events] == ["begin", "predict", "end"]
+
+
+def test_early_termination_remains_primary_over_malformed_shield_evidence():
+    class EarlyShieldEnv(FakeEnv):
+        def step(self, actions):
+            self.step_count += 1
+            return (
+                np.array([[0.0]], dtype=np.float32),
+                np.array([1.0], dtype=np.float32),
+                np.array([True]),
+                [
+                    {
+                        "terminal_observation": np.array([9.0], dtype=np.float32),
+                        "action_shield": None,
+                    }
+                ],
+            )
+
+    model = HookedFakeModel()
+    with pytest.raises(RuntimeError, match="terminated before configured horizon"):
+        run_deterministic_episode(
+            model, EarlyShieldEnv(), inference_mode="online_context"
+        )
+
+    assert [event[0] for event in model.events] == ["begin", "predict", "end"]
+
+
+def test_missing_terminal_observation_remains_primary_over_malformed_shield_evidence():
+    class MissingTerminalShieldEnv(FakeEnv):
+        def get_attr(self, name):
+            assert name == "N"
+            return [1]
+
+        def step(self, actions):
+            self.step_count += 1
+            return (
+                np.array([[0.0]], dtype=np.float32),
+                np.array([1.0], dtype=np.float32),
+                np.array([True]),
+                [{"action_shield": None}],
+            )
+
+    model = HookedFakeModel()
+    with pytest.raises(ValueError, match="terminal_observation"):
+        run_deterministic_episode(
+            model, MissingTerminalShieldEnv(), inference_mode="online_context"
         )
 
     assert [event[0] for event in model.events] == ["begin", "predict", "end"]

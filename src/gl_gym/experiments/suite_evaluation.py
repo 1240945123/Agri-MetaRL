@@ -158,12 +158,7 @@ def _shielded_executed_action(
             expected_shape=requested_action.shape,
             bounded=False,
         )
-        if not np.allclose(
-            recorded_requested,
-            requested_action,
-            rtol=0.0,
-            atol=np.finfo(np.float32).eps,
-        ):
+        if not np.array_equal(recorded_requested, requested_action):
             raise ValueError(
                 "action_shield requested_action does not match the policy action"
             )
@@ -297,6 +292,20 @@ def run_deterministic_episode(
             if capture_error is not None:
                 raise capture_error
 
+            next_observation = None
+            if use_inference_hooks and done:
+                next_observation = info.get("terminal_observation")
+                if next_observation is None:
+                    raise ValueError(
+                        "done transition requires a non-None "
+                        "info['terminal_observation']"
+                    )
+            if done and step_index + 1 < n_steps:
+                raise RuntimeError(
+                    "evaluation episode terminated before configured horizon: "
+                    f"step {step_index + 1} of {n_steps}"
+                )
+
             has_action_shield = "action_shield" in info
             if shield_presence is None:
                 shield_presence = has_action_shield
@@ -315,14 +324,7 @@ def run_deterministic_episode(
             action_trace.append(executed_action)
 
             if use_inference_hooks:
-                if done:
-                    next_observation = info.get("terminal_observation")
-                    if next_observation is None:
-                        raise ValueError(
-                            "done transition requires a non-None "
-                            "info['terminal_observation']"
-                        )
-                else:
+                if not done:
                     next_observation = obs[0]
                 model.observe_inference_transition(
                     previous_obs[0],
@@ -331,11 +333,6 @@ def run_deterministic_episode(
                     next_observation,
                     done,
                     info,
-                )
-            if done and step_index + 1 < n_steps:
-                raise RuntimeError(
-                    "evaluation episode terminated before configured horizon: "
-                    f"step {step_index + 1} of {n_steps}"
                 )
             episode_starts = dones
 
