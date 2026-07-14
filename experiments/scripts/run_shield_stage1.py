@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -36,6 +37,7 @@ from gl_gym.environments.action_shield import (
     control_to_reference_action,
     project_first_feasible,
 )
+from gl_gym.environments.baseline import RuleBasedController
 from gl_gym.environments.models.utils import FORMAL_CVODES_OPTIONS, define_model
 from gl_gym.experiments.ode_failure import load_failure_capsule
 from gl_gym.experiments.ode_replay import build_rule_based_controller
@@ -159,6 +161,68 @@ def _validate_paths(
         ):
             raise ValueError(f"output_root must be disjoint from the {label} root")
     return manifest, output, formal
+
+
+def _capture_output_topology(
+    output: Path, capsule_directory: Path, formal: Path
+) -> dict[str, Any]:
+    parent = output.parent.absolute()
+    parent.mkdir(parents=True, exist_ok=True)
+    _reject_reparse_components(parent, include_leaf=True)
+    metadata = parent.lstat()
+    if _is_reparse(parent) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("output parent identity must be a regular directory")
+    topology = {
+        "parent": parent,
+        "resolved_parent": parent.resolve(),
+        "identity": (int(metadata.st_dev), int(metadata.st_ino)),
+        "reparse": _is_reparse(parent),
+        "output_name": output.name,
+        "capsule": capsule_directory.resolve(),
+        "formal": formal.resolve(),
+    }
+    _require_output_topology(topology)
+    return topology
+
+
+def _require_output_topology(topology: Mapping[str, Any]) -> None:
+    parent = Path(topology["parent"])
+    try:
+        _reject_reparse_components(parent, include_leaf=True)
+        metadata = parent.lstat()
+        observed_identity = (int(metadata.st_dev), int(metadata.st_ino))
+        if (
+            _is_reparse(parent) != topology["reparse"]
+            or topology["reparse"]
+            or not stat.S_ISDIR(metadata.st_mode)
+            or parent.resolve() != topology["resolved_parent"]
+            or observed_identity != topology["identity"]
+        ):
+            raise ValueError("changed")
+        capsule = Path(topology["capsule"])
+        formal = Path(topology["formal"])
+        for source in (capsule, formal):
+            _reject_reparse_components(source, include_leaf=True)
+        output = (parent / str(topology["output_name"])).resolve()
+        if output.exists() and not output.is_dir():
+            raise ValueError("output root became a file")
+        for source in (capsule.resolve(), formal.resolve()):
+            if _overlaps(output, source) or _collides_with_publication_sibling(
+                source, output
+            ):
+                raise ValueError("output overlap changed")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(
+            "output parent identity or protected topology changed"
+        ) from error
+
+
+def _output_topology_matches(topology: Mapping[str, Any]) -> bool:
+    try:
+        _require_output_topology(topology)
+    except ValueError:
+        return False
+    return True
 
 
 def _positive_int(inputs: Mapping[str, Any], name: str) -> int:
@@ -312,25 +376,15 @@ def _load_env_config(
     return hashlib.sha256(snapshot).hexdigest(), u_min, u_max, delta
 
 
-def _stat_signature(metadata: os.stat_result) -> tuple[int, int, int, int]:
-    return (
-        int(metadata.st_dev),
-        int(metadata.st_ino),
-        int(metadata.st_size),
-        int(metadata.st_mtime_ns),
-    )
-
-
 def _snapshot_rule_config(
     path: str | Path = RULE_CONFIG_PATH,
-) -> tuple[str, tuple[int, int, int, int]]:
+) -> tuple[str, dict[str, Any]]:
     unresolved = Path(path).expanduser().absolute()
     _reject_reparse_components(unresolved, include_leaf=True)
     config_path = unresolved.resolve()
     try:
         with config_path.open("rb") as stream:
             snapshot = stream.read()
-            signature = _stat_signature(os.fstat(stream.fileno()))
         loaded = yaml.safe_load(snapshot.decode("utf-8", errors="strict"))
     except (OSError, UnicodeError, yaml.YAMLError) as error:
         raise ValueError(f"invalid rule controller config: {error}") from error
@@ -342,22 +396,10 @@ def _snapshot_rule_config(
         raise ValueError(
             "rule controller config requires a nonempty TomatoEnv parameter mapping"
         )
-    return hashlib.sha256(snapshot).hexdigest(), signature
-
-
-def _require_unchanged_rule_config(
-    path: str | Path, expected_signature: tuple[int, int, int, int]
-) -> None:
-    candidate = Path(path).expanduser().absolute()
-    try:
-        _reject_reparse_components(candidate, include_leaf=True)
-        observed = _stat_signature(candidate.lstat())
-    except (OSError, ValueError) as error:
-        raise ValueError(
-            "rule controller config changed before construction"
-        ) from error
-    if observed != expected_signature:
-        raise ValueError("rule controller config changed before construction")
+    return (
+        hashlib.sha256(snapshot).hexdigest(),
+        deepcopy(dict(loaded["TomatoEnv"])),
+    )
 
 
 def _state_from_result(result: Any, nx: int) -> np.ndarray:
@@ -648,14 +690,32 @@ def _trees_equal(source: Path, target: Path) -> bool:
     return True
 
 
-def _restore(backup: Path, output: Path, primary: BaseException) -> bool:
+def _restore(
+    backup: Path,
+    output: Path,
+    primary: BaseException,
+    topology: Mapping[str, Any],
+) -> bool:
     try:
+        _require_output_topology(topology)
+    except ValueError as topology_error:
+        if hasattr(primary, "add_note"):
+            primary.add_note(
+                "backup preserved because output topology changed before restoration: "
+                f"{topology_error}"
+            )
+        return False
+    try:
+        _require_output_topology(topology)
         os.replace(backup, output)
         return True
-    except Exception as error:
+    except BaseException as error:
+        if output.exists() and not backup.exists():
+            return True
         if hasattr(primary, "add_note"):
             primary.add_note(f"atomic backup rename restoration failed: {error}")
     try:
+        _require_output_topology(topology)
         if output.exists():
             raise RuntimeError("output root exists before fallback restoration")
         shutil.copytree(backup, output, copy_function=shutil.copy2, symlinks=True)
@@ -666,7 +726,7 @@ def _restore(backup: Path, output: Path, primary: BaseException) -> bool:
             primary.add_note(
                 f"fallback copy restoration failed; sole backup preserved: {error}"
             )
-        if output.exists():
+        if output.exists() and _output_topology_matches(topology):
             shutil.rmtree(output, ignore_errors=True)
         return False
     try:
@@ -681,42 +741,50 @@ def _publish_atomic(
     report: Mapping[str, Any],
     x0: np.ndarray,
     selected_state: np.ndarray | None,
+    topology: Mapping[str, Any],
 ) -> Path:
-    output.parent.mkdir(parents=True, exist_ok=True)
+    _require_output_topology(topology)
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.stage-", dir=output.parent))
     backup = output.parent / f".{output.name}.backup-{uuid.uuid4().hex}"
-    old_moved = False
     published = False
+    replacement_intended = False
+    primary_error: BaseException | None = None
     try:
         _write_outputs(stage, report, x0, selected_state)
         _validate_stage(stage, report)
         if output.exists():
+            replacement_intended = True
+            _require_output_topology(topology)
             os.replace(output, backup)
-            old_moved = True
-        try:
-            os.replace(stage, output)
-            published = True
-        except BaseException as error:
-            if old_moved:
-                _restore(backup, output, error)
-                old_moved = False
-            raise
-        if old_moved:
+        _require_output_topology(topology)
+        os.replace(stage, output)
+        _require_output_topology(topology)
+        published = True
+        if _output_topology_matches(topology) and backup.exists():
             try:
                 shutil.rmtree(backup)
             except Exception:
                 pass
-            else:
-                old_moved = False
         return output
+    except BaseException as error:
+        primary_error = error
+        if backup.exists() and not output.exists():
+            _restore(backup, output, error, topology)
+        raise
     finally:
-        if stage.exists():
+        if _output_topology_matches(topology) and stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
-        if backup.exists() and not published and old_moved and not output.exists():
-            try:
-                os.replace(backup, output)
-            except Exception:
-                pass
+        if (
+            replacement_intended
+            and not published
+            and _output_topology_matches(topology)
+            and backup.exists()
+            and not output.exists()
+        ):
+            fallback_primary = primary_error or RuntimeError(
+                "stage-1 publication did not complete"
+            )
+            _restore(backup, output, fallback_primary, topology)
 
 
 def run_stage1(
@@ -733,13 +801,16 @@ def run_stage1(
         raise ValueError("capsule_path must resolve to manifest.json")
     _reject_reparse_components(manifest_path, include_leaf=True)
     capsule = capsule_loader(manifest_path.parent.resolve())
-    _, output, _ = _validate_paths(
+    _, output, formal = _validate_paths(
         manifest_path, capsule, output_root, formal_result_root
+    )
+    output_topology = _capture_output_topology(
+        output, Path(capsule.path).expanduser().resolve(), formal
     )
     _validate_formal_solver_provenance(capsule.manifest)
     inputs = _snapshot_inputs(capsule.failure_inputs)
     env_config_sha256, u_min, u_max, delta = _load_env_config(env_config, inputs["nu"])
-    rule_config_sha256, rule_config_signature = _snapshot_rule_config(RULE_CONFIG_PATH)
+    rule_config_sha256, rule_controller_params = _snapshot_rule_config(RULE_CONFIG_PATH)
     expected_control = _control(
         inputs["requested_action"], inputs["previous_control"], delta, u_min, u_max
     )
@@ -757,11 +828,17 @@ def run_stage1(
     executed_action = np.array(inputs["requested_action"], copy=True)
     executed_control = np.array(inputs["u"], copy=True)
     attempts: list[dict[str, Any]] = []
+    controller_source = (
+        "snapshotted_rule_config"
+        if controller_factory is build_rule_based_controller
+        else "injected_controller_factory"
+    )
 
     if reproduced:
         if controller_factory is build_rule_based_controller:
-            _require_unchanged_rule_config(RULE_CONFIG_PATH, rule_config_signature)
-        controller = controller_factory()
+            controller = RuleBasedController(**deepcopy(rule_controller_params))
+        else:
+            controller = controller_factory()
         environment = SimpleNamespace(
             nu=inputs["nu"],
             day_of_year=inputs["day_of_year"],
@@ -858,6 +935,7 @@ def run_stage1(
         "formal_solver_options": dict(FORMAL_CVODES_OPTIONS),
         "env_config_sha256": env_config_sha256,
         "rule_config_sha256": rule_config_sha256,
+        "controller_source": controller_source,
         "fixed_lambdas": list(DEFAULT_LAMBDAS),
         "delta_u_max": delta.tolist(),
         "original_outcome": original,
@@ -877,7 +955,9 @@ def run_stage1(
         "outcome": outcome,
     }
     _validate_report(report, inputs["x0"], selected_state)
-    return _publish_atomic(output, report, inputs["x0"], selected_state)
+    return _publish_atomic(
+        output, report, inputs["x0"], selected_state, output_topology
+    )
 
 
 def main() -> None:

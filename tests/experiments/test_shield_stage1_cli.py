@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -418,33 +419,59 @@ def test_config_and_rule_hashes_use_pre_execution_byte_snapshots(tmp_path, monke
     payload = json.loads((output / "stage1_results.json").read_text(encoding="utf-8"))
     assert payload["env_config_sha256"] == hashlib.sha256(env_bytes).hexdigest()
     assert payload["rule_config_sha256"] == hashlib.sha256(rule_bytes).hexdigest()
+    assert payload["controller_source"] == "injected_controller_factory"
 
 
-def test_default_controller_rejects_rule_mutation_before_construction(
+def test_default_controller_uses_exact_snapshotted_params_despite_same_metadata_mutation(
     tmp_path, monkeypatch
 ):
     capsule = _capsule(tmp_path)
     env_config = _config(tmp_path / "env.yml")
     rule_config = tmp_path / "rule_based.yml"
-    rule_config.write_text("TomatoEnv:\n  lamps_on: 0\n", encoding="utf-8")
+    original_rule = (
+        SCRIPT.parents[2] / "configs" / "agents" / "rule_based.yml"
+    ).read_bytes()
+    assert b"lamps_on: 0" in original_rule
+    rule_config.write_bytes(original_rule)
+    before = rule_config.stat()
     monkeypatch.setattr(cli, "RULE_CONFIG_PATH", rule_config)
-    real_default = cli.build_rule_based_controller
+    observed_params = []
+
+    class FrozenController:
+        def __init__(self, **params):
+            observed_params.append(params)
+
+        def predict(self, *args):
+            return np.array([0.4, 0.6])
+
+    monkeypatch.setattr(cli, "RuleBasedController", FrozenController)
+    factory_calls = 0
 
     def factory(**kwargs):
-        rule_config.write_text("TomatoEnv:\n  lamps_on: 99\n", encoding="utf-8")
-        return lambda **inputs: (_ for _ in ()).throw(RuntimeError("original"))
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls == 1:
+            mutated = original_rule.replace(b"lamps_on: 0", b"lamps_on: 9", 1)
+            assert len(mutated) == len(original_rule)
+            rule_config.write_bytes(mutated)
+            os.utime(rule_config, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return lambda **inputs: (_ for _ in ()).throw(RuntimeError("original"))
+        return lambda **inputs: {"xf": np.array([4.0, 5.0, 6.0])}
 
-    output = tmp_path / "mutated-default"
-    with pytest.raises(ValueError, match="rule controller config changed"):
-        cli.run_stage1(
-            capsule.path / "manifest.json",
-            env_config,
-            output,
-            capsule_loader=lambda _: capsule,
-            integrator_factory=factory,
-            controller_factory=real_default,
-        )
-    assert not output.exists()
+    output = tmp_path / "frozen-default"
+    cli.run_stage1(
+        capsule.path / "manifest.json",
+        env_config,
+        output,
+        capsule_loader=lambda _: capsule,
+        integrator_factory=factory,
+        controller_factory=cli.build_rule_based_controller,
+    )
+    assert len(observed_params) == 1
+    assert observed_params[0]["lamps_on"] == 0
+    payload = json.loads((output / "stage1_results.json").read_text(encoding="utf-8"))
+    assert payload["rule_config_sha256"] == hashlib.sha256(original_rule).hexdigest()
+    assert payload["controller_source"] == "snapshotted_rule_config"
 
 
 def test_injected_controller_mutation_does_not_change_snapshotted_hashes(
@@ -648,3 +675,78 @@ def test_publication_failure_restores_prior_root(tmp_path, monkeypatch):
         )
     assert (output / "old.txt").read_text(encoding="utf-8") == "old"
     assert not list(tmp_path.glob(".existing.stage-*"))
+
+
+def test_old_root_rename_then_baseexception_restores_from_filesystem(
+    tmp_path, monkeypatch
+):
+    capsule = _capsule(tmp_path)
+    config = _config(tmp_path / "env.yml")
+    output = tmp_path / "existing-interrupt"
+    output.mkdir()
+    (output / "old.txt").write_text("old", encoding="utf-8")
+    real_replace = cli.os.replace
+    interrupted = False
+
+    def rename_then_interrupt(source, destination):
+        nonlocal interrupted
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            not interrupted
+            and source_path == output
+            and ".backup-" in destination_path.name
+        ):
+            interrupted = True
+            real_replace(source, destination)
+            raise KeyboardInterrupt("after old root rename")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(cli.os, "replace", rename_then_interrupt)
+    with pytest.raises(KeyboardInterrupt, match="after old root rename"):
+        cli.run_stage1(
+            capsule.path / "manifest.json",
+            config,
+            output,
+            capsule_loader=lambda _: capsule,
+            integrator_factory=lambda **kwargs: lambda **inputs: {
+                "xf": [1.0, 2.0, 3.0]
+            },
+            controller_factory=lambda: None,
+        )
+    assert (output / "old.txt").read_text(encoding="utf-8") == "old"
+    assert not list(tmp_path.glob(".existing-interrupt.stage-*"))
+    assert not list(tmp_path.glob(".existing-interrupt.backup-*"))
+
+
+def test_output_parent_identity_swap_aborts_before_publication(tmp_path):
+    capsule = _capsule(tmp_path)
+    config = _config(tmp_path / "env.yml")
+    parent = tmp_path / "publish-parent"
+    parent.mkdir()
+    displaced = tmp_path / "publish-parent-original"
+    output = parent / "stage1"
+    swapped = False
+
+    def factory(**kwargs):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            parent.rename(displaced)
+            parent.mkdir()
+        return lambda **inputs: {"xf": np.array([4.0, 5.0, 6.0])}
+
+    with pytest.raises(ValueError, match="output parent identity"):
+        cli.run_stage1(
+            capsule.path / "manifest.json",
+            config,
+            output,
+            capsule_loader=lambda _: capsule,
+            integrator_factory=factory,
+            controller_factory=lambda: None,
+        )
+    assert not output.exists()
+    assert list(parent.iterdir()) == []
+    assert list(displaced.iterdir()) == []
+    assert capsule.path.is_dir()
+    assert not Path(capsule.manifest["context"]["formal_result_root"]).exists()
