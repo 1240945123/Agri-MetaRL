@@ -316,11 +316,125 @@ def test_gate_rejects_zero_pairs():
         evaluate_shield_gate(shielded, unshielded, KEYS)
 
 
+def test_gate_rejects_bool_and_float_seed_instead_of_pairing_by_pandas_coercion():
+    shielded, unshielded = _tables()
+    shielded["seed"] = shielded["seed"].astype(object)
+    shielded.loc[0, "seed"] = True
+    with pytest.raises((TypeError, ValueError), match="seed"):
+        evaluate_shield_gate(shielded, unshielded, KEYS)
+
+    shielded, unshielded = _tables()
+    shielded["seed"] = shielded["seed"].astype(float)
+    with pytest.raises((TypeError, ValueError), match="seed"):
+        evaluate_shield_gate(shielded, unshielded, KEYS)
+
+
+def test_gate_rejects_duplicate_or_malformed_expected_keys_before_set_collapse():
+    shielded, unshielded = _tables()
+    duplicate = [
+        (1, "a", "deterministic"),
+        (np.int64(1), np.str_("a"), np.str_("deterministic")),
+        (2, "b", "deterministic"),
+    ]
+    with pytest.raises(ValueError, match="duplicate expected"):
+        evaluate_shield_gate(shielded, unshielded, duplicate)
+    with pytest.raises(ValueError, match="length"):
+        evaluate_shield_gate(shielded, unshielded, [(1, "a"), (2, "b")])
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        (True, "a", "deterministic"),
+        (1.0, "a", "deterministic"),
+        (1, "", "deterministic"),
+        (1, "a", None),
+        (1, "a", np.nan),
+    ],
+)
+def test_gate_rejects_malformed_expected_key_scalars(bad_key):
+    shielded, unshielded = _tables()
+    expected = [bad_key, (2, "b", "deterministic")]
+    with pytest.raises((TypeError, ValueError), match="expected key"):
+        evaluate_shield_gate(shielded, unshielded, expected)
+
+
+def test_gate_rejects_empty_or_duplicate_key_columns():
+    shielded, unshielded = _tables()
+    with pytest.raises(ValueError, match="nonempty"):
+        evaluate_shield_gate(shielded, unshielded, [(1,)], key_columns=("",))
+    with pytest.raises(ValueError, match="unique"):
+        evaluate_shield_gate(
+            shielded,
+            unshielded,
+            [(1, 1), (2, 2)],
+            key_columns=("seed", "seed"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("task_id", ""),
+        ("inference_mode", None),
+        ("task_id", np.nan),
+        ("inference_mode", 1),
+    ],
+)
+def test_gate_rejects_null_empty_or_unsupported_string_key_scalars(column, value):
+    shielded, unshielded = _tables()
+    shielded.loc[0, column] = value
+    with pytest.raises((TypeError, ValueError), match=column):
+        evaluate_shield_gate(shielded, unshielded, KEYS)
+
+
+def test_gate_canonicalizes_numpy_key_scalars_for_pairing_and_output():
+    shielded, unshielded = _tables()
+    shielded["seed"] = shielded["seed"].map(np.int64)
+    unshielded["seed"] = unshielded["seed"].map(np.int64)
+    shielded["task_id"] = shielded["task_id"].map(np.str_)
+    unshielded["task_id"] = unshielded["task_id"].map(np.str_)
+    paired = build_paired_shield_deltas(shielded, unshielded, KEYS)
+    assert all(type(value) is int for value in paired["seed"])
+    assert all(type(value) is str for value in paired["task_id"])
+
+
 def test_gate_rejects_overflowing_derived_evidence():
     shielded, unshielded = _tables()
     shielded["temp_violation"] = np.finfo(float).max
     unshielded["temp_violation"] = 0.0
     with pytest.raises(ValueError, match="finite"):
+        evaluate_shield_gate(shielded, unshielded, KEYS)
+
+
+def test_gate_uses_stable_finite_means_when_naive_numpy_mean_overflows():
+    shielded, unshielded = _tables()
+    huge = np.finfo(float).max / 2
+    shielded["episode_return"] = huge
+    unshielded["episode_return"] = 0.0
+    for metric in ("temp_violation", "co2_violation", "rh_violation"):
+        shielded[metric] = huge
+        unshielded[metric] = 1.0
+
+    result = evaluate_shield_gate(shielded, unshielded, KEYS)
+    assert np.isfinite(result["evidence"]["mean_paired_return_delta"])
+    assert np.isfinite(result["evidence"]["paired_violation_ratio_mean"])
+    assert result["evidence"]["paired_violation_ratio_mean"] == pytest.approx(huge)
+    json.dumps(result, allow_nan=False)
+
+
+def test_gate_stably_averages_extreme_unshielded_returns_and_rejects_delta_overflow():
+    shielded, unshielded = _tables()
+    huge = np.finfo(float).max
+    shielded["episode_return"] = huge
+    unshielded["episode_return"] = huge
+    result = evaluate_shield_gate(shielded, unshielded, KEYS)
+    assert result["evidence"]["relative_return_loss"] == 0.0
+    json.dumps(result, allow_nan=False)
+
+    shielded["episode_return"] = huge
+    unshielded["episode_return"] = -huge
+    with pytest.raises(ValueError, match="delta.*finite|finite.*delta"):
         evaluate_shield_gate(shielded, unshielded, KEYS)
 
 
@@ -482,3 +596,21 @@ def test_atomic_writer_rejects_empty_nonfinite_duplicates_and_file_root(tmp_path
     file_root.write_text("x", encoding="utf-8")
     with pytest.raises(ValueError, match="file"):
         write_shield_artifacts_atomic(*_artifact_frames(), {}, {}, file_root)
+
+
+@pytest.mark.parametrize("bad", [pd.NaT, np.datetime64("NaT"), pd.NA, [1], {"a": 1}, object()])
+def test_atomic_writer_rejects_missing_or_nonscalar_nonnullable_cells(tmp_path, bad):
+    raw, paired, interventions = _artifact_frames()
+    raw["bad"] = pd.Series([bad], dtype=object)
+    with pytest.raises((TypeError, ValueError), match="raw.bad"):
+        write_shield_artifacts_atomic(raw, paired, interventions, {}, {}, tmp_path / "bad")
+
+
+def test_atomic_writer_normalizes_all_nullable_missing_representations(tmp_path):
+    for index, missing in enumerate((None, np.nan, pd.NA, pd.NaT, np.datetime64("NaT"))):
+        raw, paired, interventions = _artifact_frames()
+        interventions["first_intervention_step"] = pd.Series([missing], dtype=object)
+        root = tmp_path / f"nullable-{index}"
+        paths = write_shield_artifacts_atomic(raw, paired, interventions, {}, {}, root)
+        written = pd.read_csv(paths["interventions"])
+        assert pd.isna(written.loc[0, "first_intervention_step"])

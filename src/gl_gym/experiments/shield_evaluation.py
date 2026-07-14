@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import tempfile
 import uuid
 from collections.abc import Mapping, Sequence
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,18 @@ def _finite_float(value: Any, *, name: str, minimum: float | None = None) -> flo
     if minimum is not None and result < minimum:
         raise ValueError(f"{name} must be at least {minimum}")
     return result
+
+
+def _stable_finite_mean(values: Any, *, name: str) -> float:
+    finite_values = [_finite_float(value, name=name) for value in values]
+    if not finite_values:
+        raise ValueError(f"{name} requires at least one value")
+    count = len(finite_values)
+    try:
+        result = math.fsum(value / count for value in finite_values)
+    except OverflowError as exc:
+        raise ValueError(f"{name} mean must remain finite") from exc
+    return _finite_float(result, name=f"{name} mean")
 
 
 def _vector(value: Any, *, name: str, action_dim: int) -> np.ndarray:
@@ -248,7 +262,9 @@ def aggregate_episode_interventions(
     def summary(values: list[float], operation: str) -> float:
         if not values:
             return 0.0
-        return float(np.mean(values) if operation == "mean" else np.max(values))
+        if operation == "mean":
+            return _stable_finite_mean(values, name="episode intervention evidence")
+        return _finite_float(max(values), name="episode intervention evidence maximum")
 
     result: dict[str, Any] = {
         "total_steps": len(records),
@@ -272,28 +288,35 @@ def aggregate_episode_interventions(
     return result
 
 
-def _expected_key_set(expected_keys: Any, key_columns: tuple[str, ...]) -> set[tuple[Any, ...]]:
+def _canonical_key_scalar(value: Any, *, column: str, source: str) -> int | str:
+    if column == "seed":
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+            raise ValueError(f"{source} {column} must be an integral non-boolean scalar")
+        return int(value)
+    if not isinstance(value, (str, np.str_)):
+        raise ValueError(f"{source} {column} must be a nonempty string scalar")
+    canonical = str(value)
+    if not canonical:
+        raise ValueError(f"{source} {column} must be a nonempty string scalar")
+    return canonical
+
+
+def _expected_key_set(expected_keys: Any, key_columns: tuple[str, ...]) -> set[tuple[int | str, ...]]:
     try:
         raw_keys = list(expected_keys)
     except TypeError as exc:
         raise TypeError("expected_keys must be iterable") from exc
-    result: set[tuple[Any, ...]] = set()
+    result: set[tuple[int | str, ...]] = set()
     for item in raw_keys:
-        if isinstance(item, Mapping):
-            try:
-                key = tuple(item[column] for column in key_columns)
-            except KeyError as exc:
-                raise ValueError(f"expected key is missing {exc.args[0]}") from exc
-        elif len(key_columns) == 1 and not isinstance(item, (tuple, list)):
-            key = (item,)
-        elif isinstance(item, (tuple, list)) and len(item) == len(key_columns):
-            key = tuple(item)
-        else:
-            raise ValueError("each expected key must match key_columns")
-        try:
-            result.add(key)
-        except TypeError as exc:
-            raise ValueError("expected key values must be hashable") from exc
+        if not isinstance(item, tuple) or len(item) != len(key_columns):
+            raise ValueError("each expected key tuple must have exact key_columns length")
+        key = tuple(
+            _canonical_key_scalar(value, column=column, source="expected key")
+            for column, value in zip(key_columns, item, strict=True)
+        )
+        if key in result:
+            raise ValueError(f"duplicate expected key after canonicalization: {key!r}")
+        result.add(key)
     if not result:
         raise ValueError("expected_keys must be nonempty")
     return result
@@ -303,7 +326,7 @@ def _validate_gate_table(
     table: pd.DataFrame,
     *,
     label: str,
-    expected: set[tuple[Any, ...]],
+    expected: set[tuple[int | str, ...]],
     key_columns: tuple[str, ...],
 ) -> pd.DataFrame:
     if not isinstance(table, pd.DataFrame):
@@ -314,14 +337,21 @@ def _validate_gate_table(
     missing = [column for column in required if column not in table.columns]
     if missing:
         raise ValueError(f"{label} is missing required columns: {missing}")
-    if table.duplicated(subset=list(key_columns), keep=False).any():
-        raise ValueError(f"{label} contains duplicate keys")
-    actual = set(table.loc[:, list(key_columns)].itertuples(index=False, name=None))
+    validated = table.copy(deep=True)
+    for column in key_columns:
+        canonical_values = [
+            _canonical_key_scalar(value, column=column, source=label)
+            for value in table[column].array
+        ]
+        validated[column] = pd.Series(canonical_values, index=validated.index, dtype=object)
+    if validated.duplicated(subset=list(key_columns), keep=False).any():
+        raise ValueError(f"{label} contains duplicate keys after canonicalization")
+    actual = set(validated.loc[:, list(key_columns)].itertuples(index=False, name=None))
     if actual != expected:
         raise ValueError(f"{label} keys do not exactly match expected_keys")
 
     completed_values: list[bool] = []
-    for row_index, row in table.iterrows():
+    for row_index, row in validated.iterrows():
         completed = row["completed"]
         if not isinstance(completed, (bool, np.bool_)):
             raise TypeError(f"{label} completed must contain only booleans")
@@ -339,7 +369,6 @@ def _validate_gate_table(
             count = _strict_int(row["intervention_count"], name="shielded intervention_count", minimum=0)
             if count > total_steps:
                 raise ValueError("shielded intervention_count cannot exceed total_steps")
-    validated = table.copy(deep=True)
     validated["completed"] = completed_values
     return validated
 
@@ -350,7 +379,7 @@ def _paired_validated(
     expected_keys: Any,
     key_columns: tuple[str, ...],
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if not isinstance(key_columns, tuple) or not key_columns or any(not isinstance(c, str) or not c for c in key_columns):
+    if not isinstance(key_columns, tuple) or not key_columns or any(type(c) is not str or not c for c in key_columns):
         raise ValueError("key_columns must be a nonempty tuple of column names")
     if len(set(key_columns)) != len(key_columns):
         raise ValueError("key_columns must be unique")
@@ -379,7 +408,8 @@ def build_paired_shield_deltas(
         base_values = paired[f"{metric}_unshielded"].astype(float)
         output[f"{metric}_shielded"] = shield_values.to_numpy(copy=True)
         output[f"{metric}_unshielded"] = base_values.to_numpy(copy=True)
-        delta = shield_values - base_values
+        with np.errstate(over="ignore", invalid="ignore"):
+            delta = shield_values - base_values
         if not np.all(np.isfinite(delta)):
             raise ValueError(f"derived {metric} deltas must remain finite")
         output[f"{metric}_delta"] = delta.to_numpy(copy=True)
@@ -408,14 +438,23 @@ def evaluate_shield_gate(
     unshield_completion_count = int(unshield["completed"].sum())
     total_steps = int(sum(int(value) for value in shield["total_steps"]))
     intervention_count = int(sum(int(value) for value in shield["intervention_count"]))
-    intervention_rate = float(intervention_count / total_steps)
+    intervention_rate = _finite_float(intervention_count / total_steps, name="intervention_rate")
 
-    delta = paired["episode_return_shielded"].astype(float) - paired["episode_return_unshielded"].astype(float)
+    with np.errstate(over="ignore", invalid="ignore"):
+        delta = paired["episode_return_shielded"].astype(float) - paired["episode_return_unshielded"].astype(float)
     if not np.all(np.isfinite(delta)):
         raise ValueError("derived episode return deltas must remain finite")
-    denominator = float(paired["episode_return_unshielded"].astype(float).abs().mean()) + EPSILON
-    mean_return_delta = float(delta.mean())
-    relative_return_loss = float(max(0.0, -mean_return_delta / denominator))
+    denominator = _stable_finite_mean(
+        paired["episode_return_unshielded"].astype(float).abs(),
+        name="absolute unshielded return",
+    ) + EPSILON
+    denominator = _finite_float(denominator, name="return loss denominator", minimum=EPSILON)
+    mean_return_delta = _stable_finite_mean(delta, name="paired return delta")
+    relative_return_loss = _finite_float(
+        max(0.0, -mean_return_delta / denominator),
+        name="relative_return_loss",
+        minimum=0.0,
+    )
     ratio_means: dict[str, float] = {}
     for metric in VIOLATION_METRICS:
         shield_values = paired[f"{metric}_shielded"].astype(float)
@@ -425,8 +464,10 @@ def evaluate_shield_gate(
         ratio = ratio.mask((shield_values == 0.0) & (base_values == 0.0), 1.0)
         if not np.all(np.isfinite(ratio)):
             raise ValueError(f"derived {metric} ratios must remain finite")
-        ratio_means[metric] = float(ratio.mean())
-    paired_violation_ratio_mean = float(np.mean(list(ratio_means.values())))
+        ratio_means[metric] = _stable_finite_mean(ratio, name=f"{metric} ratio")
+    paired_violation_ratio_mean = _stable_finite_mean(
+        ratio_means.values(), name="paired violation ratio"
+    )
 
     conditions = {
         "zero_ode_failures": shield_failures == 0 and shield_completion_count == len(shield),
@@ -471,27 +512,73 @@ def evaluate_shield_gate(
     }
 
 
-def _check_frame(frame: pd.DataFrame, *, name: str, duplicate_check: bool) -> None:
+def _is_supported_csv_scalar(value: Any) -> bool:
+    return isinstance(
+        value,
+        (
+            str,
+            bool,
+            int,
+            float,
+            np.bool_,
+            np.integer,
+            np.floating,
+            date,
+            datetime,
+            time,
+            timedelta,
+            pd.Timestamp,
+            pd.Timedelta,
+            np.datetime64,
+            np.timedelta64,
+        ),
+    )
+
+
+def _scalar_is_missing(value: Any) -> bool:
+    if value is None or value is pd.NA or value is pd.NaT:
+        return True
+    missing = pd.isna(value)
+    if not isinstance(missing, (bool, np.bool_)):
+        raise TypeError("cell missingness must be scalar")
+    return bool(missing)
+
+
+def _check_frame(frame: pd.DataFrame, *, name: str, duplicate_check: bool) -> pd.DataFrame:
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         raise ValueError(f"{name} must be a nonempty DataFrame")
-    if duplicate_check:
-        available = [column for column in ("seed", "task_id", "inference_mode") if column in frame.columns]
-        if available and frame.duplicated(subset=available, keep=False).any():
-            raise ValueError(f"{name} contains duplicate keys")
     nullable = {column for column in frame.columns if column == "first_intervention_step" or column.endswith("_first_intervention_step")}
+    validated = frame.copy(deep=True)
     for column in frame.columns:
+        normalized: list[Any] = []
         for value in frame[column].array:
-            if value is None or value is pd.NA:
+            qualified_name = f"{name}.{column}"
+            try:
+                missing = _scalar_is_missing(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{qualified_name} must contain only scalar cells") from exc
+            if missing:
                 if column in nullable:
+                    normalized.append(None)
                     continue
-                raise ValueError(f"{name}.{column} must contain finite values")
-            if isinstance(value, (float, np.floating)):
-                if np.isnan(value) and column in nullable:
-                    continue
+                raise ValueError(f"{qualified_name} must contain finite nonmissing values")
+            if not _is_supported_csv_scalar(value):
+                raise ValueError(f"{qualified_name} must contain only supported scalar cells")
+            if isinstance(value, (float, np.floating, int, np.integer)) and not isinstance(
+                value, (bool, np.bool_)
+            ):
                 if not np.isfinite(value):
-                    raise ValueError(f"{name}.{column} must contain finite values")
+                    raise ValueError(f"{qualified_name} must contain finite values")
             elif isinstance(value, (complex, np.complexfloating)):
-                raise ValueError(f"{name}.{column} must contain finite real values")
+                raise ValueError(f"{qualified_name} must contain finite real values")
+            normalized.append(value.item() if isinstance(value, np.generic) else value)
+        if column in nullable:
+            validated[column] = pd.Series(normalized, index=validated.index, dtype=object)
+    if duplicate_check:
+        available = [column for column in ("seed", "task_id", "inference_mode") if column in validated.columns]
+        if available and validated.duplicated(subset=available, keep=False).any():
+            raise ValueError(f"{name} contains duplicate keys")
+    return validated
 
 
 def _json_safe(value: Any) -> Any:
@@ -607,9 +694,9 @@ def write_shield_artifacts_atomic(
 ) -> dict[str, Path]:
     """Publish the five shield artifacts as an atomic directory replacement."""
 
-    _check_frame(raw, name="raw", duplicate_check=True)
-    _check_frame(paired, name="paired", duplicate_check=False)
-    _check_frame(interventions, name="interventions", duplicate_check=True)
+    raw = _check_frame(raw, name="raw", duplicate_check=True)
+    paired = _check_frame(paired, name="paired", duplicate_check=False)
+    interventions = _check_frame(interventions, name="interventions", duplicate_check=True)
     if not isinstance(manifest, Mapping) or not isinstance(decision, Mapping):
         raise TypeError("manifest and decision must be mappings")
     safe_manifest = _json_safe(manifest)
