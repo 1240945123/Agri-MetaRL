@@ -386,6 +386,17 @@ def _recover_publication(root: Path) -> None:
     if marker.is_file():
         state = str(_strict_json(marker).get("state"))
     if not backup.exists():
+        if state in {
+            "candidate_pending", "candidate_installed", "consumer_verified"
+        }:
+            stage = root.parent / f".{root.name}.publish"
+            if root.exists():
+                shutil.rmtree(root)
+            if stage.exists():
+                shutil.rmtree(stage)
+            _transaction_temporary_path(root).unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+            return
         if root.exists():
             marker.unlink(missing_ok=True)
             return
@@ -406,7 +417,7 @@ def _recover_publication(root: Path) -> None:
         else:
             _restore_backup(root, backup)
         return
-    if state in {"candidate_pending", "candidate_installed"}:
+    if state in {"candidate_pending", "candidate_installed", "consumer_verified"}:
         _restore_backup(root, backup)
         return
     if state == "restored_copy":
@@ -555,6 +566,7 @@ def _publish_comparator(
                 _key(row) for row in published_rows
             }:
                 raise ValueError("published comparator consumer round-trip changed exact keys")
+            _write_transaction(root, "consumer_verified")
         except BaseException:
             if had_old and backup.exists():
                 _restore_backup(root, backup)
@@ -562,6 +574,8 @@ def _publish_comparator(
                 shutil.rmtree(root)
                 _transaction_path(root).unlink(missing_ok=True)
             raise
+        if stage.exists():
+            shutil.rmtree(stage)
         if backup.exists():
             shutil.rmtree(backup)
         _transaction_path(root).unlink(missing_ok=True)

@@ -272,7 +272,100 @@ def test_publish_rename_failure_uses_copy_fallback(tmp_path, monkeypatch):
     frame = cli.run_unshielded_comparator(**kwargs)
     assert len(frame) == 32
     assert (Path(kwargs["result_root"]) / "eval_raw.csv").is_file()
+    root = Path(kwargs["result_root"])
+    assert not (root.parent / f".{root.name}.publish").exists()
     monkeypatch.setattr(Path, "rename", original)
+
+
+@pytest.mark.parametrize("state", ["candidate_pending", "candidate_installed"])
+def test_startup_discards_unverified_candidate_before_episode(tmp_path, state):
+    kwargs, _, _ = _inputs(tmp_path)
+    root = Path(kwargs["result_root"])
+    root.mkdir()
+    (root / "unverified").write_text("candidate", encoding="utf-8")
+    cli._write_transaction(root, state)
+    observed = []
+    def fail_after_recovery(*args, **inner):
+        observed.append(root.exists())
+        raise RuntimeError("episode reached after recovery")
+    kwargs["episode_runner"] = fail_after_recovery
+    with pytest.raises(RuntimeError, match="episode reached after recovery"):
+        cli.run_unshielded_comparator(**kwargs)
+    assert observed == [False]
+    assert not root.exists()
+    assert not cli._transaction_path(root).exists()
+
+
+def test_first_publish_partial_copy_is_removed_before_retry_episode(
+    tmp_path, monkeypatch
+):
+    kwargs, _, _ = _inputs(tmp_path)
+    root = Path(kwargs["result_root"])
+    real_rename = Path.rename
+    real_copytree = cli.shutil.copytree
+    real_rmtree = cli.shutil.rmtree
+    monkeypatch.setattr(
+        Path, "rename", lambda self, target: (_ for _ in ()).throw(OSError("rename"))
+    )
+    def partial_copy(source, destination, *args, **inner):
+        Path(destination).mkdir(parents=True)
+        (Path(destination) / "partial").write_text("candidate", encoding="utf-8")
+        raise OSError("candidate copy interrupted")
+    def interrupted_cleanup(path, *args, **inner):
+        if Path(path).resolve() == root.resolve():
+            raise KeyboardInterrupt()
+        return real_rmtree(path, *args, **inner)
+    monkeypatch.setattr(cli.shutil, "copytree", partial_copy)
+    monkeypatch.setattr(cli.shutil, "rmtree", interrupted_cleanup)
+    with pytest.raises(KeyboardInterrupt):
+        cli.run_unshielded_comparator(**kwargs)
+    assert (root / "partial").is_file()
+
+    monkeypatch.setattr(Path, "rename", real_rename)
+    monkeypatch.setattr(cli.shutil, "copytree", real_copytree)
+    monkeypatch.setattr(cli.shutil, "rmtree", real_rmtree)
+    observed = []
+    def fail_after_recovery(*args, **inner):
+        observed.append(root.exists())
+        raise RuntimeError("retry after partial candidate")
+    kwargs["episode_runner"] = fail_after_recovery
+    with pytest.raises(RuntimeError, match="retry after partial candidate"):
+        cli.run_unshielded_comparator(**kwargs)
+    assert observed == [False]
+    assert not root.exists()
+
+
+def test_verified_copy_with_interrupted_stage_cleanup_is_rejected_on_restart(
+    tmp_path, monkeypatch
+):
+    kwargs, _, _ = _inputs(tmp_path)
+    root = Path(kwargs["result_root"])
+    stage = root.parent / f".{root.name}.publish"
+    real_rename = Path.rename
+    real_rmtree = cli.shutil.rmtree
+    monkeypatch.setattr(
+        Path, "rename", lambda self, target: (_ for _ in ()).throw(OSError("rename"))
+    )
+    def interrupted_cleanup(path, *args, **inner):
+        if Path(path).resolve() == stage.resolve():
+            raise KeyboardInterrupt()
+        return real_rmtree(path, *args, **inner)
+    monkeypatch.setattr(cli.shutil, "rmtree", interrupted_cleanup)
+    with pytest.raises(KeyboardInterrupt):
+        cli.run_unshielded_comparator(**kwargs)
+    assert root.exists() and stage.exists()
+
+    monkeypatch.setattr(Path, "rename", real_rename)
+    monkeypatch.setattr(cli.shutil, "rmtree", real_rmtree)
+    observed = []
+    def fail_after_recovery(*args, **inner):
+        observed.append(root.exists())
+        raise RuntimeError("rerun untrusted candidate")
+    kwargs["episode_runner"] = fail_after_recovery
+    with pytest.raises(RuntimeError, match="rerun untrusted candidate"):
+        cli.run_unshielded_comparator(**kwargs)
+    assert observed == [False]
+    assert not root.exists() and not stage.exists()
 
 
 def test_publish_copy_fallback_failure_restores_unique_old_root(tmp_path, monkeypatch):
