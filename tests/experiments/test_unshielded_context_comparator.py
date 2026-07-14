@@ -417,6 +417,55 @@ def test_tampered_verified_commit_is_never_accepted(tmp_path):
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "tamper", ["trace", "csv", "capsule", "extra", "manifest"]
+)
+def test_copy_fallback_tampering_never_reaches_verified_commit(
+    tmp_path, monkeypatch, tamper
+):
+    failure_modes = (
+        {(42, cli.DIAGNOSTIC_TASK_IDS[0], cli.MODES[0])}
+        if tamper == "capsule"
+        else set()
+    )
+    kwargs, _, _ = _inputs(tmp_path, failure_modes=failure_modes)
+    root = Path(kwargs["result_root"]).resolve()
+    real_copytree = cli.shutil.copytree
+    monkeypatch.setattr(
+        Path, "rename", lambda self, target: (_ for _ in ()).throw(OSError("rename"))
+    )
+    def corrupting_copy(source, destination, *args, **inner):
+        result = real_copytree(source, destination, *args, **inner)
+        installed = Path(destination).resolve()
+        if installed != root:
+            return result
+        if tamper == "trace":
+            next((installed / "traces").glob("*.npy")).write_bytes(b"corrupt trace")
+        elif tamper == "csv":
+            with (installed / "eval_raw.csv").open("ab") as stream:
+                stream.write(b"\ncorrupt,csv")
+        elif tamper == "capsule":
+            next((installed / "failures").rglob("manifest.json")).write_bytes(
+                b"corrupt capsule"
+            )
+        elif tamper == "extra":
+            (installed / "unexpected.bin").write_bytes(b"extra")
+        else:
+            manifest_path = installed / "context_ab_manifest.json"
+            manifest = cli._strict_json(manifest_path)
+            manifest["forged_after_copy"] = True
+            manifest_path.write_text(
+                cli.json.dumps(manifest, sort_keys=True), encoding="utf-8"
+            )
+        return result
+    monkeypatch.setattr(cli.shutil, "copytree", corrupting_copy)
+
+    with pytest.raises(ValueError):
+        cli.run_unshielded_comparator(**kwargs)
+    assert not root.exists()
+    assert not cli._transaction_path(root).exists()
+
+
 def test_publish_copy_fallback_failure_restores_unique_old_root(tmp_path, monkeypatch):
     kwargs, _, _ = _inputs(tmp_path)
     cli.run_unshielded_comparator(**kwargs)

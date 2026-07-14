@@ -394,6 +394,94 @@ def _verified_transaction_matches(
         return False
 
 
+def _installed_path(root: Path, value: Any, *, name: str) -> Path:
+    path = Path(str(value))
+    if not path.is_absolute():
+        path = root / path
+    resolved = path.resolve()
+    if root.resolve() not in resolved.parents:
+        raise ValueError(f"installed comparator {name} escapes final result root")
+    return resolved
+
+
+def _validate_installed_integrity(
+    root: Path,
+    table: pd.DataFrame,
+    manifest: Mapping[str, Any],
+    capsule_evidence: list[Mapping[str, Any]],
+    *,
+    expected_manifest: Mapping[str, Any],
+) -> None:
+    """Bind the installed bytes, CSV identities, traces, and capsules together."""
+
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if dict(manifest) != dict(expected_manifest):
+        raise ValueError("installed comparator manifest differs from staged provenance")
+    actual_files: dict[str, Path] = {}
+    for path in root.rglob("*"):
+        metadata = path.lstat()
+        if path.is_symlink() or getattr(metadata, "st_file_attributes", 0) & reparse_flag:
+            raise ValueError("installed comparator integrity rejects symlink/reparse entries")
+        if stat.S_ISREG(metadata.st_mode):
+            actual_files[path.relative_to(root).as_posix()] = path
+        elif not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("installed comparator contains a non-regular filesystem entry")
+    manifest_name = "context_ab_manifest.json"
+    hashes = manifest.get("published_file_sha256")
+    if not isinstance(hashes, Mapping) or not all(
+        isinstance(name, str) and isinstance(digest, str)
+        for name, digest in hashes.items()
+    ):
+        raise ValueError("published file integrity hashes are missing or malformed")
+    expected_names = set(hashes)
+    actual_names = set(actual_files).difference({manifest_name})
+    if expected_names != actual_names:
+        raise ValueError("published file integrity set has missing or extra files")
+    for relative, digest in hashes.items():
+        relative_path = Path(relative)
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or relative_path.as_posix() != relative
+            or len(digest) != 64
+        ):
+            raise ValueError("published file integrity path/hash is noncanonical")
+        installed = _installed_path(root, relative_path, name="published file")
+        if installed != actual_files[relative] or sha256_file(installed) != digest:
+            raise ValueError(f"published file hash mismatch: {relative}")
+
+    identities = manifest.get("row_identities")
+    if not isinstance(identities, list) or "row_identity_sha256" not in table:
+        raise ValueError("installed comparator row identities are missing")
+    csv_identities = table["row_identity_sha256"].astype(str).tolist()
+    if identities != csv_identities:
+        raise ValueError("manifest row identity order does not match eval_raw.csv")
+    capsule_by_manifest = {
+        Path(item["manifest_path"]).resolve(): item for item in capsule_evidence
+    }
+    for _, series in table.iterrows():
+        row = series.to_dict()
+        if str(row["row_identity_sha256"]) != _row_identity(row):
+            raise ValueError("installed comparator row identity does not match CSV bytes")
+        if bool(row["completed"]):
+            trace = _installed_path(
+                root, row["action_trace_path"], name="completed action trace"
+            )
+            if trace.name == "manifest.json" or sha256_file(trace) != str(
+                row["action_trace_sha256"]
+            ):
+                raise ValueError("completed action trace hash mismatch")
+            continue
+        evidence_path = _installed_path(
+            root, row["failure_evidence_path"], name="failure capsule manifest"
+        )
+        evidence = capsule_by_manifest.get(evidence_path)
+        if evidence is None or str(evidence.get("capsule_identity_sha256")) != str(
+            row["failure_capsule_identity_sha256"]
+        ):
+            raise ValueError("failure capsule identity/path integrity mismatch")
+
+
 def _restore_backup(root: Path, backup: Path) -> None:
     if root.exists():
         shutil.rmtree(root)
@@ -604,7 +692,7 @@ def _publish_comparator(
             _relocate_tree(stage, root)
             _write_transaction(root, "candidate_installed")
             expected_checkpoints = {int(run["seed"]): run for run in runs}
-            loaded, _, _ = _load_published_comparator(
+            loaded, loaded_manifest, loaded_capsules = _load_published_comparator(
                 root,
                 expected_provenance=dict(provenance),
                 expected_checkpoints=expected_checkpoints,
@@ -614,6 +702,13 @@ def _publish_comparator(
                 _key(row) for row in published_rows
             }:
                 raise ValueError("published comparator consumer round-trip changed exact keys")
+            _validate_installed_integrity(
+                root,
+                loaded,
+                loaded_manifest,
+                loaded_capsules,
+                expected_manifest=manifest,
+            )
             _write_transaction(
                 root,
                 "consumer_verified",
