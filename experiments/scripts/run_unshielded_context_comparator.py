@@ -132,15 +132,33 @@ def validate_output_roots(
     ).resolve()
     result_work = _work_root(result).resolve()
     failure_work = _failure_work_root(failure, result).resolve()
+    stage = (result.parent / f".{result.name}.publish").resolve()
+    backup = (result.parent / f".{result.name}.backup").resolve()
+    transaction = _transaction_path(result).resolve()
+    transaction_temporary = _transaction_temporary_path(result).resolve()
     protected = (formal, original)
-    owned = (result, result_work, failure, failure_work)
+    owned = (
+        result, result_work, failure, failure_work, stage, backup,
+        transaction, transaction_temporary,
+    )
     if any(_overlaps(item, source) for item in owned for source in protected):
         raise ValueError(
             "comparator result and failure roots must be disjoint from formal and "
             "original diagnostic roots"
         )
-    if _overlaps(result, failure) or _overlaps(result_work, failure) or _overlaps(
-        result, failure_work
+    independent = (
+        result, result_work, failure, stage, backup,
+        transaction, transaction_temporary,
+    )
+    if any(
+        _overlaps(first, second)
+        for index, first in enumerate(independent)
+        for second in independent[index + 1 :]
+    ) or any(
+        _overlaps(failure_work, item)
+        for item in (
+            result, result_work, stage, backup, transaction, transaction_temporary
+        )
     ):
         raise ValueError("comparator result and failure roots must be disjoint")
     return result, failure
@@ -304,14 +322,14 @@ def _strict_json(path: str | Path) -> dict[str, Any]:
     return value
 
 
-def _relocate_tree(source: Path, destination: Path) -> None:
+def _relocate_tree(source: Path, destination: Path) -> bool:
     """Move a complete tree, using a recoverable copy when rename is unavailable."""
 
     if destination.exists():
         raise FileExistsError(f"tree destination already exists: {destination}")
     try:
         source.rename(destination)
-        return
+        return True
     except OSError:
         pass
     try:
@@ -320,7 +338,82 @@ def _relocate_tree(source: Path, destination: Path) -> None:
         if destination.exists():
             shutil.rmtree(destination)
         raise
-    shutil.rmtree(source)
+    return False
+
+
+def _transaction_path(root: Path) -> Path:
+    return root.parent / f".{root.name}.transaction.json"
+
+
+def _transaction_temporary_path(root: Path) -> Path:
+    return _transaction_path(root).with_suffix(".tmp")
+
+
+def _write_transaction(root: Path, state: str) -> None:
+    marker = _transaction_path(root)
+    temporary = _transaction_temporary_path(root)
+    temporary.write_text(
+        json.dumps({"state": state, "result_root": str(root.resolve())}),
+        encoding="utf-8",
+    )
+    temporary.replace(marker)
+
+
+def _tree_file_hashes(root: Path) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): sha256_file(path)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def _restore_backup(root: Path, backup: Path) -> None:
+    if root.exists():
+        shutil.rmtree(root)
+    renamed = _relocate_tree(backup, root)
+    if not renamed:
+        _write_transaction(root, "restored_copy")
+        shutil.rmtree(backup)
+    _transaction_path(root).unlink(missing_ok=True)
+
+
+def _recover_publication(root: Path) -> None:
+    """Resolve an interrupted publication before any experiment can execute."""
+
+    backup = root.parent / f".{root.name}.backup"
+    marker = _transaction_path(root)
+    state: str | None = None
+    if marker.is_file():
+        state = str(_strict_json(marker).get("state"))
+    if not backup.exists():
+        if root.exists():
+            marker.unlink(missing_ok=True)
+            return
+        if state is not None:
+            raise RuntimeError("publication transaction lost both final root and backup")
+        return
+    if not root.exists():
+        _restore_backup(root, backup)
+        return
+    if state == "backup_pending":
+        shutil.rmtree(backup)
+        marker.unlink(missing_ok=True)
+        return
+    if state == "backup_ready":
+        if _tree_file_hashes(root) == _tree_file_hashes(backup):
+            shutil.rmtree(backup)
+            marker.unlink(missing_ok=True)
+        else:
+            _restore_backup(root, backup)
+        return
+    if state in {"candidate_pending", "candidate_installed"}:
+        _restore_backup(root, backup)
+        return
+    if state == "restored_copy":
+        shutil.rmtree(backup)
+        marker.unlink(missing_ok=True)
+        return
+    raise RuntimeError("ambiguous comparator backup recovery state")
 
 
 def _published_row(
@@ -387,10 +480,7 @@ def _publish_comparator(
         raise RuntimeError("only the exact 32-key comparator may be published")
     stage = root.parent / f".{root.name}.publish"
     backup = root.parent / f".{root.name}.backup"
-    if backup.exists() and not root.exists():
-        _relocate_tree(backup, root)
-    if backup.exists():
-        raise RuntimeError("ambiguous comparator backup recovery state")
+    _recover_publication(root)
     if stage.exists():
         shutil.rmtree(stage)
     stage.mkdir(parents=True)
@@ -445,9 +535,15 @@ def _publish_comparator(
 
         had_old = root.exists()
         if had_old:
-            _relocate_tree(root, backup)
+            _write_transaction(root, "backup_pending")
+            renamed = _relocate_tree(root, backup)
+            _write_transaction(root, "backup_ready")
+            if not renamed:
+                shutil.rmtree(root)
         try:
+            _write_transaction(root, "candidate_pending")
             _relocate_tree(stage, root)
+            _write_transaction(root, "candidate_installed")
             expected_checkpoints = {int(run["seed"]): run for run in runs}
             loaded, _, _ = _load_published_comparator(
                 root,
@@ -460,13 +556,15 @@ def _publish_comparator(
             }:
                 raise ValueError("published comparator consumer round-trip changed exact keys")
         except BaseException:
-            if root.exists():
-                shutil.rmtree(root)
             if had_old and backup.exists():
-                _relocate_tree(backup, root)
+                _restore_backup(root, backup)
+            elif root.exists():
+                shutil.rmtree(root)
+                _transaction_path(root).unlink(missing_ok=True)
             raise
         if backup.exists():
             shutil.rmtree(backup)
+        _transaction_path(root).unlink(missing_ok=True)
         return table
     except BaseException:
         if stage.exists():
@@ -804,9 +902,12 @@ def run_unshielded_comparator(
         failure_work.resolve(),
         (root.parent / f".{root.name}.publish").resolve(),
         (root.parent / f".{root.name}.backup").resolve(),
+        _transaction_path(root).resolve(),
+        _transaction_temporary_path(root).resolve(),
     )
     if any(_overlaps(source, owned) for source in source_inputs for owned in mutable_roots):
         raise ValueError("source inputs and comparator output topology must be disjoint")
+    _recover_publication(root)
     if not resume:
         for path in (work, failure_work):
             if path.exists():

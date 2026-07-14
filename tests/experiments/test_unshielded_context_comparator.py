@@ -333,7 +333,9 @@ def test_round_trip_rejection_restores_old_final_root(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("source_name", ["source_manifest", "source_tasks_csv"])
-@pytest.mark.parametrize("lifecycle", ["work", "stage", "backup", "failure"])
+@pytest.mark.parametrize(
+    "lifecycle", ["work", "stage", "backup", "transaction", "transaction_temp", "failure"]
+)
 def test_source_inputs_must_not_live_in_mutable_output_topology(
     tmp_path, source_name, lifecycle
 ):
@@ -343,6 +345,8 @@ def test_source_inputs_must_not_live_in_mutable_output_topology(
         "work": cli._work_root(root),
         "stage": root.parent / f".{root.name}.publish",
         "backup": root.parent / f".{root.name}.backup",
+        "transaction": cli._transaction_path(root),
+        "transaction_temp": cli._transaction_path(root).with_suffix(".tmp"),
         "failure": Path(kwargs["failure_root"]),
     }
     source = locations[lifecycle] / f"{source_name}.dat"
@@ -624,6 +628,112 @@ def test_output_roots_must_be_pairwise_disjoint(tmp_path):
     kwargs["result_root"] = kwargs["suite"].result_root / "child"
     with pytest.raises(ValueError, match="disjoint"):
         cli.run_unshielded_comparator(**kwargs)
+
+
+@pytest.mark.parametrize("collision", ["formal_stage", "failure_backup"])
+def test_publication_lifecycle_roots_are_first_class_topology(tmp_path, collision):
+    kwargs, calls, _ = _inputs(tmp_path)
+    root = Path(kwargs["result_root"]).resolve()
+    if collision == "formal_stage":
+        kwargs["suite"].result_root = root.parent / f".{root.name}.publish"
+    else:
+        kwargs["failure_root"] = root.parent / f".{root.name}.backup"
+    with pytest.raises(ValueError, match="disjoint"):
+        cli.run_unshielded_comparator(**kwargs)
+    assert calls == []
+
+
+def test_missing_final_is_restored_from_backup_before_first_episode(tmp_path):
+    kwargs, calls, _ = _inputs(tmp_path)
+    cli.run_unshielded_comparator(**kwargs)
+    root = Path(kwargs["result_root"])
+    old = (root / "eval_raw.csv").read_bytes()
+    backup = root.parent / f".{root.name}.backup"
+    root.rename(backup)
+    calls.clear()
+    kwargs["resume"] = False
+    kwargs["episode_runner"] = lambda *args, **inner: (_ for _ in ()).throw(
+        RuntimeError("first episode failed again")
+    )
+    with pytest.raises(RuntimeError, match="first episode failed again"):
+        cli.run_unshielded_comparator(**kwargs)
+    assert calls == []
+    assert (root / "eval_raw.csv").read_bytes() == old
+    assert not backup.exists()
+
+
+def test_copy_source_cleanup_interruption_keeps_recoverable_old_final(
+    tmp_path, monkeypatch
+):
+    kwargs, _, _ = _inputs(tmp_path)
+    cli.run_unshielded_comparator(**kwargs)
+    root = Path(kwargs["result_root"])
+    old = (root / "eval_raw.csv").read_bytes()
+    kwargs["resume"] = False
+    real_rename = Path.rename
+    real_rmtree = cli.shutil.rmtree
+    monkeypatch.setattr(
+        Path, "rename", lambda self, target: (_ for _ in ()).throw(OSError("rename"))
+    )
+    def interrupted_rmtree(path, *args, **inner):
+        if Path(path).resolve() == root.resolve():
+            raise KeyboardInterrupt()
+        return real_rmtree(path, *args, **inner)
+    monkeypatch.setattr(cli.shutil, "rmtree", interrupted_rmtree)
+    with pytest.raises(KeyboardInterrupt):
+        cli.run_unshielded_comparator(**kwargs)
+    backup = root.parent / f".{root.name}.backup"
+    assert (root / "eval_raw.csv").read_bytes() == old
+    assert (backup / "eval_raw.csv").read_bytes() == old
+
+    monkeypatch.setattr(Path, "rename", real_rename)
+    monkeypatch.setattr(cli.shutil, "rmtree", real_rmtree)
+    kwargs["episode_runner"] = lambda *args, **inner: (_ for _ in ()).throw(
+        RuntimeError("stop after startup recovery")
+    )
+    with pytest.raises(RuntimeError, match="startup recovery"):
+        cli.run_unshielded_comparator(**kwargs)
+    assert (root / "eval_raw.csv").read_bytes() == old
+    assert not backup.exists()
+
+
+def test_incomplete_backup_copy_never_replaces_intact_old_final(tmp_path, monkeypatch):
+    kwargs, _, _ = _inputs(tmp_path)
+    cli.run_unshielded_comparator(**kwargs)
+    root = Path(kwargs["result_root"])
+    old = (root / "eval_raw.csv").read_bytes()
+    backup = root.parent / f".{root.name}.backup"
+    kwargs["resume"] = False
+    real_rename = Path.rename
+    real_copytree = cli.shutil.copytree
+    real_rmtree = cli.shutil.rmtree
+    monkeypatch.setattr(
+        Path, "rename", lambda self, target: (_ for _ in ()).throw(OSError("rename"))
+    )
+    def incomplete_copy(source, destination, *args, **inner):
+        Path(destination).mkdir(parents=True)
+        (Path(destination) / "partial").write_text("incomplete", encoding="utf-8")
+        raise OSError("copy failed")
+    def interrupted_cleanup(path, *args, **inner):
+        if Path(path).resolve() == backup.resolve():
+            raise KeyboardInterrupt()
+        return real_rmtree(path, *args, **inner)
+    monkeypatch.setattr(cli.shutil, "copytree", incomplete_copy)
+    monkeypatch.setattr(cli.shutil, "rmtree", interrupted_cleanup)
+    with pytest.raises(KeyboardInterrupt):
+        cli.run_unshielded_comparator(**kwargs)
+    assert (root / "eval_raw.csv").read_bytes() == old
+
+    monkeypatch.setattr(Path, "rename", real_rename)
+    monkeypatch.setattr(cli.shutil, "copytree", real_copytree)
+    monkeypatch.setattr(cli.shutil, "rmtree", real_rmtree)
+    kwargs["episode_runner"] = lambda *args, **inner: (_ for _ in ()).throw(
+        RuntimeError("stop after incomplete-copy recovery")
+    )
+    with pytest.raises(RuntimeError, match="incomplete-copy recovery"):
+        cli.run_unshielded_comparator(**kwargs)
+    assert (root / "eval_raw.csv").read_bytes() == old
+    assert not backup.exists()
 
 
 def _progress_path(kwargs) -> Path:
