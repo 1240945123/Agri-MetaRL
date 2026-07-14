@@ -24,7 +24,7 @@ All other errors remain fatal. This includes prediction and context errors, malf
 
 ## Resume semantics
 
-The runner may import the 18 completed rows from the existing interrupted work file only after strict validation. Each imported row must have an approved key, exact checkpoint and source provenance, a valid canonical trace, finite metrics, valid mode-aware context diagnostics, and no failure evidence. Invalid rows are recomputed.
+The runner may import completed rows from an interrupted work file only after strict validation. Each imported row must have an approved key, exact checkpoint and source provenance, a valid canonical trace, finite metrics, valid mode-aware context diagnostics, no failure evidence, and an explicit full runtime-source-tree fingerprint matching the current run. Rows without that fingerprint are unverifiable and must be recomputed rather than re-signed. In particular, the existing 18-row `run_context_ab.py` progress file predates this field, so the real comparator must reject those rows and rerun their episodes.
 
 Native comparator progress is also resumable. Completed rows require valid traces. Failed rows require reloading and fully validating their capsule. Paths are canonical per key and globally unique. A changed checkpoint, source byte, task table, configuration, trace, or capsule invalidates the row.
 
@@ -49,7 +49,7 @@ The runner does not compute the shield gate. Its sole output is an immutable uns
 
 ## Testing
 
-Tests cover exact key enumeration, successful episodes, real wrapper-versus-underlying ODE exception behavior, multiple independent ODE failures, rejection of arbitrary exceptions and interrupts, strict capsule identity, import of valid legacy progress, stale progress recomputation, canonical paths, resume after interruption, cleanup priority, 31-row refusal, atomic publication and restoration failures, protected-root topology, and round-trip acceptance by `load_unshielded_comparator()`.
+Tests cover exact key enumeration, successful episodes, real wrapper-versus-underlying ODE exception behavior, multiple independent ODE failures, rejection of arbitrary exceptions and interrupts, strict capsule identity, import of fully fingerprinted legacy progress, rejection of the actual pre-fingerprint legacy schema, stale progress recomputation, canonical paths, resume after interruption, cleanup priority, 31-row refusal, atomic publication and restoration failures, protected-root topology, and round-trip acceptance by `load_unshielded_comparator()`.
 
 ## Non-goals
 

@@ -88,7 +88,7 @@ Use canonical per-key trace and capsule locations. Validate strict checkpoint st
 
 - [ ] **Step 3: Write and implement legacy import tests**
 
-Import only completed rows from the existing fail-fast progress CSV after the same provenance/trace/diagnostic validation. Never import a missing or inferred key. Copy accepted traces into comparator-owned work paths and re-sign row identities.
+Import only completed rows from a fail-fast progress CSV after the same provenance/trace/diagnostic validation, including an explicit matching full runtime-source-tree fingerprint. Never import a missing or inferred key, and never re-sign a row whose historical runtime fingerprint is absent. Copy accepted traces into comparator-owned work paths and re-sign row identities. Regression-test that the actual 18-row pre-fingerprint progress schema is rejected and recomputed.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -119,7 +119,7 @@ After publication call `load_unshielded_comparator()` with exact provenance and 
 
 - [ ] **Step 4: Verify, commit, and run real comparator**
 
-Run focused and full tests with short E-drive `--basetemp`, then execute the real two-seed comparator using the existing 18-row legacy progress. Inspect the final 32 rows and capsule counts before starting `run_shielded_context_ab.py`.
+Run focused and full tests with short E-drive `--basetemp`, then execute the real two-seed comparator. The existing 18-row legacy progress lacks a full runtime-source-tree fingerprint and must therefore be rejected; rerun all unverifiable episodes. Inspect the final 32 rows and capsule counts before starting `run_shielded_context_ab.py`.
 
 ```powershell
 git add -- experiments/scripts/run_unshielded_context_comparator.py tests/experiments/test_unshielded_context_comparator.py
