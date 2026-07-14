@@ -691,8 +691,10 @@ def write_shield_artifacts_atomic(
     manifest: Mapping[str, Any],
     decision: Mapping[str, Any],
     result_root: str | Path,
+    *,
+    evidence_files: Mapping[str, str | Path] | None = None,
 ) -> dict[str, Path]:
-    """Publish the five shield artifacts as an atomic directory replacement."""
+    """Publish shield artifacts and optional evidence as one atomic replacement."""
 
     raw = _check_frame(raw, name="raw", duplicate_check=True)
     paired = _check_frame(paired, name="paired", duplicate_check=False)
@@ -701,6 +703,30 @@ def write_shield_artifacts_atomic(
         raise TypeError("manifest and decision must be mappings")
     safe_manifest = _json_safe(manifest)
     safe_decision = _json_safe(decision)
+    evidence: dict[Path, Path] = {}
+    if evidence_files is not None:
+        if not isinstance(evidence_files, Mapping):
+            raise TypeError("evidence_files must be a mapping")
+        for relative, source in evidence_files.items():
+            if not isinstance(relative, str) or not relative:
+                raise ValueError("evidence destination must be nonempty relative text")
+            destination = Path(relative)
+            if destination.is_absolute() or ".." in destination.parts:
+                raise ValueError("evidence destination must remain inside result_root")
+            if destination.as_posix() in {
+                "eval_raw.csv",
+                "paired_deltas.csv",
+                "interventions.csv",
+                "shield_manifest.json",
+                "decision.json",
+            }:
+                raise ValueError("evidence destination cannot replace a core artifact")
+            source_path = Path(source).resolve()
+            if not source_path.is_file():
+                raise FileNotFoundError(f"evidence source does not exist: {source_path}")
+            if destination in evidence:
+                raise ValueError(f"duplicate evidence destination: {destination}")
+            evidence[destination] = source_path
 
     root = Path(result_root).resolve()
     if root.exists() and not root.is_dir():
@@ -718,6 +744,10 @@ def write_shield_artifacts_atomic(
             with (stage / filename).open("w", encoding="utf-8", newline="\n") as handle:
                 json.dump(payload, handle, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=True)
                 handle.write("\n")
+        for relative, source in evidence.items():
+            destination = stage / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
         if root.exists():
             os.replace(root, backup)
             old_moved = True
@@ -751,10 +781,13 @@ def write_shield_artifacts_atomic(
                 # Never remove the only remaining copy of the prior root.
                 pass
 
-    return {
+    paths = {
         "eval_raw": root / "eval_raw.csv",
         "paired_deltas": root / "paired_deltas.csv",
         "interventions": root / "interventions.csv",
         "shield_manifest": root / "shield_manifest.json",
         "decision": root / "decision.json",
     }
+    if evidence:
+        paths["evidence"] = root
+    return paths
