@@ -37,9 +37,9 @@ from gl_gym.environments.action_shield import (
     control_to_reference_action,
     project_first_feasible,
 )
-from gl_gym.environments.baseline import RuleBasedController
 from gl_gym.environments.models.utils import FORMAL_CVODES_OPTIONS, define_model
 from gl_gym.experiments.ode_failure import load_failure_capsule
+import gl_gym.experiments.ode_replay as ode_replay_module
 from gl_gym.experiments.ode_replay import build_rule_based_controller
 
 
@@ -400,6 +400,25 @@ def _snapshot_rule_config(
         hashlib.sha256(snapshot).hexdigest(),
         deepcopy(dict(loaded["TomatoEnv"])),
     )
+
+
+def _build_default_controller_from_snapshot(
+    controller_factory: Callable[[], Any], params: Mapping[str, Any]
+) -> Any:
+    """Call the declared builder with its config dependency narrowly frozen."""
+
+    original_loader = ode_replay_module.load_model_hyperparams
+
+    def snapshot_loader(agent_name: str, env_name: str) -> dict[str, Any]:
+        if (agent_name, env_name) != ("rule_based", "TomatoEnv"):
+            raise ValueError("unexpected model hyperparameter request during stage-1")
+        return deepcopy(dict(params))
+
+    ode_replay_module.load_model_hyperparams = snapshot_loader
+    try:
+        return controller_factory()
+    finally:
+        ode_replay_module.load_model_hyperparams = original_loader
 
 
 def _state_from_result(result: Any, nx: int) -> np.ndarray:
@@ -828,15 +847,11 @@ def run_stage1(
     executed_action = np.array(inputs["requested_action"], copy=True)
     executed_control = np.array(inputs["u"], copy=True)
     attempts: list[dict[str, Any]] = []
-    controller_source = (
-        "snapshotted_rule_config"
-        if controller_factory is build_rule_based_controller
-        else "injected_controller_factory"
-    )
-
     if reproduced:
         if controller_factory is build_rule_based_controller:
-            controller = RuleBasedController(**deepcopy(rule_controller_params))
+            controller = _build_default_controller_from_snapshot(
+                controller_factory, rule_controller_params
+            )
         else:
             controller = controller_factory()
         environment = SimpleNamespace(
@@ -935,7 +950,6 @@ def run_stage1(
         "formal_solver_options": dict(FORMAL_CVODES_OPTIONS),
         "env_config_sha256": env_config_sha256,
         "rule_config_sha256": rule_config_sha256,
-        "controller_source": controller_source,
         "fixed_lambdas": list(DEFAULT_LAMBDAS),
         "delta_u_max": delta.tolist(),
         "original_outcome": original,

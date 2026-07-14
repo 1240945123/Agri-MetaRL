@@ -191,6 +191,7 @@ def test_failure_then_fixed_candidates_selects_first_success(tmp_path):
     }
     payload = json.loads((result / "stage1_results.json").read_text(encoding="utf-8"))
     assert payload["schema_version"] == "action-shield-stage1-v1"
+    assert "controller_source" not in payload
     assert payload["git_head"] == "d" * 40
     assert payload["dirty"] is True
     assert payload["reference_control"] == [0.4, 0.6]
@@ -419,7 +420,6 @@ def test_config_and_rule_hashes_use_pre_execution_byte_snapshots(tmp_path, monke
     payload = json.loads((output / "stage1_results.json").read_text(encoding="utf-8"))
     assert payload["env_config_sha256"] == hashlib.sha256(env_bytes).hexdigest()
     assert payload["rule_config_sha256"] == hashlib.sha256(rule_bytes).hexdigest()
-    assert payload["controller_source"] == "injected_controller_factory"
 
 
 def test_default_controller_uses_exact_snapshotted_params_despite_same_metadata_mutation(
@@ -444,7 +444,15 @@ def test_default_controller_uses_exact_snapshotted_params_despite_same_metadata_
         def predict(self, *args):
             return np.array([0.4, 0.6])
 
-    monkeypatch.setattr(cli, "RuleBasedController", FrozenController)
+    monkeypatch.setattr(cli.ode_replay_module, "RuleBasedController", FrozenController)
+    real_builder = cli.build_rule_based_controller
+    builder_calls = []
+
+    def spy_builder():
+        builder_calls.append(True)
+        return real_builder()
+
+    monkeypatch.setattr(cli, "build_rule_based_controller", spy_builder)
     factory_calls = 0
 
     def factory(**kwargs):
@@ -465,13 +473,13 @@ def test_default_controller_uses_exact_snapshotted_params_despite_same_metadata_
         output,
         capsule_loader=lambda _: capsule,
         integrator_factory=factory,
-        controller_factory=cli.build_rule_based_controller,
+        controller_factory=spy_builder,
     )
+    assert builder_calls == [True]
     assert len(observed_params) == 1
     assert observed_params[0]["lamps_on"] == 0
     payload = json.loads((output / "stage1_results.json").read_text(encoding="utf-8"))
     assert payload["rule_config_sha256"] == hashlib.sha256(original_rule).hexdigest()
-    assert payload["controller_source"] == "snapshotted_rule_config"
 
 
 def test_injected_controller_mutation_does_not_change_snapshotted_hashes(
@@ -510,6 +518,41 @@ def test_injected_controller_mutation_does_not_change_snapshotted_hashes(
     payload = json.loads((output / "stage1_results.json").read_text(encoding="utf-8"))
     assert payload["env_config_sha256"] == hashlib.sha256(env_bytes).hexdigest()
     assert payload["rule_config_sha256"] == hashlib.sha256(rule_bytes).hexdigest()
+
+
+def test_default_builder_snapshot_patch_restored_after_baseexception(
+    tmp_path, monkeypatch
+):
+    capsule = _capsule(tmp_path)
+    config = _config(tmp_path / "env.yml")
+    output = tmp_path / "builder-interrupt"
+
+    def sentinel_loader(*args):
+        raise AssertionError("sentinel loader must be temporarily patched")
+
+    monkeypatch.setattr(
+        cli.ode_replay_module, "load_model_hyperparams", sentinel_loader
+    )
+
+    def exploding_builder():
+        assert cli.ode_replay_module.load_model_hyperparams is not sentinel_loader
+        raise KeyboardInterrupt("builder interrupted")
+
+    monkeypatch.setattr(cli, "build_rule_based_controller", exploding_builder)
+
+    with pytest.raises(KeyboardInterrupt, match="builder interrupted"):
+        cli.run_stage1(
+            capsule.path / "manifest.json",
+            config,
+            output,
+            capsule_loader=lambda _: capsule,
+            integrator_factory=lambda **kwargs: lambda **inputs: (_ for _ in ()).throw(
+                RuntimeError("original")
+            ),
+            controller_factory=exploding_builder,
+        )
+    assert cli.ode_replay_module.load_model_hyperparams is sentinel_loader
+    assert not output.exists()
 
 
 def test_noncallable_original_integrator_is_construction_error(tmp_path):
