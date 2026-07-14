@@ -48,6 +48,7 @@ class _Recorder:
         self.root = Path(root)
         self.context = context
         self.malformed = malformed
+        self.identity = "a" * 64
 
     def emit(self, step: int = 2):
         first = self.root / "capsule-a"
@@ -72,7 +73,7 @@ def _capsule_loader(path: str | Path):
             "context": context,
             "exception": {"type": "RuntimeError", "message": "CVODES failed"},
             "solver": {"options": dict(FORMAL_CVODES_OPTIONS)},
-            "content_identity_sha256": "a" * 64,
+            "content_identity_sha256": recorder.identity,
         },
         history_arrays={"step_index": np.asarray([step], dtype=np.int64)},
         failure_inputs={"timestep": np.asarray(step, dtype=np.int64)},
@@ -459,6 +460,243 @@ def test_output_roots_must_be_pairwise_disjoint(tmp_path):
     kwargs["result_root"] = kwargs["suite"].result_root / "child"
     with pytest.raises(ValueError, match="disjoint"):
         cli.run_unshielded_comparator(**kwargs)
+
+
+def _progress_path(kwargs) -> Path:
+    root = Path(kwargs["result_root"])
+    return root.parent / f".{root.name}.work" / "progress.csv"
+
+
+def test_resume_skips_canonical_completed_rows(tmp_path):
+    kwargs, calls, _ = _inputs(tmp_path)
+    first = cli.run_unshielded_comparator(**kwargs)
+    assert len(calls) == 32
+
+    calls.clear()
+    kwargs["resume"] = True
+    resumed = cli.run_unshielded_comparator(**kwargs)
+
+    assert calls == []
+    pd.testing.assert_frame_equal(
+        resumed.sort_index(axis=1), first.sort_index(axis=1), check_dtype=False
+    )
+
+
+@pytest.mark.parametrize("tamper", ["checkpoint", "source", "diagnostic", "trace"])
+def test_resume_recomputes_completed_row_when_evidence_changes(tmp_path, tamper):
+    kwargs, calls, _ = _inputs(tmp_path)
+    cli.run_unshielded_comparator(**kwargs)
+    progress_path = _progress_path(kwargs)
+    progress = pd.read_csv(progress_path)
+    target = progress.iloc[0]
+    key = (int(target.seed), str(target.task_id), str(target.inference_mode))
+    if tamper == "checkpoint":
+        progress.loc[0, "checkpoint_steps"] = 18
+    elif tamper == "source":
+        progress.loc[0, "runtime_source_tree_sha256"] = "f" * 64
+    elif tamper == "diagnostic":
+        progress.loc[0, "context_norm_mean"] = 9.0
+    else:
+        np.save(Path(target.action_trace_path), np.zeros((3, 2)), allow_pickle=False)
+    progress.to_csv(progress_path, index=False)
+
+    calls.clear()
+    kwargs["resume"] = True
+    cli.run_unshielded_comparator(**kwargs)
+
+    assert calls == [key]
+
+
+def test_resume_skips_valid_failed_capsule(tmp_path):
+    failure = {(42, cli.DIAGNOSTIC_TASK_IDS[0], cli.MODES[0])}
+    kwargs, calls, _ = _inputs(tmp_path, failure_modes=failure)
+    cli.run_unshielded_comparator(**kwargs)
+    calls.clear()
+    kwargs["resume"] = True
+
+    resumed = cli.run_unshielded_comparator(**kwargs)
+
+    assert calls == []
+    assert (~resumed.completed).sum() == 1
+
+
+def test_resume_recomputes_failed_row_when_capsule_identity_changes(tmp_path):
+    key = (42, cli.DIAGNOSTIC_TASK_IDS[0], cli.MODES[0])
+    kwargs, calls, _ = _inputs(tmp_path, failure_modes={key})
+    frame = cli.run_unshielded_comparator(**kwargs)
+    manifest = Path(frame.loc[~frame.completed, "failure_evidence_path"].iloc[0])
+    _RECORDER_BY_ROOT[manifest.parent.parent].identity = "c" * 64
+    calls.clear()
+    kwargs["resume"] = True
+
+    def successful_runner(model, env, **runner_kwargs):
+        recorder = runner_kwargs["failure_recorder"]
+        calls.append(
+            (recorder.context.seed, recorder.context.task_id, runner_kwargs["inference_mode"])
+        )
+        metrics = {name: 1.0 for name in cli.REQUIRED_METRICS}
+        return metrics, {
+            "support_ready_step": (
+                np.nan if runner_kwargs["inference_mode"] == "zero_context" else 1.0
+            ),
+            "context_norm_mean": 0.5,
+            "context_norm_max": 1.0,
+            "action_trace": np.ones((3, 2)),
+        }
+
+    kwargs["episode_runner"] = successful_runner
+    cli.run_unshielded_comparator(**kwargs)
+    assert calls == [key]
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "mismatch"])
+def test_resume_recomputes_failed_row_when_capsule_is_not_valid(tmp_path, damage):
+    key = (42, cli.DIAGNOSTIC_TASK_IDS[0], cli.MODES[0])
+    kwargs, calls, _ = _inputs(tmp_path, failure_modes={key})
+    frame = cli.run_unshielded_comparator(**kwargs)
+    manifest = Path(frame.loc[~frame.completed, "failure_evidence_path"].iloc[0])
+    if damage == "missing":
+        manifest.unlink()
+    elif damage == "corrupt":
+        manifest.write_text("not-json", encoding="utf-8")
+        _RECORDER_BY_ROOT[manifest.parent.parent].malformed = "context"
+    else:
+        _RECORDER_BY_ROOT[manifest.parent.parent].malformed = "context"
+
+    calls.clear()
+    kwargs["resume"] = True
+
+    def successful_runner(model, env, **runner_kwargs):
+        recorder = runner_kwargs["failure_recorder"]
+        calls.append((recorder.context.seed, recorder.context.task_id, runner_kwargs["inference_mode"]))
+        metrics = {name: 1.0 for name in cli.REQUIRED_METRICS}
+        return metrics, {
+            "support_ready_step": np.nan if runner_kwargs["inference_mode"] == "zero_context" else 1.0,
+            "context_norm_mean": 0.5,
+            "context_norm_max": 1.0,
+            "action_trace": np.ones((3, 2)),
+        }
+
+    kwargs["episode_runner"] = successful_runner
+    cli.run_unshielded_comparator(**kwargs)
+    assert calls == [key]
+
+
+def test_resume_ignores_rows_for_other_keys_and_result_roots(tmp_path):
+    kwargs, calls, _ = _inputs(tmp_path / "source")
+    cli.run_unshielded_comparator(**kwargs)
+    progress = pd.read_csv(_progress_path(kwargs))
+    progress.loc[0, "task_id"] = "not-a-target"
+    progress.to_csv(_progress_path(kwargs), index=False)
+    calls.clear()
+    kwargs["resume"] = True
+    cli.run_unshielded_comparator(**kwargs)
+    assert len(calls) == 1
+
+    other, other_calls, _ = _inputs(tmp_path / "other")
+    other["resume"] = True
+    cli.run_unshielded_comparator(**other)
+    assert len(other_calls) == 32
+
+
+def test_resume_parse_errors_are_stale_not_fatal(tmp_path):
+    kwargs, calls, _ = _inputs(tmp_path)
+    work = _progress_path(kwargs).parent
+    work.mkdir(parents=True)
+    _progress_path(kwargs).write_bytes(b'"unterminated')
+    kwargs["resume"] = True
+
+    frame = cli.run_unshielded_comparator(**kwargs)
+
+    assert len(frame) == 32 and len(calls) == 32
+
+
+def test_checkpoint_steps_must_be_a_nonnegative_exact_integer(tmp_path):
+    kwargs, _, _ = _inputs(tmp_path)
+    kwargs["model_loader"] = lambda *args: SimpleNamespace(num_timesteps=17.5)
+    with pytest.raises(ValueError, match="checkpoint steps"):
+        cli.run_unshielded_comparator(**kwargs)
+
+
+def test_legacy_import_copies_valid_trace_and_resigns_identity(tmp_path):
+    old, calls, _ = _inputs(tmp_path / "old")
+    old_frame = cli.run_unshielded_comparator(**old)
+    legacy = tmp_path / "legacy.csv"
+    legacy_row = old_frame.iloc[[0]].copy()
+    legacy_row["EPI"] = 1.0
+    legacy_row = legacy_row.drop(
+        columns=[
+            *cli.STATUS_FIELDS,
+            "action_trace_sha256",
+            "failure_capsule_identity_sha256",
+            "row_identity_sha256",
+        ]
+    )
+    legacy_row.to_csv(legacy, index=False)
+    old_trace = Path(old_frame.iloc[0].action_trace_path)
+
+    calls.clear()
+    new = dict(old)
+    new["result_root"] = tmp_path / "new" / "comparator-final"
+    new["failure_root"] = tmp_path / "new" / "failure-root"
+    new["legacy_progress"] = legacy
+    frame = cli.run_unshielded_comparator(**new)
+
+    imported = frame.iloc[0]
+    assert len(calls) == 31
+    assert Path(imported.action_trace_path) != old_trace
+    assert Path(imported.action_trace_path) == cli._trace_path(
+        _progress_path(new).parent,
+        int(imported.seed),
+        str(imported.task_id),
+        str(imported.inference_mode),
+    )
+    assert Path(imported.action_trace_path).read_bytes() == old_trace.read_bytes()
+    assert len(imported.row_identity_sha256) == 64
+
+    calls.clear()
+    new["resume"] = True
+    new["legacy_progress"] = None
+    cli.run_unshielded_comparator(**new)
+    assert calls == []
+
+
+def test_legacy_import_rejects_inferred_or_unproven_rows(tmp_path):
+    old, _, _ = _inputs(tmp_path / "old")
+    frame = cli.run_unshielded_comparator(**old)
+    legacy = tmp_path / "legacy.csv"
+    invalid = frame.iloc[[0]].copy()
+    invalid["EPI"] = 1.0
+    invalid = invalid.drop(
+        columns=[
+            "inference_mode",
+            *cli.STATUS_FIELDS,
+            "action_trace_sha256",
+            "failure_capsule_identity_sha256",
+            "row_identity_sha256",
+        ]
+    )
+    invalid.to_csv(legacy, index=False)
+
+    new, calls, _ = _inputs(tmp_path / "new")
+    new["legacy_progress"] = legacy
+    cli.run_unshielded_comparator(**new)
+
+    assert len(calls) == 32
+
+
+def test_legacy_import_rejects_non_fail_fast_status_rows(tmp_path):
+    old, _, _ = _inputs(tmp_path / "old")
+    row = cli.run_unshielded_comparator(**old).iloc[[0]].copy()
+    row["EPI"] = 1.0
+    legacy = tmp_path / "legacy.csv"
+    row.to_csv(legacy, index=False)
+
+    new, calls, _ = _inputs(tmp_path / "new")
+    new["legacy_progress"] = legacy
+    cli.run_unshielded_comparator(**new)
+
+    assert len(calls) == 32
 
     kwargs, _, _ = _inputs(tmp_path / "second")
     kwargs["failure_root"] = kwargs["result_root"] / "failures"

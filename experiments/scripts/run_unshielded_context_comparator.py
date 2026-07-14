@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import hashlib
+import json
 from pathlib import Path
 import re
 import shutil
+import stat
 import sys
 from typing import Any, Callable, Mapping
 
@@ -32,6 +34,8 @@ from experiments.scripts.run_context_ab import (
     _package_versions,
     _provenance,
     build_diagnostic_runs,
+    resume_row_is_complete,
+    sha256_file,
 )
 from gl_gym.RL.agri_metarl import AgriMetaRL
 from gl_gym.environments.models.utils import FORMAL_CVODES_OPTIONS
@@ -77,6 +81,10 @@ RESERVED_ROW_FIELDS = frozenset(
         "action_trace_path",
         "source_manifest",
         "source_tasks_csv",
+        "runtime_source_tree_sha256",
+        "action_trace_sha256",
+        "failure_capsule_identity_sha256",
+        "row_identity_sha256",
         *STATUS_FIELDS,
         *HASH_FIELDS,
         *PROVENANCE_FIELDS,
@@ -140,6 +148,103 @@ def _attempt_root(failure_work: Path, seed: int, task_id: str, mode: str) -> Pat
     return failure_work / hashlib.sha256(key).hexdigest()[:12]
 
 
+def _runtime_source_tree_sha256(root: str | Path = ROOT) -> str:
+    """Fingerprint every regular Python module used from the runtime source tree."""
+
+    source_root = Path(root).resolve() / "src" / "gl_gym"
+    if not source_root.is_dir() or source_root.is_symlink():
+        raise ValueError("runtime source tree must be a regular directory")
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    files: list[tuple[str, Path]] = []
+    for path in source_root.rglob("*"):
+        metadata = path.lstat()
+        if path.is_symlink() or getattr(metadata, "st_file_attributes", 0) & reparse_flag:
+            raise ValueError(f"runtime source tree contains symlink/reparse entry: {path}")
+        if path.suffix == ".py":
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"runtime Python source must be a regular file: {path}")
+            files.append((path.relative_to(source_root).as_posix(), path))
+    if not files:
+        raise ValueError("runtime source tree contains no Python files")
+    digest = hashlib.sha256()
+    for relative, path in sorted(files):
+        relative_bytes = relative.encode("utf-8")
+        content = path.read_bytes()
+        digest.update(len(relative_bytes).to_bytes(8, "big"))
+        digest.update(relative_bytes)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def _key(row: Mapping[str, Any]) -> tuple[int, str, str]:
+    return (int(row["seed"]), str(row["task_id"]), str(row["inference_mode"]))
+
+
+def _load_rows(path: Path | None) -> list[dict[str, Any]]:
+    if path is None or not path.is_file():
+        return []
+    try:
+        return pd.read_csv(path).to_dict(orient="records")
+    except (OSError, UnicodeError, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError):
+        return []
+
+
+def _canonical_scalar(name: str, value: Any) -> Any:
+    if isinstance(value, np.generic):
+        value = value.item()
+    if name in {
+        "failure_evidence_path",
+        "action_trace_path",
+        "action_trace_sha256",
+        "failure_capsule_identity_sha256",
+    } and (
+        value == "" or (isinstance(value, float) and np.isnan(value))
+    ):
+        return {"empty": True}
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return {"nan": True}
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if not np.isfinite(numeric):
+            return {"number": str(numeric)}
+        return {"number": numeric.hex()}
+    return str(value)
+
+
+def _row_identity(row: Mapping[str, Any]) -> str:
+    payload = {
+        str(name): _canonical_scalar(str(name), value)
+        for name, value in row.items()
+        if name != "row_identity_sha256"
+        and not (
+            (
+                value is None
+                or (isinstance(value, (float, np.floating)) and np.isnan(value))
+            )
+            and name
+            not in {
+                "failure_evidence_path",
+                "action_trace_path",
+                "action_trace_sha256",
+                "failure_capsule_identity_sha256",
+            }
+        )
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _signed_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    signed = dict(row)
+    signed["row_identity_sha256"] = _row_identity(signed)
+    return signed
+
+
 def _replace_progress(rows: list[dict[str, Any]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -176,6 +281,16 @@ def _finite_metrics(metrics: Any) -> dict[str, Any]:
         elif not isinstance(value, (int, float)):
             normalized[name] = scalar
     return normalized
+
+
+def _checkpoint_steps(model: Any) -> int:
+    try:
+        value = float(model.num_timesteps)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("checkpoint steps must be a nonnegative exact integer") from error
+    if not np.isfinite(value) or not value.is_integer() or value < 0:
+        raise ValueError("checkpoint steps must be a nonnegative exact integer")
+    return int(value)
 
 
 def _success_diagnostics(
@@ -220,11 +335,15 @@ def _success_diagnostics(
 def _validate_completed_row(row: Mapping[str, Any]) -> None:
     """Validate the final merged row before it becomes resumable progress."""
 
+    evidence = row.get("failure_evidence_path")
+    evidence_is_empty = evidence == "" or (
+        isinstance(evidence, float) and np.isnan(evidence)
+    )
     if (
-        row.get("completed") is not True
+        row.get("completed") not in (True, np.bool_(True))
         or row.get("status") != "completed"
         or row.get("ode_failure_count") != 0
-        or row.get("failure_evidence_path") != ""
+        or not evidence_is_empty
     ):
         raise ValueError("completed comparator row has an invalid status schema")
     try:
@@ -235,6 +354,80 @@ def _validate_completed_row(row: Mapping[str, Any]) -> None:
         raise ValueError("completed comparator row has invalid required metrics") from error
     if not np.isfinite(metrics).all():
         raise ValueError("completed comparator row required metrics must be finite")
+
+
+def _valid_readiness(row: Mapping[str, Any], trace_length: int) -> bool:
+    try:
+        readiness = float(row["support_ready_step"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if str(row.get("inference_mode")) == "online_context":
+        return bool(
+            np.isfinite(readiness)
+            and readiness.is_integer()
+            and 1 <= readiness < trace_length
+        )
+    if str(row.get("inference_mode")) != "zero_context":
+        return False
+    return bool(
+        np.isnan(readiness)
+        or (
+            np.isfinite(readiness)
+            and readiness.is_integer()
+            and 1 <= readiness < trace_length
+        )
+    )
+
+
+def _base_matches(row: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    try:
+        for name, value in expected.items():
+            actual = row[name]
+            if isinstance(value, (bool, np.bool_)):
+                if isinstance(actual, str):
+                    if actual not in {"True", "False"}:
+                        return False
+                    actual = actual == "True"
+                if not isinstance(actual, (bool, np.bool_)) or bool(actual) != bool(value):
+                    return False
+            elif isinstance(value, int):
+                numeric = float(actual)
+                if not np.isfinite(numeric) or not numeric.is_integer() or int(numeric) != value:
+                    return False
+            elif str(actual) != str(value):
+                return False
+        identity = str(row["row_identity_sha256"])
+        return len(identity) == 64 and identity == _row_identity(row)
+    except (KeyError, OverflowError, TypeError, ValueError):
+        return False
+
+
+def _completed_row_is_valid(
+    row: Mapping[str, Any], *, expected: Mapping[str, Any], trace_path: Path
+) -> bool:
+    if not _base_matches(row, expected):
+        return False
+    try:
+        _validate_completed_row(row)
+        if Path(str(row["action_trace_path"])).resolve() != trace_path.resolve():
+            return False
+        trace = np.load(trace_path, allow_pickle=False)
+        if (
+            trace.ndim != 2
+            or not trace.shape[0]
+            or not trace.shape[1]
+            or not np.isfinite(trace).all()
+            or sha256_file(trace_path) != str(row["action_trace_sha256"])
+            or not _valid_readiness(row, trace.shape[0])
+        ):
+            return False
+        context = np.asarray(
+            [float(row["context_norm_mean"]), float(row["context_norm_max"])],
+            dtype=float,
+        )
+        return bool(np.isfinite(context).all())
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
 
 
 def _validate_capsule(
@@ -250,6 +443,27 @@ def _validate_capsule(
     episode_step, horizon = (int(item) for item in match.groups())
     if episode_step >= horizon:
         raise ValueError("early-horizon RuntimeError has inconsistent step/horizon")
+    capsule = _validate_capsule_evidence(
+        manifest_path,
+        expected_context=expected_context,
+        capsule_loader=capsule_loader,
+    )
+    try:
+        recorded_step = int(capsule.history_arrays["step_index"][-1])
+        failure_timestep = int(capsule.failure_inputs["timestep"])
+    except (KeyError, IndexError, TypeError, ValueError) as capsule_error:
+        raise ValueError("failure capsule has malformed step evidence") from capsule_error
+    if recorded_step != episode_step - 1 or failure_timestep != recorded_step:
+        raise ValueError("failure capsule timestep does not match the early episode step")
+    return capsule
+
+
+def _validate_capsule_evidence(
+    manifest_path: Path,
+    *,
+    expected_context: CapsuleContext,
+    capsule_loader: Callable[[str | Path], Any],
+) -> Any:
     capsule = capsule_loader(manifest_path.parent)
     expected = asdict(expected_context)
     if capsule.manifest.get("context") != expected:
@@ -267,8 +481,8 @@ def _validate_capsule(
         failure_timestep = int(capsule.failure_inputs["timestep"])
     except (KeyError, IndexError, TypeError, ValueError) as capsule_error:
         raise ValueError("failure capsule has malformed step evidence") from capsule_error
-    if recorded_step != episode_step - 1 or failure_timestep != recorded_step:
-        raise ValueError("failure capsule timestep does not match the early episode step")
+    if recorded_step < 0 or failure_timestep != recorded_step:
+        raise ValueError("failure capsule has inconsistent step evidence")
     if capsule.manifest.get("solver", {}).get("options") != dict(
         FORMAL_CVODES_OPTIONS
     ):
@@ -277,6 +491,53 @@ def _validate_capsule(
     if not isinstance(identity, str) or len(identity) != 64:
         raise ValueError("failure capsule content identity is invalid")
     return capsule
+
+
+def _failed_row_is_valid(
+    row: Mapping[str, Any],
+    *,
+    expected: Mapping[str, Any],
+    attempt: Path,
+    context: CapsuleContext,
+    capsule_loader: Callable[[str | Path], Any],
+) -> bool:
+    if not _base_matches(row, expected):
+        return False
+    try:
+        if (
+            row["completed"] not in (False, np.bool_(False))
+            or str(row["status"]) != "ode_failure"
+            or int(row["ode_failure_count"]) != 1
+        ):
+            return False
+        metrics = np.asarray([float(row[name]) for name in REQUIRED_METRICS])
+        diagnostics = np.asarray(
+            [
+                float(row["support_ready_step"]),
+                float(row["context_norm_mean"]),
+                float(row["context_norm_max"]),
+            ]
+        )
+        if not np.isnan(metrics).all() or not np.isnan(diagnostics).all():
+            return False
+        trace_value = row["action_trace_path"]
+        if not (
+            trace_value == ""
+            or (isinstance(trace_value, float) and np.isnan(trace_value))
+        ):
+            return False
+        manifest = Path(str(row["failure_evidence_path"])).resolve()
+        manifests = sorted(attempt.rglob("manifest.json")) if attempt.is_dir() else []
+        if len(manifests) != 1 or manifests[0].resolve() != manifest:
+            return False
+        capsule = _validate_capsule_evidence(
+            manifest, expected_context=context, capsule_loader=capsule_loader
+        )
+        return str(row["failure_capsule_identity_sha256"]) == str(
+            capsule.manifest["content_identity_sha256"]
+        )
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
 
 
 def run_unshielded_comparator(
@@ -300,7 +561,6 @@ def run_unshielded_comparator(
 ) -> pd.DataFrame:
     """Run all approved keys, retaining only strictly proven ODE failures."""
 
-    del legacy_progress  # Accepted for the Task-2 migration path.
     root, capsule_root = validate_output_roots(
         result_root, failure_root, suite.result_root
     )
@@ -314,6 +574,8 @@ def run_unshielded_comparator(
                 shutil.rmtree(path)
     progress_path = work / "progress.csv"
     work.joinpath("traces").mkdir(parents=True, exist_ok=True)
+    resume_rows = _load_rows(progress_path) if resume else []
+    legacy_rows = _load_rows(Path(legacy_progress)) if legacy_progress is not None else []
 
     selected = select_diagnostic_tasks(tasks)
     task_records = [task_from_row(row) for row in selected.itertuples(index=False)]
@@ -331,6 +593,7 @@ def run_unshielded_comparator(
         }
     )
     packages = _package_versions()
+    runtime_source_tree_sha256 = _runtime_source_tree_sha256()
     evidence_by_seed = {
         int(run["seed"]): {
             "model_sha256": str(run["model_sha256"]),
@@ -349,12 +612,10 @@ def run_unshielded_comparator(
     for run in runs:
         seed = int(run["seed"])
         model = load_model(Path(run["model_path"]), device)
-        checkpoint_steps = int(model.num_timesteps)
+        checkpoint_steps = _checkpoint_steps(model)
         for task in task_records:
             for mode in MODES:
                 attempt = _attempt_root(failure_work, seed, task.task_id, mode)
-                if attempt.exists():
-                    shutil.rmtree(attempt)
                 context = CapsuleContext(
                     seed=seed,
                     task_id=task.task_id,
@@ -368,6 +629,110 @@ def run_unshielded_comparator(
                     package_versions=dict(packages),
                     formal_result_root=str(root),
                 )
+                base = {
+                    "seed": seed,
+                    "task_id": task.task_id,
+                    "split": task.split,
+                    "inference_mode": mode,
+                    "checkpoint_steps": checkpoint_steps,
+                    "checkpoint_path": str(Path(run["model_path"]).resolve()),
+                    "model_path": str(Path(run["model_path"]).resolve()),
+                    "vecnormalize_path": str(
+                        Path(run["vecnormalize_path"]).resolve()
+                    ),
+                    "source_manifest": str(Path(source_manifest).resolve()),
+                    "source_tasks_csv": str(Path(source_tasks_csv).resolve()),
+                    "runtime_source_tree_sha256": runtime_source_tree_sha256,
+                    **evidence_by_seed[seed],
+                }
+                key = (seed, task.task_id, mode)
+                trace_path = _trace_path(work, seed, task.task_id, mode)
+                reused: dict[str, Any] | None = None
+                for candidate in resume_rows:
+                    try:
+                        if _key(candidate) != key:
+                            continue
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    status = str(candidate.get("status"))
+                    if status == "completed" and not attempt.exists() and _completed_row_is_valid(
+                        candidate, expected=base, trace_path=trace_path
+                    ):
+                        reused = dict(candidate)
+                        reused["failure_evidence_path"] = ""
+                        reused["failure_capsule_identity_sha256"] = ""
+                        break
+                    if status == "ode_failure" and _failed_row_is_valid(
+                        candidate,
+                        expected=base,
+                        attempt=attempt,
+                        context=context,
+                        capsule_loader=capsule_loader,
+                    ):
+                        reused = dict(candidate)
+                        reused["action_trace_path"] = ""
+                        reused["action_trace_sha256"] = ""
+                        break
+                if reused is not None:
+                    rows.append(reused)
+                    continue
+
+                for candidate in legacy_rows:
+                    if set(STATUS_FIELDS).intersection(candidate):
+                        continue
+                    try:
+                        candidate_key = _key(candidate)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if candidate_key != key or str(candidate.get("split")) != task.split:
+                        continue
+                    if not resume_row_is_complete(
+                        candidate,
+                        checkpoint_steps=checkpoint_steps,
+                        expected_hashes=evidence_by_seed[seed],
+                    ):
+                        continue
+                    source_trace = Path(str(candidate["action_trace_path"])).resolve()
+                    trace_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source_trace, trace_path)
+                    imported = dict(candidate)
+                    for name in (
+                        "row_identity_sha256",
+                        "action_trace_sha256",
+                        "failure_capsule_identity_sha256",
+                        "failure_evidence_path",
+                        "status",
+                        "completed",
+                        "ode_failure_count",
+                    ):
+                        imported.pop(name, None)
+                    imported.update(base)
+                    imported.update(
+                        {
+                            "action_trace_path": str(trace_path),
+                            "action_trace_sha256": sha256_file(trace_path),
+                            "failure_capsule_identity_sha256": "",
+                            "completed": True,
+                            "status": "completed",
+                            "ode_failure_count": 0,
+                            "failure_evidence_path": "",
+                        }
+                    )
+                    imported = _signed_row(imported)
+                    if not _completed_row_is_valid(
+                        imported, expected=base, trace_path=trace_path
+                    ):
+                        trace_path.unlink(missing_ok=True)
+                        continue
+                    reused = imported
+                    break
+                if reused is not None:
+                    rows.append(reused)
+                    _replace_progress(rows, progress_path)
+                    continue
+
+                if attempt.exists():
+                    shutil.rmtree(attempt)
                 recorder = recorder_factory(attempt, context)
                 env = env_loader(suite, task, Path(run["vecnormalize_path"]))
                 error: Exception | None = None
@@ -401,14 +766,6 @@ def run_unshielded_comparator(
                     assert error is not None
                     raise error
                 manifests = sorted(attempt.rglob("manifest.json")) if attempt.exists() else []
-                base = {
-                    "seed": seed,
-                    "task_id": task.task_id,
-                    "split": task.split,
-                    "inference_mode": mode,
-                    "checkpoint_steps": checkpoint_steps,
-                    **evidence_by_seed[seed],
-                }
                 if error is not None:
                     try:
                         if len(manifests) != 1:
@@ -416,7 +773,7 @@ def run_unshielded_comparator(
                                 "expected exactly one new failure capsule, "
                                 f"found {len(manifests)}"
                             )
-                        _validate_capsule(
+                        capsule = _validate_capsule(
                             manifests[0],
                             expected_context=context,
                             error=error,
@@ -430,18 +787,22 @@ def run_unshielded_comparator(
                             f"{type(classification_error).__name__}: {classification_error}"
                         )
                         raise error
-                    row = {
+                    row = _signed_row({
                         **{name: float("nan") for name in REQUIRED_METRICS},
                         "support_ready_step": float("nan"),
                         "context_norm_mean": float("nan"),
                         "context_norm_max": float("nan"),
                         "action_trace_path": "",
+                        "action_trace_sha256": "",
+                        "failure_capsule_identity_sha256": str(
+                            capsule.manifest["content_identity_sha256"]
+                        ),
                         **base,
                         "completed": False,
                         "status": "ode_failure",
                         "ode_failure_count": 1,
                         "failure_evidence_path": str(manifests[0].resolve()),
-                    }
+                    })
                 else:
                     if manifests:
                         shutil.rmtree(attempt)
@@ -452,19 +813,24 @@ def run_unshielded_comparator(
                     normalized_diagnostics, trace = _success_diagnostics(
                         diagnostics, metric_names=set(normalized_metrics)
                     )
-                    trace_path = _trace_path(work, seed, task.task_id, mode)
                     np.save(trace_path, trace, allow_pickle=False)
-                    row = {
+                    row = _signed_row({
                         **normalized_metrics,
                         **normalized_diagnostics,
                         "action_trace_path": str(trace_path),
+                        "action_trace_sha256": sha256_file(trace_path),
+                        "failure_capsule_identity_sha256": "",
                         **base,
                         "completed": True,
                         "status": "completed",
                         "ode_failure_count": 0,
                         "failure_evidence_path": "",
-                    }
+                    })
                     _validate_completed_row(row)
+                    if not _valid_readiness(row, trace.shape[0]):
+                        raise ValueError(
+                            "support_ready_step is invalid for the inference mode"
+                        )
                     if attempt.exists():
                         shutil.rmtree(attempt)
                 rows.append(row)
