@@ -300,27 +300,37 @@ def run_deterministic_episode(
                         "done transition requires a non-None "
                         "info['terminal_observation']"
                     )
+            pending_early_done_error = None
             if done and step_index + 1 < n_steps:
-                raise RuntimeError(
+                pending_early_done_error = RuntimeError(
                     "evaluation episode terminated before configured horizon: "
                     f"step {step_index + 1} of {n_steps}"
                 )
 
-            has_action_shield = "action_shield" in info
-            if shield_presence is None:
-                shield_presence = has_action_shield
-            elif shield_presence != has_action_shield:
-                raise ValueError(
-                    "mixed action_shield presence within one evaluation episode"
-                )
+            try:
+                has_action_shield = "action_shield" in info
+                if shield_presence is None:
+                    shield_presence = has_action_shield
+                elif shield_presence != has_action_shield:
+                    raise ValueError(
+                        "mixed action_shield presence within one evaluation episode"
+                    )
 
-            executed_action = requested_action
-            if has_action_shield:
-                executed_action, detached_record = _shielded_executed_action(
-                    info["action_shield"], requested_action
+                executed_action = requested_action
+                if has_action_shield:
+                    executed_action, detached_record = _shielded_executed_action(
+                        info["action_shield"], requested_action
+                    )
+                    requested_action_trace.append(requested_action)
+                    action_shield_records.append(detached_record)
+            except ValueError as shield_error:
+                if pending_early_done_error is None:
+                    raise
+                pending_early_done_error.add_note(
+                    "action_shield evidence validation also failed: "
+                    f"{type(shield_error).__name__}: {shield_error}"
                 )
-                requested_action_trace.append(requested_action)
-                action_shield_records.append(detached_record)
+                raise pending_early_done_error from shield_error
             action_trace.append(executed_action)
 
             if use_inference_hooks:
@@ -334,6 +344,8 @@ def run_deterministic_episode(
                     done,
                     info,
                 )
+            if pending_early_done_error is not None:
+                raise pending_early_done_error
             episode_starts = dones
 
         if use_inference_hooks:

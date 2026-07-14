@@ -1010,12 +1010,53 @@ def test_early_termination_remains_primary_over_malformed_shield_evidence():
             )
 
     model = HookedFakeModel()
-    with pytest.raises(RuntimeError, match="terminated before configured horizon"):
+    with pytest.raises(
+        RuntimeError, match="terminated before configured horizon"
+    ) as captured:
         run_deterministic_episode(
             model, EarlyShieldEnv(), inference_mode="online_context"
         )
 
     assert [event[0] for event in model.events] == ["begin", "predict", "end"]
+    assert any("action_shield" in note for note in captured.value.__notes__)
+
+
+def test_valid_early_terminal_transition_is_observed_once_before_horizon_error():
+    class ValidEarlyShieldEnv(FakeEnv):
+        def step(self, actions):
+            self.step_count += 1
+            requested = np.asarray(actions[0], dtype=np.float32).copy()
+            return (
+                np.array([[0.0]], dtype=np.float32),
+                np.array([1.0], dtype=np.float32),
+                np.array([True]),
+                [
+                    {
+                        "terminal_observation": np.array([9.0], dtype=np.float32),
+                        "action_shield": {
+                            "requested_action": requested.tolist(),
+                            "executed_action": [0.25],
+                        },
+                    }
+                ],
+            )
+
+    model = HookedFakeModel()
+    with pytest.raises(RuntimeError, match="terminated before configured horizon"):
+        run_deterministic_episode(
+            model, ValidEarlyShieldEnv(), inference_mode="online_context"
+        )
+
+    assert [event[0] for event in model.events] == [
+        "begin",
+        "predict",
+        "observe",
+        "end",
+    ]
+    observation = next(event for event in model.events if event[0] == "observe")
+    np.testing.assert_array_equal(observation[2], np.array([0.25], dtype=np.float32))
+    np.testing.assert_array_equal(observation[4], np.array([9.0], dtype=np.float32))
+    assert observation[5] is True
 
 
 def test_missing_terminal_observation_remains_primary_over_malformed_shield_evidence():
