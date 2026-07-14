@@ -46,6 +46,7 @@ from gl_gym.experiments.ode_failure import (
     load_failure_capsule,
 )
 from gl_gym.experiments.shield_evaluation import REQUIRED_METRICS
+from gl_gym.experiments.suite_aggregation import DEFAULT_METRICS
 from gl_gym.experiments.suite_evaluation import (
     load_task_env,
     run_deterministic_episode,
@@ -68,6 +69,7 @@ STATUS_FIELDS = (
     "ode_failure_count",
     "failure_evidence_path",
 )
+EPISODE_SCORING_METRICS = tuple(DEFAULT_METRICS)
 RESERVED_ROW_FIELDS = frozenset(
     {
         "seed",
@@ -271,6 +273,15 @@ def _finite_metrics(metrics: Any) -> dict[str, Any]:
         raise TypeError("required episode metrics must be numeric scalars") from error
     if not np.isfinite(values).all():
         raise ValueError("successful episode metrics must be finite")
+    for name in EPISODE_SCORING_METRICS:
+        if name not in normalized:
+            continue
+        try:
+            value = float(normalized[name])
+        except (TypeError, ValueError) as error:
+            raise TypeError(f"episode scoring metric {name!r} must be numeric") from error
+        if not np.isfinite(value):
+            raise ValueError(f"episode scoring metric {name!r} must be finite")
     for name, value in list(normalized.items()):
         try:
             scalar = float(value)
@@ -346,14 +357,20 @@ def _validate_completed_row(row: Mapping[str, Any]) -> None:
         or not evidence_is_empty
     ):
         raise ValueError("completed comparator row has an invalid status schema")
+    scoring_names = [
+        *REQUIRED_METRICS,
+        *(
+            name
+            for name in EPISODE_SCORING_METRICS
+            if name not in REQUIRED_METRICS and name in row
+        ),
+    ]
     try:
-        metrics = np.asarray(
-            [float(row[name]) for name in REQUIRED_METRICS], dtype=float
-        )
+        metrics = np.asarray([float(row[name]) for name in scoring_names], dtype=float)
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("completed comparator row has invalid required metrics") from error
+        raise ValueError("completed comparator row has invalid scoring metrics") from error
     if not np.isfinite(metrics).all():
-        raise ValueError("completed comparator row required metrics must be finite")
+        raise ValueError("completed comparator row scoring metrics must be finite")
 
 
 def _valid_readiness(row: Mapping[str, Any], trace_length: int) -> bool:
@@ -575,7 +592,8 @@ def run_unshielded_comparator(
     progress_path = work / "progress.csv"
     work.joinpath("traces").mkdir(parents=True, exist_ok=True)
     resume_rows = _load_rows(progress_path) if resume else []
-    legacy_rows = _load_rows(Path(legacy_progress)) if legacy_progress is not None else []
+    legacy_path = Path(legacy_progress).resolve() if legacy_progress is not None else None
+    legacy_rows = _load_rows(legacy_path)
 
     selected = select_diagnostic_tasks(tasks)
     task_records = [task_from_row(row) for row in selected.itertuples(index=False)]
@@ -685,6 +703,14 @@ def run_unshielded_comparator(
                     except (KeyError, TypeError, ValueError):
                         continue
                     if candidate_key != key or str(candidate.get("split")) != task.split:
+                        continue
+                    if (
+                        str(candidate.get("runtime_source_tree_sha256"))
+                        != runtime_source_tree_sha256
+                        or legacy_path is None
+                        or Path(str(candidate.get("action_trace_path"))).resolve()
+                        != _trace_path(legacy_path.parent, *key)
+                    ):
                         continue
                     if not resume_row_is_complete(
                         candidate,

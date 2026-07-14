@@ -126,7 +126,10 @@ def _inputs(tmp_path: Path, *, failure_modes=(), malformed=None, close_error=Non
             raise RuntimeError(
                 "evaluation episode terminated before configured horizon: step 3 of 10"
             )
-        metrics = {name: float(index + 1) for index, name in enumerate(cli.REQUIRED_METRICS)}
+        metrics = {
+            name: float(index + 1)
+            for index, name in enumerate(cli.EPISODE_SCORING_METRICS)
+        }
         return metrics, {
             "support_ready_step": 1.0,
             "context_norm_mean": 0.5,
@@ -467,6 +470,20 @@ def _progress_path(kwargs) -> Path:
     return root.parent / f".{root.name}.work" / "progress.csv"
 
 
+def _legacy_row(frame: pd.DataFrame) -> pd.DataFrame:
+    row = frame.iloc[[0]].copy()
+    row["EPI"] = 1.0
+    row["revenue"] = 2.0
+    return row.drop(
+        columns=[
+            *cli.STATUS_FIELDS,
+            "action_trace_sha256",
+            "failure_capsule_identity_sha256",
+            "row_identity_sha256",
+        ]
+    )
+
+
 def test_resume_skips_canonical_completed_rows(tmp_path):
     kwargs, calls, _ = _inputs(tmp_path)
     first = cli.run_unshielded_comparator(**kwargs)
@@ -504,6 +521,33 @@ def test_resume_recomputes_completed_row_when_evidence_changes(tmp_path, tamper)
     kwargs["resume"] = True
     cli.run_unshielded_comparator(**kwargs)
 
+    assert calls == [key]
+
+
+def test_resume_recomputes_row_with_nonfinite_optional_scoring_metric(tmp_path):
+    kwargs, calls, _ = _inputs(tmp_path)
+    original = kwargs["episode_runner"]
+
+    def runner(*args, **runner_kwargs):
+        metrics, diagnostics = original(*args, **runner_kwargs)
+        metrics["revenue"] = 2.0
+        return metrics, diagnostics
+
+    kwargs["episode_runner"] = runner
+    cli.run_unshielded_comparator(**kwargs)
+    progress_path = _progress_path(kwargs)
+    progress = pd.read_csv(progress_path)
+    target = progress.iloc[0]
+    key = (int(target.seed), str(target.task_id), str(target.inference_mode))
+    progress.loc[0, "revenue"] = np.inf
+    progress.loc[0, "row_identity_sha256"] = cli._row_identity(
+        progress.iloc[0].to_dict()
+    )
+    progress.to_csv(progress_path, index=False)
+
+    calls.clear()
+    kwargs["resume"] = True
+    cli.run_unshielded_comparator(**kwargs)
     assert calls == [key]
 
 
@@ -618,20 +662,29 @@ def test_checkpoint_steps_must_be_a_nonnegative_exact_integer(tmp_path):
         cli.run_unshielded_comparator(**kwargs)
 
 
+def test_native_success_rejects_nonfinite_optional_scoring_metric(tmp_path):
+    kwargs, _, _ = _inputs(tmp_path)
+
+    def runner(*args, **runner_kwargs):
+        metrics = {name: 1.0 for name in cli.REQUIRED_METRICS}
+        metrics["EPI"] = np.inf
+        return metrics, {
+            "support_ready_step": 1.0,
+            "context_norm_mean": 0.5,
+            "context_norm_max": 1.0,
+            "action_trace": np.ones((3, 2)),
+        }
+
+    kwargs["episode_runner"] = runner
+    with pytest.raises(ValueError, match="scoring metric"):
+        cli.run_unshielded_comparator(**kwargs)
+
+
 def test_legacy_import_copies_valid_trace_and_resigns_identity(tmp_path):
     old, calls, _ = _inputs(tmp_path / "old")
     old_frame = cli.run_unshielded_comparator(**old)
-    legacy = tmp_path / "legacy.csv"
-    legacy_row = old_frame.iloc[[0]].copy()
-    legacy_row["EPI"] = 1.0
-    legacy_row = legacy_row.drop(
-        columns=[
-            *cli.STATUS_FIELDS,
-            "action_trace_sha256",
-            "failure_capsule_identity_sha256",
-            "row_identity_sha256",
-        ]
-    )
+    legacy = _progress_path(old)
+    legacy_row = _legacy_row(old_frame)
     legacy_row.to_csv(legacy, index=False)
     old_trace = Path(old_frame.iloc[0].action_trace_path)
 
@@ -661,21 +714,61 @@ def test_legacy_import_copies_valid_trace_and_resigns_identity(tmp_path):
     assert calls == []
 
 
+def test_legacy_import_rejects_stale_runtime_source_tree(tmp_path):
+    old, _, _ = _inputs(tmp_path / "old")
+    frame = cli.run_unshielded_comparator(**old)
+    legacy = _progress_path(old)
+    row = _legacy_row(frame)
+    row["runtime_source_tree_sha256"] = "f" * 64
+    row.to_csv(legacy, index=False)
+
+    new, calls, _ = _inputs(tmp_path / "new")
+    new["legacy_progress"] = legacy
+    cli.run_unshielded_comparator(**new)
+    assert len(calls) == 32
+
+
+@pytest.mark.parametrize("foreign", ["key", "root"])
+def test_legacy_import_rejects_noncanonical_trace_source(tmp_path, foreign):
+    old, _, _ = _inputs(tmp_path / "old")
+    frame = cli.run_unshielded_comparator(**old)
+    legacy = _progress_path(old)
+    row = _legacy_row(frame)
+    if foreign == "key":
+        foreign_trace = Path(frame.iloc[1].action_trace_path)
+    else:
+        source_trace = Path(frame.iloc[0].action_trace_path)
+        foreign_trace = tmp_path / "foreign-work" / "traces" / source_trace.name
+        foreign_trace.parent.mkdir(parents=True)
+        foreign_trace.write_bytes(source_trace.read_bytes())
+    row.loc[row.index[0], "action_trace_path"] = str(foreign_trace)
+    row.to_csv(legacy, index=False)
+
+    new, calls, _ = _inputs(tmp_path / "new")
+    new["legacy_progress"] = legacy
+    cli.run_unshielded_comparator(**new)
+    assert len(calls) == 32
+
+
+def test_legacy_import_rejects_nonfinite_optional_scoring_metric(tmp_path):
+    old, _, _ = _inputs(tmp_path / "old")
+    frame = cli.run_unshielded_comparator(**old)
+    legacy = _progress_path(old)
+    row = _legacy_row(frame)
+    row["revenue"] = np.inf
+    row.to_csv(legacy, index=False)
+
+    new, calls, _ = _inputs(tmp_path / "new")
+    new["legacy_progress"] = legacy
+    cli.run_unshielded_comparator(**new)
+    assert len(calls) == 32
+
+
 def test_legacy_import_rejects_inferred_or_unproven_rows(tmp_path):
     old, _, _ = _inputs(tmp_path / "old")
     frame = cli.run_unshielded_comparator(**old)
-    legacy = tmp_path / "legacy.csv"
-    invalid = frame.iloc[[0]].copy()
-    invalid["EPI"] = 1.0
-    invalid = invalid.drop(
-        columns=[
-            "inference_mode",
-            *cli.STATUS_FIELDS,
-            "action_trace_sha256",
-            "failure_capsule_identity_sha256",
-            "row_identity_sha256",
-        ]
-    )
+    legacy = _progress_path(old)
+    invalid = _legacy_row(frame).drop(columns=["inference_mode"])
     invalid.to_csv(legacy, index=False)
 
     new, calls, _ = _inputs(tmp_path / "new")
@@ -689,7 +782,7 @@ def test_legacy_import_rejects_non_fail_fast_status_rows(tmp_path):
     old, _, _ = _inputs(tmp_path / "old")
     row = cli.run_unshielded_comparator(**old).iloc[[0]].copy()
     row["EPI"] = 1.0
-    legacy = tmp_path / "legacy.csv"
+    legacy = _progress_path(old)
     row.to_csv(legacy, index=False)
 
     new, calls, _ = _inputs(tmp_path / "new")
