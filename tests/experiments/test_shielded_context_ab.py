@@ -218,6 +218,31 @@ def test_stage2_gate_outcome_mapping_preserves_generic_evidence():
     }
 
 
+def test_comparator_capsule_identity_and_paths_are_protected(tmp_path: Path):
+    failure_root = tmp_path / "capsules"
+    capsule = failure_root / ("a" * 64)
+    capsule.mkdir(parents=True)
+    manifest = capsule / "manifest.json"
+    manifest.write_text("immutable", encoding="utf-8")
+    stage1 = {"report": {"capsule_identity_sha256": "b" * 64, "failure_id": "a" * 64}}
+    evidence = [{"manifest_path": manifest.resolve(), "capsule_dir": capsule.resolve(),
+                 "capsule_identity_sha256": "b" * 64, "failure_id": "a" * 64}]
+    protected = cli._validate_comparator_capsules(evidence, stage1)
+    assert capsule.resolve() in protected
+    for candidate in (capsule, capsule / "inside", failure_root / f".{capsule.name}.stage-token"):
+        with pytest.raises(ValueError, match="disjoint"):
+            cli.validate_output_roots(
+                candidate, tmp_path / "stage2-failures", protected_roots=protected
+            )
+    assert manifest.read_text(encoding="utf-8") == "immutable"
+
+    evidence[0]["capsule_identity_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="Stage-1|identity"):
+        cli._validate_comparator_capsules(evidence, stage1)
+    with pytest.raises(ValueError, match="exactly one"):
+        cli._validate_comparator_capsules([], stage1)
+
+
 @pytest.mark.parametrize("capsule_case", ["bogus", "mismatch"])
 def test_comparator_rejects_bogus_or_mismatched_failure_capsule(
     tmp_path: Path, capsule_case: str
@@ -293,7 +318,7 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
     tasks_path = source / "tasks.csv"
     manifest_path.write_text("{}", encoding="utf-8")
     tasks_path.write_text("task_id\n", encoding="utf-8")
-    stage = {"root": tmp_path / "stage1", "report": {"capsule_identity_sha256": "4" * 64}, "selected_lambda": 0.0625,
+    stage = {"root": tmp_path / "stage1", "report": {"capsule_identity_sha256": "4" * 64, "failure_id": "f" * 64}, "selected_lambda": 0.0625,
              "stage1_results_sha256": "1" * 64, "stage1_states_sha256": "2" * 64,
              "stage1_decision_sha256": "3" * 64}
     stage["root"].mkdir()
@@ -307,10 +332,23 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
           "temp_violation": 1.0, "co2_violation": 1.0, "rh_violation": 1.0}
          for seed in cli.APPROVED_SEEDS for task in cli.DIAGNOSTIC_TASK_IDS for mode in cli.MODES]
     )
-    monkeypatch.setattr(cli, "load_unshielded_comparator", lambda *args, **kwargs: (unshielded, {}))
     unshielded_root = tmp_path / "unshielded"
     unshielded_root.mkdir()
     (unshielded_root / "diagnostic_manifest.json").write_text("{}", encoding="utf-8")
+    fake_capsule = unshielded_root / ("f" * 64)
+    fake_capsule.mkdir()
+    fake_manifest = fake_capsule / "manifest.json"
+    fake_manifest.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "load_unshielded_comparator",
+        lambda *args, **kwargs: (
+            unshielded,
+            {},
+            [{"manifest_path": fake_manifest, "capsule_dir": fake_capsule,
+              "capsule_identity_sha256": "4" * 64, "failure_id": "f" * 64}],
+        ),
+    )
     suite = SimpleNamespace(suite_id="suite", result_root=str(source), env_id="Fake")
     tasks = pd.DataFrame([
         {"suite_id": "suite", "task_id": task, "split": task.split("_", 1)[0],
@@ -425,6 +463,24 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
         recorder_factory=lambda root, context: object(),
     )
     assert len(calls) == 1
+
+    for trace_column in ("requested_action_trace_path", "executed_action_trace_path"):
+        refreshed = pd.read_csv(progress_path)
+        trace_path = Path(refreshed.loc[0, trace_column])
+        altered = np.load(trace_path, allow_pickle=False)
+        altered[0, 0] = np.float32(0.25)
+        np.save(trace_path, altered, allow_pickle=False)
+        calls.clear()
+        cli.run_shielded_diagnostic(
+            suite=suite, tasks=tasks, runs=runs, source_manifest=manifest_path,
+            source_tasks_csv=tasks_path, stage1_root=stage["root"],
+            unshielded_result_root=unshielded_root, result_root=tmp_path / "shielded",
+            failure_root=tmp_path / "failures", device="cpu", resume=True,
+            model_loader=lambda path, device: Model(), env_loader=env_loader,
+            episode_runner=episode_runner, provenance_loader=lambda: provenance,
+            recorder_factory=lambda root, context: object(),
+        )
+        assert len(calls) == 1
 
     refreshed = pd.read_csv(progress_path)
     Path(refreshed.loc[0, "requested_action_trace_path"]).write_bytes(b"corrupt")

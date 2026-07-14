@@ -317,6 +317,35 @@ def _stage2_decision(gate: Mapping[str, Any]) -> dict[str, Any]:
     return decision
 
 
+def _validate_comparator_capsules(
+    evidence: list[Mapping[str, Any]], stage1: Mapping[str, Any]
+) -> list[Path]:
+    unique: dict[tuple[str, str, Path], Mapping[str, Any]] = {}
+    for item in evidence:
+        capsule_dir = Path(item["capsule_dir"]).resolve()
+        key = (
+            str(item["capsule_identity_sha256"]),
+            str(item["failure_id"]),
+            capsule_dir,
+        )
+        unique[key] = item
+    if len(unique) != 1:
+        raise ValueError("comparator must load exactly one unique known failure capsule")
+    (identity, failure_id, capsule_dir), _ = next(iter(unique.items()))
+    report = stage1["report"]
+    if (
+        identity != report.get("capsule_identity_sha256")
+        or failure_id != report.get("failure_id")
+    ):
+        raise ValueError("comparator capsule identity/failure_id does not match Stage-1")
+    protected = [capsule_dir]
+    common_failure_root = capsule_dir.parent
+    anchor = Path(common_failure_root.anchor)
+    if common_failure_root != anchor and common_failure_root.parent != common_failure_root:
+        protected.append(common_failure_root)
+    return protected
+
+
 def validate_stage1_provenance(
     stage1: Mapping[str, Any],
     *,
@@ -371,7 +400,7 @@ def load_unshielded_comparator(
     expected_provenance: Mapping[str, Any],
     expected_checkpoints: Mapping[int, Mapping[str, str]] | None = None,
     capsule_loader: Callable[[str | Path], Any] = load_failure_capsule,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
+) -> tuple[pd.DataFrame, dict[str, Any], list[dict[str, Any]]]:
     """Load an immutable exact-key unshielded comparator, never rerunning it."""
 
     directory = Path(root).resolve()
@@ -389,6 +418,7 @@ def load_unshielded_comparator(
         if name not in manifest or manifest[name] != expected:
             raise ValueError(f"unshielded comparator provenance mismatch: {name}")
     table = pd.read_csv(raw_path)
+    capsule_evidence: list[dict[str, Any]] = []
     key_columns = ["seed", "task_id", "inference_mode"]
     if any(column not in table for column in key_columns):
         raise ValueError("unshielded comparator is missing key columns")
@@ -473,7 +503,15 @@ def load_unshielded_comparator(
             identity_matches = identity_matches and expected_provenance.get(name) in source_values
         if not identity_matches:
             raise ValueError("failure capsule identity/provenance does not match comparator row")
-    return table, manifest
+        capsule_evidence.append(
+            {
+                "manifest_path": evidence_path,
+                "capsule_dir": Path(capsule.path).resolve(),
+                "capsule_identity_sha256": capsule.manifest.get("content_identity_sha256"),
+                "failure_id": capsule.manifest.get("failure_id"),
+            }
+        )
+    return table, manifest, capsule_evidence
 
 
 def _trace_paths(root: Path, seed: int, task_id: str, mode: str) -> tuple[Path, Path, Path]:
@@ -492,6 +530,55 @@ def _json_records(path: Path) -> list[dict[str, Any]]:
     return value
 
 
+def _validate_trace_record_consistency(
+    executed_value: Any,
+    requested_value: Any,
+    raw_records: Any,
+    *,
+    decorate_steps: bool,
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
+    executed = np.asarray(executed_value, dtype=np.float32)
+    requested = np.asarray(requested_value, dtype=np.float32)
+    if (
+        executed.ndim != 2
+        or executed.shape[0] == 0
+        or executed.shape[1] == 0
+        or executed.shape != requested.shape
+        or not np.isfinite(executed).all()
+        or not np.isfinite(requested).all()
+    ):
+        raise ValueError("executed/requested action traces must be matching finite 2D arrays")
+    if not isinstance(raw_records, list) or len(raw_records) != executed.shape[0]:
+        raise ValueError("action_shield_records must contain one record per executed step")
+    records: list[dict[str, Any]] = []
+    for step, record in enumerate(raw_records):
+        if not isinstance(record, Mapping):
+            raise TypeError("each action shield record must be a mapping")
+        detached = dict(record)
+        if "step_index" in detached and detached["step_index"] != step:
+            raise ValueError("action shield step_index is inconsistent")
+        if decorate_steps:
+            detached["step_index"] = step
+        elif detached.get("step_index") != step:
+            raise ValueError("resumed action shield step_index is missing or inconsistent")
+        try:
+            record_executed = np.asarray(detached["executed_action"], dtype=np.float32)
+            record_requested = np.asarray(detached["requested_action"], dtype=np.float32)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("action shield record actions must be numeric vectors") from error
+        if (
+            record_executed.shape != (executed.shape[1],)
+            or record_requested.shape != (requested.shape[1],)
+            or not np.isfinite(record_executed).all()
+            or not np.isfinite(record_requested).all()
+            or not np.array_equal(executed[step], record_executed)
+            or not np.array_equal(requested[step], record_requested)
+        ):
+            raise ValueError("action traces must exactly match each shield record")
+        records.append(detached)
+    return executed, requested, records
+
+
 def resume_row_is_complete(row: Mapping[str, Any], *, expected: Mapping[str, Any], work_root: Path) -> bool:
     required = {"seed", "task_id", "inference_mode", "checkpoint_steps", "completed", "executed_action_trace_path", "requested_action_trace_path", "intervention_records_path", "method", *HASH_FIELDS, *REQUIRED_METRICS}
     completed_value = row.get("completed")
@@ -508,11 +595,12 @@ def resume_row_is_complete(row: Mapping[str, Any], *, expected: Mapping[str, Any
         paths = [Path(str(row[name])).resolve() for name in ("executed_action_trace_path", "requested_action_trace_path", "intervention_records_path")]
         if any(not path.is_relative_to(work_root.resolve()) for path in paths):
             return False
-        executed = np.load(paths[0], allow_pickle=False)
-        requested = np.load(paths[1], allow_pickle=False)
-        records = _json_records(paths[2])
-        if executed.ndim != 2 or executed.shape != requested.shape or executed.shape[0] != len(records) or not np.isfinite(executed).all() or not np.isfinite(requested).all():
-            return False
+        executed, requested, records = _validate_trace_record_consistency(
+            np.load(paths[0], allow_pickle=False),
+            np.load(paths[1], allow_pickle=False),
+            _json_records(paths[2]),
+            decorate_steps=False,
+        )
         summary = aggregate_episode_interventions(records, executed.shape[1])
         for name, value in summary.items():
             observed = row[name]
@@ -545,36 +633,12 @@ def _strict_diagnostics(diagnostics: Mapping[str, Any]) -> tuple[np.ndarray, np.
     missing = {"action_trace", "requested_action_trace", "action_shield_records"}.difference(diagnostics)
     if missing:
         raise KeyError(f"shielded episode diagnostics are missing: {sorted(missing)}")
-    executed = np.asarray(diagnostics.pop("action_trace"), dtype=np.float32)
-    requested = np.asarray(diagnostics.pop("requested_action_trace"), dtype=np.float32)
+    executed_value = diagnostics.pop("action_trace")
+    requested_value = diagnostics.pop("requested_action_trace")
     raw_records = diagnostics.pop("action_shield_records")
-    if executed.ndim != 2 or executed.shape[0] == 0 or executed.shape[1] == 0 or executed.shape != requested.shape or not np.isfinite(executed).all() or not np.isfinite(requested).all():
-        raise ValueError("executed/requested action traces must be matching finite 2D arrays")
-    if not isinstance(raw_records, list) or len(raw_records) != executed.shape[0]:
-        raise ValueError("action_shield_records must contain one record per executed step")
-    records: list[dict[str, Any]] = []
-    for step, record in enumerate(raw_records):
-        if not isinstance(record, Mapping):
-            raise TypeError("each action shield record must be a mapping")
-        detached = dict(record)
-        if "step_index" in detached and detached["step_index"] != step:
-            raise ValueError("action shield step_index is inconsistent")
-        detached["step_index"] = step
-        try:
-            record_executed = np.asarray(detached["executed_action"], dtype=np.float32)
-            record_requested = np.asarray(detached["requested_action"], dtype=np.float32)
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError("action shield record actions must be numeric vectors") from error
-        if (
-            record_executed.shape != (executed.shape[1],)
-            or record_requested.shape != (requested.shape[1],)
-            or not np.isfinite(record_executed).all()
-            or not np.isfinite(record_requested).all()
-            or not np.array_equal(executed[step], record_executed)
-            or not np.array_equal(requested[step], record_requested)
-        ):
-            raise ValueError("action traces must exactly match each shield record")
-        records.append(detached)
+    executed, requested, records = _validate_trace_record_consistency(
+        executed_value, requested_value, raw_records, decorate_steps=True
+    )
     normalized: dict[str, Any] = {}
     reserved = {"seed", "task_id", "inference_mode", "method", *HASH_FIELDS}
     if reserved.intersection(diagnostics):
@@ -626,16 +690,11 @@ def run_shielded_diagnostic(
         source_tasks_csv=source_tasks_csv, evaluation_provenance=evaluation,
         rule_config_sha256=rule_sha, env_config_sha256=env_sha,
     )
-    root, capsule_root = validate_output_roots(
-        result_root, failure_root,
-        protected_roots=[suite.result_root, stage1["root"], unshielded_result_root],
-    )
-    output_topology = _capture_output_topology(root)
     comparator_provenance = {
         name: evaluation[name]
         for name in ("source_manifest_sha256", "source_tasks_sha256", "git_commit", "dirty", "evaluation_provenance_sha256")
     }
-    unshielded, unshielded_manifest = load_unshielded_comparator(
+    unshielded, unshielded_manifest, comparator_capsules = load_unshielded_comparator(
         unshielded_result_root, expected_provenance=comparator_provenance,
         expected_checkpoints={
             int(run["seed"]): {
@@ -646,6 +705,19 @@ def run_shielded_diagnostic(
             for run in runs
         },
     )
+    capsule_protected_roots = _validate_comparator_capsules(
+        comparator_capsules, stage1
+    )
+    root, capsule_root = validate_output_roots(
+        result_root, failure_root,
+        protected_roots=[
+            suite.result_root,
+            stage1["root"],
+            unshielded_result_root,
+            *capsule_protected_roots,
+        ],
+    )
+    output_topology = _capture_output_topology(root)
     selected = select_diagnostic_tasks(tasks)
     task_records = [task_from_row(row) for row in selected.itertuples(index=False)]
     fingerprint_payload = {
