@@ -408,7 +408,7 @@ def test_post_commit_backup_cleanup_failure_is_best_effort(monkeypatch, tmp_path
     real_rmtree(backups[0])
 
 
-def test_failed_publish_never_deletes_only_backup_when_restore_also_fails(monkeypatch, tmp_path):
+def test_failed_publish_uses_copy_fallback_when_atomic_restore_also_fails(monkeypatch, tmp_path):
     raw, paired, interventions = _artifact_frames()
     root = tmp_path / "shield"
     root.mkdir()
@@ -418,20 +418,54 @@ def test_failed_publish_never_deletes_only_backup_when_restore_also_fails(monkey
     def fail_publish_and_restore(source, destination):
         source_path = Path(source)
         destination_path = Path(destination)
-        if destination_path == root and (
-            ".stage-" in source_path.name or ".backup-" in source_path.name
-        ):
-            raise OSError("injected replace failure")
+        if destination_path == root and ".stage-" in source_path.name:
+            raise OSError("injected publication failure")
+        if destination_path == root and ".backup-" in source_path.name:
+            raise OSError("injected atomic restoration failure")
         return real_replace(source, destination)
 
     monkeypatch.setattr(shield_module.os, "replace", fail_publish_and_restore)
-    with pytest.raises(OSError, match="injected"):
+    with pytest.raises(OSError, match="injected publication failure") as captured:
+        write_shield_artifacts_atomic(raw, paired, interventions, {}, {}, root)
+
+    backups = [path for path in tmp_path.iterdir() if ".backup-" in path.name]
+    assert set(path.name for path in root.iterdir()) == {"old.txt"}
+    assert (root / "old.txt").read_text(encoding="utf-8") == "old"
+    assert backups == []
+    assert any("atomic backup rename restoration failed" in note for note in captured.value.__notes__)
+
+
+def test_failed_fallback_copy_preserves_backup_and_annotates_primary_error(monkeypatch, tmp_path):
+    raw, paired, interventions = _artifact_frames()
+    root = tmp_path / "shield"
+    root.mkdir()
+    (root / "old.txt").write_text("old", encoding="utf-8")
+    real_replace = shield_module.os.replace
+
+    def fail_publish_and_restore(source, destination):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if destination_path == root and ".stage-" in source_path.name:
+            raise OSError("injected publication failure")
+        if destination_path == root and ".backup-" in source_path.name:
+            raise OSError("injected atomic restoration failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(shield_module.os, "replace", fail_publish_and_restore)
+    monkeypatch.setattr(
+        shield_module.shutil,
+        "copytree",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("injected fallback copy failure")),
+    )
+    with pytest.raises(OSError, match="injected publication failure") as captured:
         write_shield_artifacts_atomic(raw, paired, interventions, {}, {}, root)
 
     backups = [path for path in tmp_path.iterdir() if ".backup-" in path.name]
     assert not root.exists()
     assert len(backups) == 1
     assert (backups[0] / "old.txt").read_text(encoding="utf-8") == "old"
+    assert any("atomic backup rename restoration failed" in note for note in captured.value.__notes__)
+    assert any("fallback copy restoration failed" in note for note in captured.value.__notes__)
 
 
 def test_atomic_writer_rejects_empty_nonfinite_duplicates_and_file_root(tmp_path):

@@ -519,6 +519,84 @@ def _json_safe(value: Any) -> Any:
     raise TypeError(f"value of type {type(value).__name__} is not JSON-safe")
 
 
+def _directory_trees_equal(source: Path, restored: Path) -> bool:
+    source_entries = {path.relative_to(source): path for path in source.rglob("*")}
+    restored_entries = {path.relative_to(restored): path for path in restored.rglob("*")}
+    if set(source_entries) != set(restored_entries):
+        return False
+    for relative_path, source_path in source_entries.items():
+        restored_path = restored_entries[relative_path]
+        if source_path.is_symlink() != restored_path.is_symlink():
+            return False
+        if source_path.is_symlink():
+            if os.readlink(source_path) != os.readlink(restored_path):
+                return False
+        elif source_path.is_dir() != restored_path.is_dir():
+            return False
+        elif source_path.is_file():
+            if not restored_path.is_file():
+                return False
+            if source_path.stat().st_size != restored_path.stat().st_size:
+                return False
+            with source_path.open("rb") as source_handle, restored_path.open("rb") as restored_handle:
+                while True:
+                    source_chunk = source_handle.read(1024 * 1024)
+                    restored_chunk = restored_handle.read(1024 * 1024)
+                    if source_chunk != restored_chunk:
+                        return False
+                    if not source_chunk:
+                        break
+        else:
+            return False
+    return True
+
+
+def _restore_prior_root(
+    backup: Path,
+    root: Path,
+    publication_error: BaseException,
+) -> bool:
+    try:
+        os.replace(backup, root)
+    except Exception as restoration_error:
+        publication_error.add_note(
+            "atomic backup rename restoration failed: "
+            f"{type(restoration_error).__name__}: {restoration_error}"
+        )
+    else:
+        return True
+
+    try:
+        if root.exists():
+            raise RuntimeError("result_root unexpectedly exists before fallback copy")
+        shutil.copytree(backup, root, copy_function=shutil.copy2, symlinks=True)
+        if not _directory_trees_equal(backup, root):
+            raise OSError("fallback copy verification did not match the backup tree")
+    except Exception as fallback_error:
+        publication_error.add_note(
+            "fallback copy restoration failed; sole backup preserved: "
+            f"{type(fallback_error).__name__}: {fallback_error}"
+        )
+        if root.exists():
+            try:
+                shutil.rmtree(root)
+            except Exception as cleanup_error:
+                publication_error.add_note(
+                    "partial fallback root cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        return False
+
+    try:
+        shutil.rmtree(backup)
+    except Exception as cleanup_error:
+        publication_error.add_note(
+            "verified fallback restored result_root but stale backup cleanup failed: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+    return True
+
+
 def write_shield_artifacts_atomic(
     raw: pd.DataFrame,
     paired: pd.DataFrame,
@@ -559,9 +637,9 @@ def write_shield_artifacts_atomic(
         try:
             os.replace(stage, root)
             published = True
-        except BaseException:
+        except BaseException as publication_error:
             if old_moved:
-                os.replace(backup, root)
+                _restore_prior_root(backup, root, publication_error)
                 old_moved = False
             raise
         if old_moved:
