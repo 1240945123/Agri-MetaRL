@@ -698,6 +698,63 @@ def test_checkpoint_steps_must_be_a_nonnegative_exact_integer(tmp_path):
         cli.run_unshielded_comparator(**kwargs)
 
 
+@pytest.mark.parametrize("value", [True, np.bool_(True)])
+def test_checkpoint_steps_reject_boolean_values(value):
+    with pytest.raises(ValueError, match="checkpoint steps"):
+        cli._checkpoint_steps(SimpleNamespace(num_timesteps=value))
+
+
+def test_checkpoint_steps_preserve_large_integer_exactly():
+    value = 9_007_199_254_740_993
+    assert cli._checkpoint_steps(SimpleNamespace(num_timesteps=value)) == value
+
+
+def test_runtime_fingerprint_includes_comparator_and_context_runner(tmp_path):
+    source = tmp_path / "src" / "gl_gym"
+    scripts = tmp_path / "experiments" / "scripts"
+    source.mkdir(parents=True)
+    scripts.mkdir(parents=True)
+    (source / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+    comparator = scripts / "run_unshielded_context_comparator.py"
+    context_runner = scripts / "run_context_ab.py"
+    comparator.write_text("COMPARATOR = 1\n", encoding="utf-8")
+    context_runner.write_text("CONTEXT = 1\n", encoding="utf-8")
+
+    original = cli._runtime_source_tree_sha256(tmp_path)
+    comparator.write_text("COMPARATOR = 2\n", encoding="utf-8")
+    comparator_changed = cli._runtime_source_tree_sha256(tmp_path)
+    comparator.write_text("COMPARATOR = 1\n", encoding="utf-8")
+    context_runner.write_text("CONTEXT = 2\n", encoding="utf-8")
+    context_changed = cli._runtime_source_tree_sha256(tmp_path)
+
+    assert original != comparator_changed
+    assert original != context_changed
+
+
+@pytest.mark.parametrize("lifecycle", ["resume", "legacy"])
+def test_runtime_entrypoint_change_makes_saved_evidence_stale(
+    tmp_path, monkeypatch, lifecycle
+):
+    fingerprint = ["a" * 64]
+    monkeypatch.setattr(cli, "_runtime_source_tree_sha256", lambda: fingerprint[0])
+    old, calls, _ = _inputs(tmp_path / "old")
+    old_frame = cli.run_unshielded_comparator(**old)
+    calls.clear()
+    fingerprint[0] = "b" * 64
+
+    if lifecycle == "resume":
+        old["resume"] = True
+        cli.run_unshielded_comparator(**old)
+    else:
+        legacy = _progress_path(old)
+        _legacy_row(old_frame).to_csv(legacy, index=False)
+        new, calls, _ = _inputs(tmp_path / "new")
+        new["legacy_progress"] = legacy
+        cli.run_unshielded_comparator(**new)
+
+    assert len(calls) == 32
+
+
 def test_native_success_rejects_nonfinite_optional_scoring_metric(tmp_path):
     kwargs, _, _ = _inputs(tmp_path)
 

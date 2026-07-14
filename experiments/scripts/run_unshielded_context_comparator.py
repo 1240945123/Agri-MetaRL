@@ -7,6 +7,7 @@ import argparse
 from dataclasses import asdict
 import hashlib
 import json
+from numbers import Integral
 from pathlib import Path
 import re
 import shutil
@@ -151,12 +152,36 @@ def _attempt_root(failure_work: Path, seed: int, task_id: str, mode: str) -> Pat
 
 
 def _runtime_source_tree_sha256(root: str | Path = ROOT) -> str:
-    """Fingerprint every regular Python module used from the runtime source tree."""
+    """Fingerprint all repository Python code directly used by this comparator."""
 
-    source_root = Path(root).resolve() / "src" / "gl_gym"
-    if not source_root.is_dir() or source_root.is_symlink():
-        raise ValueError("runtime source tree must be a regular directory")
+    repository = Path(root).expanduser().absolute()
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+    def require_directory(path: Path) -> None:
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or getattr(metadata, "st_file_attributes", 0) & reparse_flag
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise ValueError(f"runtime source directory must be regular: {path}")
+
+    def require_file(path: Path) -> None:
+        for parent in (repository, *reversed(path.parents)):
+            if parent == repository or repository in parent.parents:
+                require_directory(parent)
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or getattr(metadata, "st_file_attributes", 0) & reparse_flag
+            or not stat.S_ISREG(metadata.st_mode)
+        ):
+            raise ValueError(f"runtime Python source must be a regular file: {path}")
+
+    require_directory(repository)
+    source_root = repository / "src" / "gl_gym"
+    require_directory(repository / "src")
+    require_directory(source_root)
     files: list[tuple[str, Path]] = []
     for path in source_root.rglob("*"):
         metadata = path.lstat()
@@ -165,7 +190,14 @@ def _runtime_source_tree_sha256(root: str | Path = ROOT) -> str:
         if path.suffix == ".py":
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError(f"runtime Python source must be a regular file: {path}")
-            files.append((path.relative_to(source_root).as_posix(), path))
+            files.append((path.relative_to(repository).as_posix(), path))
+    for relative in (
+        "experiments/scripts/run_unshielded_context_comparator.py",
+        "experiments/scripts/run_context_ab.py",
+    ):
+        path = repository / relative
+        require_file(path)
+        files.append((relative, path))
     if not files:
         raise ValueError("runtime source tree contains no Python files")
     digest = hashlib.sha256()
@@ -300,12 +332,15 @@ def _finite_metrics(metrics: Any) -> dict[str, Any]:
 
 def _checkpoint_steps(model: Any) -> int:
     try:
-        value = float(model.num_timesteps)
-    except (AttributeError, TypeError, ValueError) as error:
+        value = model.num_timesteps
+    except AttributeError as error:
         raise ValueError("checkpoint steps must be a nonnegative exact integer") from error
-    if not np.isfinite(value) or not value.is_integer() or value < 0:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
         raise ValueError("checkpoint steps must be a nonnegative exact integer")
-    return int(value)
+    exact = int(value)
+    if exact < 0:
+        raise ValueError("checkpoint steps must be a nonnegative exact integer")
+    return exact
 
 
 def _success_diagnostics(
