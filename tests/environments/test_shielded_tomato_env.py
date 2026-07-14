@@ -282,6 +282,157 @@ def test_retry_uses_fixed_order_fresh_integrators_and_reuses_selected_state(
     assert record["intervention_l1"] >= record["intervention_l2"] >= record["intervention_linf"]
 
 
+class ExplodingArray:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def __array__(self, dtype=None):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    ("candidate_result", "expected_type", "message"),
+    [
+        ({}, KeyError, "xf"),
+        ({"xf": np.zeros(2)}, ValueError, "exact shape"),
+        ({"xf": np.array([1.0, np.nan, 3.0])}, ValueError, "finite"),
+        (
+            {"xf": ExplodingArray(TypeError("conversion exploded"))},
+            TypeError,
+            "conversion exploded",
+        ),
+    ],
+)
+def test_candidate_post_call_output_error_stops_projection_and_keeps_priority(
+    shield_env, monkeypatch, candidate_result, expected_type, message
+) -> None:
+    from gl_gym.environments import shielded_tomato_env as module
+
+    monkeypatch.setattr(module, "parametric_crop_uncertainty", lambda p, scale, rng: p.copy())
+    shield_env.F = Integrator(RuntimeError("original solver failure"))
+    factory_calls = []
+
+    class MalformedOutputIntegrator:
+        def __call__(self, **kwargs):
+            return candidate_result
+
+    def factory(**kwargs):
+        factory_calls.append(kwargs)
+        return MalformedOutputIntegrator()
+
+    monkeypatch.setattr(module, "define_model", factory)
+
+    with pytest.raises(expected_type, match=message):
+        shield_env.step(np.zeros(2))
+
+    assert len(factory_calls) == 1
+    assert shield_env.timestep == 1
+    assert shield_env.reward.calls == 0
+
+
+def test_candidate_input_conversion_error_is_not_solver_infeasibility(
+    shield_env, monkeypatch
+) -> None:
+    from gl_gym.environments import shielded_tomato_env as module
+
+    monkeypatch.setattr(module, "parametric_crop_uncertainty", lambda p, scale, rng: p.copy())
+    conversion_error = TypeError("candidate input conversion failed")
+    original_dm = module.ca.DM
+
+    class OriginalThatBreaksLaterConversion:
+        def __call__(self, **kwargs):
+            monkeypatch.setattr(
+                module.ca,
+                "DM",
+                lambda value: (_ for _ in ()).throw(conversion_error),
+            )
+            raise RuntimeError("original solver failure")
+
+    shield_env.F = OriginalThatBreaksLaterConversion()
+    candidate_calls = []
+    monkeypatch.setattr(
+        module,
+        "define_model",
+        lambda **kwargs: Integrator(lambda call: candidate_calls.append(call) or [4, 5, 6]),
+    )
+
+    with pytest.raises(TypeError) as raised:
+        shield_env.step(np.zeros(2))
+
+    assert raised.value is conversion_error
+    assert candidate_calls == []
+    monkeypatch.setattr(module.ca, "DM", original_dm)
+
+
+def test_successful_recovery_discards_external_rng_draws_after_single_sample(
+    shield_env, monkeypatch
+) -> None:
+    from gl_gym.environments import shielded_tomato_env as module
+
+    external_draws = []
+
+    def sample_once(p, scale, rng):
+        rng.random()
+        return p.copy()
+
+    monkeypatch.setattr(module, "parametric_crop_uncertainty", sample_once)
+
+    class RngConsumingOriginal:
+        def __call__(self, **kwargs):
+            external_draws.append(("original", shield_env._np_random.random()))
+            raise RuntimeError("original solver failure")
+
+    class RngConsumingController:
+        def predict(self, x, d, env):
+            external_draws.append(("reference", env._np_random.random()))
+            return env.u.copy()
+
+    shield_env.F = RngConsumingOriginal()
+    shield_env.action_shield_controller = RngConsumingController()
+    candidate_index = 0
+
+    def factory(**kwargs):
+        nonlocal candidate_index
+        index = candidate_index
+        candidate_index += 1
+        external_draws.append(
+            (f"factory-{index}", shield_env._np_random.random())
+        )
+
+        class RngConsumingCandidate:
+            def __call__(self, **call_kwargs):
+                external_draws.append(
+                    (f"candidate-{index}", shield_env._np_random.random())
+                )
+                if index == 0:
+                    raise RuntimeError("first candidate failed")
+                return {"xf": ca.DM([20.0, 21.0, 22.0])}
+
+        return RngConsumingCandidate()
+
+    monkeypatch.setattr(module, "define_model", factory)
+    control_rng = np.random.default_rng(123)
+    control_rng.random()
+    expected_rng_state = deepcopy(control_rng.bit_generator.state)
+    expected_external_draw = control_rng.random()
+
+    shield_env.step(np.zeros(2))
+
+    assert shield_env._np_random.bit_generator.state == expected_rng_state
+    assert [name for name, _ in external_draws] == [
+        "original",
+        "reference",
+        "factory-0",
+        "candidate-0",
+        "factory-1",
+        "candidate-1",
+    ]
+    np.testing.assert_allclose(
+        [value for _, value in external_draws],
+        [expected_external_draw] * len(external_draws),
+    )
+
+
 def test_recovered_diagnostics_keep_original_failure_and_committed_observation(
     shield_env, monkeypatch
 ) -> None:

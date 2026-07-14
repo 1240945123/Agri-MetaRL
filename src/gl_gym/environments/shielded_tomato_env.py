@@ -30,6 +30,14 @@ class _ConstructionFailure(BaseException):
         self.error = error
 
 
+class _PostCallFailure(BaseException):
+    """Carry a post-integrator error through the projection exception boundary."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.error_traceback = error.__traceback__
+
+
 class ShieldedTomatoEnv(TomatoEnv):
     """A distinct evaluation environment that shields solver-failing actions."""
 
@@ -96,6 +104,9 @@ class ShieldedTomatoEnv(TomatoEnv):
         )
         if restore_rng:
             self._np_random.bit_generator.state = deepcopy(snapshot["rng"])
+
+    def _restore_rng(self, state: dict[str, Any]) -> None:
+        self._np_random.bit_generator.state = deepcopy(state)
 
     def _state_from_result(self, result: Any) -> np.ndarray:
         raw_state = result["xf"]
@@ -183,26 +194,32 @@ class ShieldedTomatoEnv(TomatoEnv):
                 name="requested control",
                 size=self.nu,
             )
+            raw_sampled_parameters = parametric_crop_uncertainty(
+                self.p, self.uncertainty_scale, self._np_random
+            )
+            post_sample_rng = deepcopy(self._np_random.bit_generator.state)
             sampled_parameters = self._vector(
-                parametric_crop_uncertainty(
-                    self.p, self.uncertainty_scale, self._np_random
-                ),
+                raw_sampled_parameters,
                 name="sampled parameters",
                 size=self.num_params,
             )
             p_dyn = ca.vertcat(ca.DM(weather), sampled_parameters)
+            x0_input = ca.DM(x0)
+            requested_control_input = ca.DM(requested_control)
 
             original_error: Exception | None = None
             original_traceback: str | None = None
+            self._restore_rng(post_sample_rng)
             try:
                 result = self.F(
-                    x0=ca.DM(x0), u=ca.DM(requested_control), p=p_dyn
+                    x0=x0_input, u=requested_control_input, p=p_dyn
                 )
             except Exception as error:
                 original_error = error
                 original_traceback = traceback.format_exc()
                 # A failed foreign integrator must not contaminate recovery inputs.
                 self._restore(snapshot, restore_rng=False)
+                self._restore_rng(post_sample_rng)
             else:
                 # Malformed solver output is a construction/programming error,
                 # not evidence that the requested action is infeasible.
@@ -215,6 +232,7 @@ class ShieldedTomatoEnv(TomatoEnv):
                 selected_lambda = 0.0
                 attempts: tuple[CandidateAttempt, ...] = ()
             else:
+                self._restore_rng(post_sample_rng)
                 target = self._vector(
                     self.action_shield_controller.predict(
                         x0.copy(), weather.copy(), self
@@ -223,6 +241,7 @@ class ShieldedTomatoEnv(TomatoEnv):
                     size=self.nu,
                 )
                 self._restore(snapshot, restore_rng=False)
+                self._restore_rng(post_sample_rng)
                 reference_action = control_to_reference_action(
                     target, previous_control, self.delta_u_max
                 )
@@ -231,19 +250,25 @@ class ShieldedTomatoEnv(TomatoEnv):
                 def integrate(candidate_action: np.ndarray) -> np.ndarray:
                     try:
                         self._restore(snapshot, restore_rng=False)
+                        self._restore_rng(post_sample_rng)
                         candidate_control = self._vector(
                             self.action_to_control(candidate_action),
                             name="candidate control",
                             size=self.nu,
                         )
                         candidate_controls.append(candidate_control.copy())
+                        candidate_control_input = ca.DM(candidate_control)
                         integrator = self._fresh_integrator()
                     except Exception as construction_error:
                         raise _ConstructionFailure(construction_error) from None
+                    self._restore_rng(post_sample_rng)
                     result = integrator(
-                        x0=ca.DM(x0), u=ca.DM(candidate_control), p=p_dyn
+                        x0=x0_input, u=candidate_control_input, p=p_dyn
                     )
-                    return self._state_from_result(result)
+                    try:
+                        return self._state_from_result(result)
+                    except Exception as post_call_error:
+                        raise _PostCallFailure(post_call_error) from None
 
                 try:
                     projection = project_first_feasible(
@@ -254,6 +279,8 @@ class ShieldedTomatoEnv(TomatoEnv):
                     )
                 except _ConstructionFailure as failure:
                     raise failure.error
+                except _PostCallFailure as failure:
+                    raise failure.error.with_traceback(failure.error_traceback) from None
                 attempts = projection.attempts
                 if projection.selected is None or projection.final_state is None:
                     exhausted = RuntimeError(
@@ -271,6 +298,7 @@ class ShieldedTomatoEnv(TomatoEnv):
                 final_state = np.array(projection.final_state, copy=True)
 
             self._restore(snapshot, restore_rng=False)
+            self._restore_rng(post_sample_rng)
             self.x = final_state
             self.u = executed_control
             self.day_of_year += (self.dt / self.c) % 365
