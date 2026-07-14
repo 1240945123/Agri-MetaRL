@@ -28,6 +28,7 @@ class _ConstructionFailure(BaseException):
 
     def __init__(self, error: Exception) -> None:
         self.error = error
+        self.error_traceback = error.__traceback__
 
 
 class _PostCallFailure(BaseException):
@@ -90,6 +91,7 @@ class ShieldedTomatoEnv(TomatoEnv):
             "fields": {name: deepcopy(getattr(self, name)) for name in fields},
             "reward": reward_state,
             "rng": deepcopy(self._np_random.bit_generator.state),
+            "F": self.F,
         }
 
     def _restore(self, snapshot: dict[str, Any], *, restore_rng: bool = True) -> None:
@@ -104,9 +106,26 @@ class ShieldedTomatoEnv(TomatoEnv):
         )
         if restore_rng:
             self._np_random.bit_generator.state = deepcopy(snapshot["rng"])
+        self.F = snapshot["F"]
 
     def _restore_rng(self, state: dict[str, Any]) -> None:
         self._np_random.bit_generator.state = deepcopy(state)
+
+    @classmethod
+    def _detach_payload(cls, value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            return np.array(value, copy=True)
+        if isinstance(value, Mapping):
+            return {key: cls._detach_payload(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._detach_payload(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._detach_payload(item) for item in value)
+        if isinstance(value, set):
+            return {cls._detach_payload(item) for item in value}
+        if value is None or isinstance(value, (str, bytes, bool, int, float)):
+            return value
+        return deepcopy(value)
 
     def _state_from_result(self, result: Any) -> np.ndarray:
         raw_state = result["xf"]
@@ -228,6 +247,7 @@ class ShieldedTomatoEnv(TomatoEnv):
             if original_error is None:
                 executed_action = requested_action.copy()
                 executed_control = requested_control
+                selected_integrator = snapshot["F"]
                 reference_action = None
                 selected_lambda = 0.0
                 attempts: tuple[CandidateAttempt, ...] = ()
@@ -246,6 +266,7 @@ class ShieldedTomatoEnv(TomatoEnv):
                     target, previous_control, self.delta_u_max
                 )
                 candidate_controls: list[np.ndarray] = []
+                candidate_integrators: list[Any] = []
 
                 def integrate(candidate_action: np.ndarray) -> np.ndarray:
                     try:
@@ -259,6 +280,7 @@ class ShieldedTomatoEnv(TomatoEnv):
                         candidate_controls.append(candidate_control.copy())
                         candidate_control_input = ca.DM(candidate_control)
                         integrator = self._fresh_integrator()
+                        candidate_integrators.append(integrator)
                     except Exception as construction_error:
                         raise _ConstructionFailure(construction_error) from None
                     self._restore_rng(post_sample_rng)
@@ -278,7 +300,7 @@ class ShieldedTomatoEnv(TomatoEnv):
                         self.action_shield_config,
                     )
                 except _ConstructionFailure as failure:
-                    raise failure.error
+                    raise failure.error.with_traceback(failure.error_traceback) from None
                 except _PostCallFailure as failure:
                     raise failure.error.with_traceback(failure.error_traceback) from None
                 attempts = projection.attempts
@@ -291,9 +313,10 @@ class ShieldedTomatoEnv(TomatoEnv):
                             f"lambda={attempt.lambda_value}: "
                             f"{attempt.exception_type}: {attempt.exception_message}"
                         )
-                    raise exhausted
+                    raise exhausted from original_error
                 executed_action = np.array(projection.selected.action, copy=True)
                 executed_control = candidate_controls[len(attempts) - 1]
+                selected_integrator = candidate_integrators[len(attempts) - 1]
                 selected_lambda = float(projection.selected.lambda_value)
                 final_state = np.array(projection.final_state, copy=True)
 
@@ -301,6 +324,7 @@ class ShieldedTomatoEnv(TomatoEnv):
             self._restore_rng(post_sample_rng)
             self.x = final_state
             self.u = executed_control
+            self.F = selected_integrator
             self.day_of_year += (self.dt / self.c) % 365
             self.hour_of_day = (self.hour_of_day + self.dt / 3600) % 24
             self.obs = self._get_obs()
@@ -365,6 +389,7 @@ class ShieldedTomatoEnv(TomatoEnv):
                         hour_of_day=pre_hour,
                     )
 
+            info = self._detach_payload(info)
             self.timestep += 1
             self.x_prev = np.copy(self.x)
             return self.obs, reward, self.terminated, False, info
@@ -376,4 +401,4 @@ class ShieldedTomatoEnv(TomatoEnv):
                     "transaction restoration also failed: "
                     f"{type(restoration_error).__name__}: {restoration_error}"
                 )
-            raise error
+            raise

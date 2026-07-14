@@ -282,6 +282,60 @@ def test_retry_uses_fixed_order_fresh_integrators_and_reuses_selected_state(
     assert record["intervention_l1"] >= record["intervention_l2"] >= record["intervention_linf"]
 
 
+def test_selected_fresh_integrator_becomes_next_step_fast_path(shield_env, monkeypatch) -> None:
+    from gl_gym.environments import shielded_tomato_env as module
+
+    monkeypatch.setattr(module, "parametric_crop_uncertainty", lambda p, scale, rng: p.copy())
+    original = Integrator(RuntimeError("original failed"))
+    selected = Integrator([30.0, 31.0, 32.0])
+    shield_env.F = original
+    controller = Controller(shield_env.u.copy())
+    shield_env.action_shield_controller = controller
+    factory_calls = []
+
+    def factory(**kwargs):
+        factory_calls.append(kwargs)
+        return selected
+
+    monkeypatch.setattr(module, "define_model", factory)
+    shield_env.step(np.zeros(2))
+
+    assert shield_env.F is selected
+    assert len(selected.calls) == 1
+    assert len(controller.calls) == 1
+
+    controller.predict = lambda *args: pytest.fail("reference called on next fast path")
+    monkeypatch.setattr(module, "define_model", lambda **kwargs: pytest.fail("retry factory called"))
+    shield_env.step(np.zeros(2))
+
+    assert shield_env.F is selected
+    assert len(selected.calls) == 2
+    assert len(original.calls) == 1
+    assert len(factory_calls) == 1
+
+
+def test_returned_info_is_detached_from_environment_and_shield_evidence(
+    shield_env, monkeypatch
+) -> None:
+    from gl_gym.environments import shielded_tomato_env as module
+
+    monkeypatch.setattr(module, "parametric_crop_uncertainty", lambda p, scale, rng: p.copy())
+    shield_env.F = Integrator(RuntimeError("original failed"))
+    monkeypatch.setattr(module, "define_model", lambda **kwargs: Integrator([7, 8, 9]))
+
+    _, _, _, _, info = shield_env.step(np.array([0.5, -0.5]))
+    committed_control = shield_env.u.copy()
+    committed_action = list(info["action_shield"]["executed_action"])
+
+    info["controls"][0] = 999.0
+    info["action_shield"]["executed_control"][0] = 888.0
+    info["action_shield"]["executed_action"][0] = 777.0
+    info["action_shield"]["candidate_attempts"][0]["action"][0] = 666.0
+
+    np.testing.assert_array_equal(shield_env.u, committed_control)
+    assert committed_action[0] != 777.0
+
+
 class ExplodingArray:
     def __init__(self, error: Exception) -> None:
         self.error = error
@@ -473,6 +527,8 @@ def test_exhaustion_restores_state_reward_and_rng_and_attaches_notes(shield_env,
         shield_env.step(np.zeros(2))
 
     assert len(raised.value.__notes__) == len(DEFAULT_LAMBDAS)
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "original"
     for name, expected in before.items():
         np.testing.assert_equal(getattr(shield_env, name), expected)
     assert shield_env.reward.calls == 0
@@ -500,6 +556,7 @@ def test_reference_factory_and_commit_errors_keep_priority_and_restore(shield_en
 
     monkeypatch.setattr(module, "define_model", lambda **kwargs: Integrator([5, 6, 7]))
     commit_error = LookupError("observation bug")
+    original_integrator = shield_env.F
     shield_env._get_obs = lambda: (_ for _ in ()).throw(commit_error)
     with pytest.raises(LookupError) as raised:
         shield_env.step(np.zeros(2))
@@ -507,6 +564,28 @@ def test_reference_factory_and_commit_errors_keep_priority_and_restore(shield_en
     np.testing.assert_array_equal(shield_env.x, before[0])
     np.testing.assert_array_equal(shield_env.u, before[1])
     assert shield_env.timestep == before[2] and shield_env.reward.calls == 0
+    assert shield_env.F is original_integrator
+
+
+def test_commit_error_reraises_without_duplicate_step_traceback_frame(
+    shield_env, monkeypatch
+) -> None:
+    from gl_gym.environments import shielded_tomato_env as module
+
+    monkeypatch.setattr(module, "parametric_crop_uncertainty", lambda p, scale, rng: p.copy())
+    shield_env.F = Integrator([5, 6, 7])
+    commit_error = LookupError("info failed")
+    shield_env._get_info = lambda: (_ for _ in ()).throw(commit_error)
+
+    with pytest.raises(LookupError) as raised:
+        shield_env.step(np.zeros(2))
+
+    frames = []
+    current = raised.value.__traceback__
+    while current is not None:
+        frames.append(current.tb_frame.f_code.co_name)
+        current = current.tb_next
+    assert frames.count("step") == 1
 
 
 def test_commit_error_keeps_priority_if_best_effort_restore_also_fails(
