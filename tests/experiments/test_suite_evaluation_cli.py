@@ -59,6 +59,40 @@ def test_environment_close_error_is_not_allowed_to_replace_episode_error():
         cli.close_environment(Env(), None)
 
 
+@pytest.mark.parametrize("completed", [True, False])
+def test_canonical_evaluation_row_identity_survives_csv_roundtrip(tmp_path, completed):
+    cli = _module()
+    row = {
+        "suite_id": "suite", "algorithm": "agri_metarl", "method": "formal",
+        "seed": 42, "task_id": "task", "weather_year": 2010, "start_day": 59,
+        "checkpoint_steps": 10, "ode_failure_count": 0 if completed else 1,
+        "uncertainty_scale": 0.0, "completed": completed, "formal_complete": True,
+        "failure_evidence_path": "" if completed else "failure/manifest.json",
+        "failure_evidence_identity_sha256": "" if completed else "a" * 64,
+        "episode_return": 1.0 if completed else None,
+        "temp_violation": 2.0 if completed else None,
+        "co2_violation": 3.0 if completed else None,
+        "rh_violation": 4.0 if completed else None,
+        "future_schema_column": "preserved",
+    }
+    normalized = cli.canonical_evaluation_row(row)
+    normalized["episode_evidence_identity_sha256"] = cli.evaluation_row_identity(normalized)
+    path = tmp_path / "row.csv"
+    pd.DataFrame([normalized]).to_csv(path, index=False)
+    roundtrip = cli.canonical_evaluation_row(pd.read_csv(path).iloc[0].to_dict())
+    assert roundtrip["future_schema_column"] == "preserved"
+    assert roundtrip["episode_evidence_identity_sha256"] == cli.evaluation_row_identity(roundtrip)
+
+
+def test_shield_resume_rejects_smoke_row_for_formal_run(tmp_path):
+    cli = _module()
+    row = {"formal_complete": False}
+    evidence = {"formal_complete": False}
+    assert not cli._shield_row_valid(
+        row, evidence, {"formal_complete": True}, work_root=tmp_path
+    )
+
+
 def _stage2_fixture(cli, root: Path) -> Path:
     root.mkdir()
     unshielded_root = root.parent / f"{root.name}-unshielded"
@@ -318,11 +352,17 @@ def test_formal_unshielded_accepts_exactly_one_matching_failure_capsule(tmp_path
     cli = _module()
     args, root, model_map, env_loader = _formal_unshielded_fixture(cli, tmp_path)
     calls = 0
+    sibling = root.parent / f".{root.name}.work" / "failures" / "attempts" / "sibling.keep"
+    recorder_roots = []
 
     def one_wrapped_solver_failure(model, env, *, failure_recorder):
         nonlocal calls
         calls += 1
         if calls == 1:
+            recorder_root = Path(str(failure_recorder.root).replace("\\\\?\\", ""))
+            recorder_roots.append(recorder_root)
+            sibling.parent.mkdir(parents=True, exist_ok=True)
+            sibling.write_text("preserve", encoding="utf-8")
             return cli.run_deterministic_episode(
                 model, env, failure_recorder=failure_recorder
             )
@@ -347,6 +387,16 @@ def test_formal_unshielded_accepts_exactly_one_matching_failure_capsule(tmp_path
     assert capsule_manifest.name == "manifest.json"
     from gl_gym.experiments.ode_failure import load_failure_capsule
     load_failure_capsule(capsule_manifest.parent)
+    assert recorder_roots[0].is_relative_to((root.parent / f".{root.name}.work").resolve())
+    assert sibling.read_text(encoding="utf-8") == "preserve"
+    args.resume_eval = True
+    resumed_calls = 0
+    def must_not_rerun(model, env, *, failure_recorder):
+        nonlocal resumed_calls
+        resumed_calls += 1
+        raise AssertionError("valid completed/failed rows must resume-skip")
+    assert cli.run(args, model_map=model_map, env_loader=env_loader, episode_runner=must_not_rerun) == 182
+    assert resumed_calls == 0
 
 
 def test_stage2_five_artifact_identity_recomputes_gate_and_rejects_forgery(tmp_path):

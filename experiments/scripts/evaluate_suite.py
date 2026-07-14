@@ -210,11 +210,96 @@ def _overlap(a: Path, b: Path) -> bool:
     return a == b or a in b.parents or b in a.parents
 
 
+def _long_path(path: Path) -> Path:
+    resolved = path.resolve()
+    if os.name == "nt" and not str(resolved).startswith("\\\\?\\"):
+        return Path("\\\\?\\" + str(resolved))
+    return resolved
+
+
 def _canonical_hash(value: Any) -> str:
     payload = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+_ROW_INTEGER_FIELDS = frozenset({
+    "seed", "weather_year", "start_day", "checkpoint_steps", "ode_failure_count",
+})
+_ROW_FLOAT_FIELDS = frozenset({
+    "uncertainty_scale", "episode_return", "temp_violation", "co2_violation",
+    "rh_violation",
+})
+_ROW_NULLABLE_METRICS = frozenset({
+    "episode_return", "temp_violation", "co2_violation", "rh_violation",
+})
+_ROW_EMPTY_TEXT_FIELDS = frozenset({
+    "failure_evidence_path", "failure_evidence_identity_sha256",
+})
+
+
+def canonical_evaluation_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize every evaluation-row column for stable JSON/CSV identities."""
+    import numpy as np
+
+    result: dict[str, Any] = {}
+    for name, raw in dict(row).items():
+        value = raw.item() if isinstance(raw, np.generic) else raw
+        missing = value is None or (
+            isinstance(value, (float, np.floating)) and pd.isna(value)
+        )
+        if name in _ROW_EMPTY_TEXT_FIELDS:
+            result[name] = "" if missing else str(value)
+        elif name in _ROW_NULLABLE_METRICS and missing:
+            result[name] = None
+        elif name in _ROW_INTEGER_FIELDS:
+            if missing or isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+                raise TypeError(f"evaluation row {name} must be a strict integer")
+            result[name] = int(value)
+        elif name in _ROW_FLOAT_FIELDS:
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
+                raise TypeError(f"evaluation row {name} must be numeric")
+            scalar = float(value)
+            if not np.isfinite(scalar):
+                raise ValueError(f"evaluation row {name} must be finite")
+            result[name] = scalar
+        elif name in {"completed", "formal_complete"}:
+            if not isinstance(value, (bool, np.bool_)):
+                raise TypeError(f"evaluation row {name} must be strict boolean")
+            result[name] = bool(value)
+        elif isinstance(value, float) and pd.isna(value):
+            raise ValueError(f"evaluation row {name} has unsupported missing value")
+        else:
+            result[name] = value
+    completed = result.get("completed")
+    if completed is True and any(result.get(name) is None for name in _ROW_NULLABLE_METRICS if name in result):
+        raise ValueError("completed evaluation row metrics cannot be null")
+    if completed is False and any(result.get(name) is not None for name in _ROW_NULLABLE_METRICS if name in result):
+        raise ValueError("failed evaluation row metrics must be null")
+    return result
+
+
+def evaluation_row_identity(row: Mapping[str, Any]) -> str:
+    normalized = canonical_evaluation_row(row)
+    normalized.pop("episode_evidence_identity_sha256", None)
+    return _canonical_hash(normalized)
+
+
+def shield_method_fingerprint_components(
+    *, source_inputs: Mapping[str, str], rule_config_sha256: str,
+    env_config_sha256: str, stage2_identity_sha256: str,
+    fixed_lambdas: Any, formal_solver_options: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "method": SHIELD_METHOD,
+        "rule_config_sha256": rule_config_sha256,
+        "env_config_sha256": env_config_sha256,
+        "stage2_identity_sha256": stage2_identity_sha256,
+        "fixed_lambdas": list(fixed_lambdas),
+        "formal_solver_options": dict(formal_solver_options),
+        "source_fingerprint_inputs": dict(source_inputs),
+    }
 
 
 def load_stage2_evidence(decision_path: str | Path) -> dict[str, Any]:
@@ -505,6 +590,9 @@ def _read_shield_progress(work: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         "executed_action_trace_path", "requested_action_trace_path", "intervention_records_path",
         "executed_action_trace_sha256", "requested_action_trace_sha256",
         "intervention_records_sha256", "episode_evidence_identity_sha256",
+        "formal_complete", "rule_config_sha256", "env_config_sha256",
+        "fixed_lambdas_json", "formal_solver_options_json",
+        "shield_method_fingerprint_sha256",
     }
     if (
         not required.issubset(raw.columns) or not required.issubset(evidence.columns)
@@ -522,6 +610,12 @@ def _shield_row_valid(
 ) -> bool:
     import numpy as np
     try:
+        formal_expected = expected.get("formal_complete")
+        if not isinstance(formal_expected, bool):
+            return False
+        for candidate in (row.get("formal_complete"), evidence.get("formal_complete")):
+            if not isinstance(candidate, (bool, np.bool_)) or bool(candidate) is not formal_expected:
+                return False
         for name, value in expected.items():
             if row[name] != value or evidence[name] != value: return False
         seed = row["seed"]
@@ -698,6 +792,15 @@ def run_shield_evaluation(
         )
     }
     source_fingerprint = _canonical_hash(source_identity_inputs)
+    method_components = shield_method_fingerprint_components(
+        source_inputs=source_identity_inputs,
+        rule_config_sha256=rule_sha,
+        env_config_sha256=source_payload["env_config_sha256"],
+        stage2_identity_sha256=stage2_identity,
+        fixed_lambdas=stage2.DEFAULT_LAMBDAS,
+        formal_solver_options=stage2.FORMAL_CVODES_OPTIONS,
+    )
+    method_fingerprint = _canonical_hash(method_components)
     completed: dict[tuple[str, int, str], tuple[dict[str, Any], dict[str, Any]]] = {}
     published_checkpoints: dict[int, dict[str, Any]] = {}
     selected_runs = [row for row in runs.itertuples(index=False) if row.status == "completed"]
@@ -729,6 +832,16 @@ def run_shield_evaluation(
             "source_manifest_sha256": source_payload["source_manifest_sha256"],
             "runs_csv_sha256": source_payload["runs_csv_sha256"],
             "tasks_csv_sha256": source_payload["tasks_csv_sha256"],
+            "formal_complete": formal,
+            "rule_config_sha256": source_payload["rule_config_sha256"],
+            "env_config_sha256": source_payload["env_config_sha256"],
+            "fixed_lambdas_json": json.dumps(
+                method_components["fixed_lambdas"], sort_keys=True, separators=(",", ":")
+            ),
+            "formal_solver_options_json": json.dumps(
+                method_components["formal_solver_options"], sort_keys=True, separators=(",", ":")
+            ),
+            "shield_method_fingerprint_sha256": method_fingerprint,
         }
         published_checkpoints[int(run_row.seed)] = {
             "seed": int(run_row.seed), "model_sha256": model_sha,
@@ -788,7 +901,7 @@ def run_shield_evaluation(
             }
             row = {
                 **descriptor, **expected_common, **metrics, "trajectory_path": "", "completed": True,
-                "ode_failure_count": 0, "formal_complete": formal,
+                "ode_failure_count": 0,
                 "executed_action_trace_path": str(executed_path.resolve()),
                 "requested_action_trace_path": str(requested_path.resolve()),
                 "intervention_records_path": str(records_path.resolve()), **hashes,
@@ -816,6 +929,14 @@ def run_shield_evaluation(
         "stage2_identity_sha256": stage2_identity,
         "source_fingerprint_sha256": source_fingerprint, **source_payload,
         "source_fingerprint_inputs": source_identity_inputs,
+        "source_checksum_mapping": _formal_source_checksums(args, source_payload),
+        "source_input_paths": {
+            "manifest": str(Path(args.manifest).resolve()),
+            "runs_csv": str(Path(args.runs_csv).resolve()),
+            "tasks_csv": str(Path(args.tasks_csv).resolve()),
+        },
+        "shield_method_fingerprint_components": method_components,
+        "shield_method_fingerprint_sha256": method_fingerprint,
     }
     _publish_shield_final(root, work, raw, interventions, manifest_base=manifest_base)
     print(f"Published {len(raw)} shield rows atomically to {root}")
@@ -909,19 +1030,19 @@ def run_formal_unshielded_evaluation(
                 "stage2_identity_sha256": stage2_decision["stage2_identity_sha256"],
             }
             try:
-                if all(old[name] == value for name, value in expected_fields.items()):
-                    identity_fields = {name: old[name] for name in old if name != "episode_evidence_identity_sha256" and not pd.isna(old[name])}
-                    if old["episode_evidence_identity_sha256"] == _canonical_hash(identity_fields):
-                        completed[(int(run_row.seed), str(old["task_id"]))] = old
+                normalized_old = canonical_evaluation_row(old)
+                if all(normalized_old[name] == value for name, value in expected_fields.items()):
+                    if normalized_old["episode_evidence_identity_sha256"] == evaluation_row_identity(normalized_old):
+                        completed[(int(run_row.seed), str(normalized_old["task_id"]))] = normalized_old
             except (KeyError, TypeError, ValueError): pass
         for task in task_records:
             key = (int(run_row.seed), task.task_id)
             if key in completed: continue
-            attempt_token = _canonical_hash({"seed": key[0], "task_id": key[1]})
-            # Keep the isolated recorder root short enough for legacy Windows path limits.
-            attempt_root = root.parent / f".f-{attempt_token[:12]}"
-            if attempt_root.exists():
-                shutil.rmtree(attempt_root)
+            task_token = _canonical_hash(str(key[1]))[:12]
+            attempt_root = _long_path(
+                work / "failures" / "attempts" / source_fingerprint[:16]
+                / str(key[0]) / task_token / uuid.uuid4().hex
+            )
             context = CapsuleContext(
                 seed=key[0], task_id=task.task_id, inference_mode="stage3_unshielded",
                 task=dict(vars(task)), checkpoint_path=str(Path(run_row.model_path).resolve()),
@@ -957,9 +1078,12 @@ def run_formal_unshielded_evaluation(
                     )
                     failure_path = str(manifests[0].resolve())
                 except Exception as capsule_error:
+                    if attempt_root.exists():
+                        shutil.rmtree(attempt_root, ignore_errors=True)
                     error.add_note(f"ODE failure classification rejected: {capsule_error}")
                     raise error
             elif manifests:
+                shutil.rmtree(attempt_root, ignore_errors=True)
                 raise ValueError("successful formal episode unexpectedly produced a failure capsule")
             row = {
                 "suite_id": suite.suite_id, "algorithm": "agri_metarl", "method": FORMAL_UNSHIELDED_METHOD,
@@ -978,7 +1102,8 @@ def run_formal_unshielded_evaluation(
                 "tasks_csv_sha256": source_payload["tasks_csv_sha256"],
                 "stage2_identity_sha256": stage2_decision["stage2_identity_sha256"],
             }
-            row["episode_evidence_identity_sha256"] = _canonical_hash(row)
+            row = canonical_evaluation_row(row)
+            row["episode_evidence_identity_sha256"] = evaluation_row_identity(row)
             completed[key] = row
             _replace_csv(pd.DataFrame([completed[item] for item in sorted(completed)]), progress_path)
     expected = {(seed, task.task_id) for seed in approved for task in task_records}
@@ -991,10 +1116,15 @@ def run_formal_unshielded_evaluation(
         source_attempt_roots: set[Path] = set()
         for index, row in final.loc[~final["completed"]].iterrows():
             source_path = Path(row.failure_evidence_path).parent
-            attempt_root = source_path.parents[3]
-            if attempt_root.parent != root.parent or not attempt_root.name.startswith(".f-"):
-                raise ValueError("failure capsule is not contained in its isolated attempt root")
-            source_attempt_roots.add(attempt_root)
+            attempts_root = _long_path(work / "failures" / "attempts")
+            resolved_source = source_path.resolve()
+            if resolved_source.is_relative_to(root.resolve()):
+                pass
+            elif resolved_source.is_relative_to(attempts_root):
+                attempt_root = source_path.parents[3]
+                source_attempt_roots.add(attempt_root)
+            else:
+                raise ValueError("failure capsule is not contained in its evaluation roots")
             relative_dir = (
                 Path("failure_evidence")
                 / f"seed{int(row.seed)}__{_canonical_hash(str(row.task_id))[:12]}"
@@ -1007,18 +1137,8 @@ def run_formal_unshielded_evaluation(
             for evidence_file in sorted((stage / relative_dir).iterdir()):
                 evidence_hashes[evidence_file.relative_to(stage).as_posix()] = _sha(evidence_file)
         for index, row in published.iterrows():
-            identity_payload = {}
-            for name, value in row.to_dict().items():
-                if name == "episode_evidence_identity_sha256":
-                    continue
-                if pd.isna(value):
-                    value = None
-                elif hasattr(value, "item"):
-                    value = value.item()
-                identity_payload[name] = value
-            published.at[index, "episode_evidence_identity_sha256"] = _canonical_hash(
-                identity_payload
-            )
+            normalized = canonical_evaluation_row(row.to_dict())
+            published.at[index, "episode_evidence_identity_sha256"] = evaluation_row_identity(normalized)
         published.to_csv(stage / "eval_raw.csv", index=False)
         manifest = {
             "schema_version": "formal-unshielded-evaluation-v1", "result_root": str(root),
@@ -1026,6 +1146,12 @@ def run_formal_unshielded_evaluation(
             "eval_raw_sha256": _sha(stage / "eval_raw.csv"), "checkpoints": checkpoint_records,
             "source_fingerprint_sha256": source_fingerprint, "runtime_source_tree_sha256": runtime_sha,
             **source_payload, "source_fingerprint_inputs": source_identity_inputs,
+            "source_checksum_mapping": source_checksums,
+            "source_input_paths": {
+                "manifest": str(Path(args.manifest).resolve()),
+                "runs_csv": str(Path(args.runs_csv).resolve()),
+                "tasks_csv": str(Path(args.tasks_csv).resolve()),
+            },
             "stage2_identity_sha256": stage2_decision["stage2_identity_sha256"],
             "evaluator_source_sha256": source_payload["evaluator_source_sha256"],
             "gate_source_sha256": source_payload["gate_source_sha256"],
@@ -1034,6 +1160,17 @@ def run_formal_unshielded_evaluation(
         }
         _atomic_json(stage / "evaluation_manifest.json", manifest)
         replace_directory_atomic(stage, root)
+        resume_frame = published.copy()
+        for index, row in resume_frame.loc[~resume_frame["completed"]].iterrows():
+            resume_frame.at[index, "failure_evidence_path"] = str(
+                (root / str(row.failure_evidence_path)).resolve()
+            )
+        resume_records = []
+        for record in resume_frame.to_dict("records"):
+            normalized = canonical_evaluation_row(record)
+            normalized["episode_evidence_identity_sha256"] = evaluation_row_identity(normalized)
+            resume_records.append(normalized)
+        _replace_csv(pd.DataFrame(resume_records), progress_path)
         for source_attempt_root in source_attempt_roots:
             shutil.rmtree(source_attempt_root, ignore_errors=True)
     finally:

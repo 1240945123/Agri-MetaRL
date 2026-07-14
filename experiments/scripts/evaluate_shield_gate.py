@@ -31,6 +31,8 @@ from gl_gym.experiments.suite_schema import load_suite_manifest
 from gl_gym.experiments.suite_tasks import build_evaluation_tasks
 from gl_gym.experiments.ode_failure import load_failure_capsule
 from experiments.scripts.evaluate_suite import (
+    canonical_evaluation_row,
+    evaluation_row_identity,
     load_stage2_evidence,
     replace_directory_atomic,
 )
@@ -223,6 +225,27 @@ def _load_evaluation_manifest(eval_path: str | Path, *, label: str) -> dict[str,
         raise ValueError(f"{label} gate source provenance is stale")
     if any(source_inputs[name] != manifest.get(name) for name in source_fields):
         raise ValueError(f"{label} source fingerprint inputs are stale")
+    input_paths = manifest.get("source_input_paths")
+    if not isinstance(input_paths, dict) or set(input_paths) != {"manifest", "runs_csv", "tasks_csv"}:
+        raise ValueError(f"{label} source input paths have invalid exact schema")
+    expected_mapping = {
+        str(Path(input_paths["manifest"]).resolve()): source_inputs["source_manifest_sha256"],
+        str(Path(input_paths["runs_csv"]).resolve()): source_inputs["runs_csv_sha256"],
+        str(Path(input_paths["tasks_csv"]).resolve()): source_inputs["tasks_csv_sha256"],
+        str((ROOT / "experiments/scripts/evaluate_suite.py").resolve()): source_inputs["evaluator_source_sha256"],
+        str(Path(__file__).resolve()): source_inputs["gate_source_sha256"],
+        "runtime_source_tree": source_inputs["runtime_source_tree_sha256"],
+    }
+    for semantic, hash_name in (
+        ("manifest", "source_manifest_sha256"),
+        ("runs_csv", "runs_csv_sha256"),
+        ("tasks_csv", "tasks_csv_sha256"),
+    ):
+        source_path = Path(input_paths[semantic]).resolve()
+        if not source_path.is_file() or source_path.is_symlink() or _sha(source_path) != source_inputs[hash_name]:
+            raise ValueError(f"{label} {semantic} source path/hash is stale")
+    if manifest.get("source_checksum_mapping") != expected_mapping:
+        raise ValueError(f"{label} source checksum semantic mapping is invalid")
     return manifest
 
 
@@ -264,6 +287,48 @@ def _validate_metric_provenance(
             raise ValueError(f"{label} runtime/Stage-2 provenance mismatch")
 
 
+def _validate_shield_method_provenance(
+    frame: pd.DataFrame, manifest: Mapping[str, Any], stage2: Mapping[str, Any]
+) -> None:
+    from experiments.scripts.evaluate_suite import (
+        _canonical_hash,
+        shield_method_fingerprint_components,
+    )
+    from experiments.scripts import run_shielded_context_ab as source
+
+    _, rule_sha = source._load_rule_params()
+    components = shield_method_fingerprint_components(
+        source_inputs=manifest["source_fingerprint_inputs"],
+        rule_config_sha256=rule_sha,
+        env_config_sha256=_sha(source.ENV_CONFIG_PATH),
+        stage2_identity_sha256=stage2["stage2_identity_sha256"],
+        fixed_lambdas=source.DEFAULT_LAMBDAS,
+        formal_solver_options=source.FORMAL_CVODES_OPTIONS,
+    )
+    fingerprint = _canonical_hash(components)
+    if (
+        manifest.get("shield_method_fingerprint_components") != components
+        or manifest.get("shield_method_fingerprint_sha256") != fingerprint
+    ):
+        raise ValueError("shield method fingerprint is stale")
+    required = {
+        "rule_config_sha256", "env_config_sha256", "fixed_lambdas_json",
+        "formal_solver_options_json", "shield_method_fingerprint_sha256",
+    }
+    if not required.issubset(frame.columns):
+        raise ValueError("shield rows lack method fingerprint components")
+    expected = {
+        "rule_config_sha256": components["rule_config_sha256"],
+        "env_config_sha256": components["env_config_sha256"],
+        "fixed_lambdas_json": json.dumps(components["fixed_lambdas"], sort_keys=True, separators=(",", ":")),
+        "formal_solver_options_json": json.dumps(components["formal_solver_options"], sort_keys=True, separators=(",", ":")),
+        "shield_method_fingerprint_sha256": fingerprint,
+    }
+    for row in frame.itertuples(index=False):
+        if any(getattr(row, name) != value for name, value in expected.items()):
+            raise ValueError("shield row method fingerprint is stale")
+
+
 def _validate_unshielded_status(
     frame: pd.DataFrame,
     manifest: dict[str, Any],
@@ -280,19 +345,8 @@ def _validate_unshielded_status(
     root = Path(eval_path).resolve().parent
     referenced: set[str] = set()
     for row in frame.itertuples(index=False):
-        from experiments.scripts.evaluate_suite import _canonical_hash
-        identity_payload = {}
-        for name, value in row._asdict().items():
-            if name == "episode_evidence_identity_sha256":
-                continue
-            if pd.isna(value):
-                value = "" if name in {
-                    "failure_evidence_path", "failure_evidence_identity_sha256"
-                } else None
-            elif isinstance(value, np.generic):
-                value = value.item()
-            identity_payload[name] = value
-        if row.episode_evidence_identity_sha256 != _canonical_hash(identity_payload):
+        normalized_row = canonical_evaluation_row(row._asdict())
+        if row.episode_evidence_identity_sha256 != evaluation_row_identity(normalized_row):
             raise ValueError("unshielded canonical row evidence identity is invalid")
         completed = row.completed
         if not isinstance(completed, (bool, np.bool_)):
@@ -331,8 +385,7 @@ def _validate_unshielded_status(
                 or context.get("checkpoint_sha256") != row.model_sha256
                 or not Path(str(context.get("checkpoint_path", ""))).is_absolute()
                 or Path(str(context.get("formal_result_root", ""))).resolve() != root
-                or set(context.get("source_checksums", {}).values())
-                != set(manifest["source_fingerprint_inputs"].values())
+                or context.get("source_checksums") != manifest.get("source_checksum_mapping")
             ):
                 raise ValueError("unshielded failure capsule provenance mismatch")
             if (
@@ -422,6 +475,9 @@ def _validate_intervention_evidence(
                 "source_fingerprint_sha256", "stage2_identity_sha256", "suite_id", "seed", "task_id",
                 "runtime_source_tree_sha256", "source_manifest_sha256", "runs_csv_sha256",
                 "tasks_csv_sha256",
+                "formal_complete", "rule_config_sha256", "env_config_sha256",
+                "fixed_lambdas_json", "formal_solver_options_json",
+                "shield_method_fingerprint_sha256",
                 "split", "weather_year", "start_day", "uncertainty_scale", "economic_scenario",
                 "climate_constraint_scenario", "executed_action_trace_sha256",
                 "requested_action_trace_sha256", "intervention_records_sha256",
@@ -441,12 +497,43 @@ def _publish(output: Path, paired: pd.DataFrame, summary: pd.DataFrame, manifest
     try:
         paired.to_csv(stage / "paired_deltas.csv", index=False)
         summary.to_csv(stage / "summary.csv", index=False)
-        for name, payload in (("shield_manifest.json", manifest), ("decision.json", decision)):
-            with (stage / name).open("w", encoding="utf-8", newline="\n") as handle:
-                json.dump(payload, handle, allow_nan=False, sort_keys=True, indent=2); handle.write("\n")
+        with (stage / "decision.json").open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(decision, handle, allow_nan=False, sort_keys=True, indent=2); handle.write("\n")
+        from experiments.scripts.evaluate_suite import _canonical_hash
+        bound_manifest = {
+            **manifest,
+            "result_root": str(output.resolve()),
+            "paired_deltas_sha256": _sha(stage / "paired_deltas.csv"),
+            "summary_sha256": _sha(stage / "summary.csv"),
+            "decision_sha256": _sha(stage / "decision.json"),
+        }
+        bound_manifest["gate_identity_sha256"] = _canonical_hash(bound_manifest)
+        with (stage / "shield_manifest.json").open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(bound_manifest, handle, allow_nan=False, sort_keys=True, indent=2); handle.write("\n")
         replace_directory_atomic(stage, output)
     finally:
         if stage.exists(): shutil.rmtree(stage, ignore_errors=True)
+
+
+def audit_stage3_artifacts(root: str | Path) -> dict[str, Any]:
+    result_root = Path(root).resolve()
+    manifest = _strict_json(result_root / "shield_manifest.json")
+    if Path(str(manifest.get("result_root", ""))).resolve() != result_root:
+        raise ValueError("Stage-3 manifest result_root is invalid")
+    for name, field in (
+        ("paired_deltas.csv", "paired_deltas_sha256"),
+        ("summary.csv", "summary_sha256"),
+        ("decision.json", "decision_sha256"),
+    ):
+        path = result_root / name
+        if not path.is_file() or path.is_symlink() or manifest.get(field) != _sha(path):
+            raise ValueError(f"Stage-3 artifact hash mismatch: {name}")
+    from experiments.scripts.evaluate_suite import _canonical_hash
+    identity_payload = dict(manifest)
+    observed_identity = identity_payload.pop("gate_identity_sha256", None)
+    if observed_identity != _canonical_hash(identity_payload):
+        raise ValueError("Stage-3 canonical gate identity mismatch")
+    return manifest
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -473,6 +560,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if (
             inputs["source_manifest_sha256"] != expected_manifest_sha
             or inputs["tasks_csv_sha256"] != expected_tasks_sha
+            or Path(evaluation_manifest["source_input_paths"]["manifest"]).resolve()
+            != Path(args.manifest).resolve()
+            or Path(evaluation_manifest["source_input_paths"]["tasks_csv"]).resolve()
+            != Path(args.tasks_csv).resolve()
         ):
             raise ValueError(f"{label} manifest/tasks input source hash mismatch")
     if (
@@ -514,6 +605,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     unshield = _strict_keys(pd.read_csv(args.unshielded_eval), label="unshielded", expected=expected)
     _validate_metric_provenance(shield, shield_manifest, label="shielded", approved=approved_map, stage2_identity=stage2["stage2_identity_sha256"], runtime_sha=runtime_sha)
     _validate_metric_provenance(unshield, unshield_manifest, label="unshielded", approved=approved_map, stage2_identity=stage2["stage2_identity_sha256"], runtime_sha=runtime_sha)
+    _validate_shield_method_provenance(shield, shield_manifest, stage2)
     _validate_unshielded_status(
         unshield, unshield_manifest, args.unshielded_eval, stage2=stage2
     )
@@ -527,6 +619,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     interventions = _strict_keys(pd.read_csv(args.interventions), label="interventions", expected=expected)
     _validate_metric_provenance(interventions, shield_manifest, label="interventions", approved=approved_map, stage2_identity=stage2["stage2_identity_sha256"], runtime_sha=runtime_sha)
+    _validate_shield_method_provenance(interventions, shield_manifest, stage2)
     if "method" not in interventions or set(interventions["method"]) != {SHIELD_METHOD}:
         raise ValueError("intervention method provenance is invalid")
     if set(interventions["algorithm"]) != {SHIELD_ALGORITHM}:
@@ -562,6 +655,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "suite_evaluator_source_sha256": _sha(ROOT / "experiments/scripts/evaluate_suite.py"),
     }
     _publish(output, paired, summary, manifest, decision)
+    audit_stage3_artifacts(output)
     return decision
 
 
