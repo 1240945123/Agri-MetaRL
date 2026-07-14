@@ -62,7 +62,13 @@ class _Recorder:
 
 def _capsule_loader(path: str | Path):
     path = Path(path)
-    recorder = _RECORDER_BY_ROOT[path.parent]
+    recorder = _RECORDER_BY_ROOT.get(path.parent)
+    if recorder is None:
+        recorder = next(
+            item for root, item in _RECORDER_BY_ROOT.items()
+            if root.name == path.parent.name
+            and Path(item.context.formal_result_root).resolve() in path.resolve().parents
+        )
     context = asdict(recorder.context)
     if recorder.malformed == "context":
         context["task_id"] = "wrong-task"
@@ -169,7 +175,7 @@ def test_bootstrap_help_works_outside_repository(tmp_path):
     assert "--legacy_progress" in result.stdout
 
 
-def test_injected_successes_produce_exact_32_complete_rows_and_only_work_output(tmp_path):
+def test_injected_successes_publish_exact_immutable_result(tmp_path):
     kwargs, calls, envs = _inputs(tmp_path)
     frame = cli.run_unshielded_comparator(**kwargs)
 
@@ -186,10 +192,165 @@ def test_injected_successes_produce_exact_32_complete_rows_and_only_work_output(
     assert frame["failure_evidence_path"].eq("").all()
     assert np.isfinite(frame[list(cli.REQUIRED_METRICS)].to_numpy()).all()
     assert np.isfinite(frame[["context_norm_mean", "context_norm_max"]].to_numpy()).all()
+    root = Path(kwargs["result_root"]).resolve()
+    assert all(root in Path(path).resolve().parents for path in frame.action_trace_path)
     assert all(Path(path).is_file() for path in frame.action_trace_path)
-    assert not Path(kwargs["result_root"]).exists()
+    assert {path.name for path in root.iterdir()} == {
+        "eval_raw.csv", "context_ab_manifest.json", "traces", "failures"
+    }
+    manifest = cli._strict_json(root / "context_ab_manifest.json")
+    assert Path(manifest["result_root"]).resolve() == root
+    assert len(manifest["row_identities"]) == 32
+    assert set(manifest["published_file_sha256"]) == {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and path.name != "context_ab_manifest.json"
+    }
+    assert all(
+        digest == cli.sha256_file(root / relative)
+        for relative, digest in manifest["published_file_sha256"].items()
+    )
     assert (Path(kwargs["result_root"]).parent / ".comparator-final.work" / "progress.csv").is_file()
     assert len(calls) == 32 and all(env.closed for env in envs)
+
+
+def test_publication_rejects_31_rows_without_creating_final_root(tmp_path):
+    kwargs, _, _ = _inputs(tmp_path)
+    kwargs["episode_runner"] = lambda *args, **inner: (_ for _ in ()).throw(
+        KeyboardInterrupt()
+    )
+    with pytest.raises(KeyboardInterrupt):
+        cli.run_unshielded_comparator(**kwargs)
+    assert not Path(kwargs["result_root"]).exists()
+
+    with pytest.raises(RuntimeError, match="exact 32-key"):
+        cli._publish_comparator(
+            [{} for _ in range(31)],
+            root=Path(kwargs["result_root"]),
+            work=cli._work_root(Path(kwargs["result_root"])),
+            failure_work=tmp_path / "failure-work",
+            suite=kwargs["suite"],
+            runs=kwargs["runs"],
+            source_manifest=kwargs["source_manifest"],
+            source_tasks_csv=kwargs["source_tasks_csv"],
+            provenance={},
+            runtime_source_tree_sha256="a" * 64,
+            capsule_loader=_capsule_loader,
+        )
+
+
+def test_failed_rows_and_capsules_are_rewritten_beneath_final_root(tmp_path):
+    key = (42, cli.DIAGNOSTIC_TASK_IDS[0], cli.MODES[0])
+    kwargs, _, _ = _inputs(tmp_path, failure_modes={key})
+    frame = cli.run_unshielded_comparator(**kwargs)
+    root = Path(kwargs["result_root"]).resolve()
+    failed = frame.loc[~frame.completed].iloc[0]
+    evidence = Path(failed.failure_evidence_path).resolve()
+    assert root in evidence.parents and evidence.is_file()
+    assert all(root in Path(path).resolve().parents for path in frame.loc[frame.completed, "action_trace_path"])
+    assert not any(".work" in str(path) for path in frame.action_trace_path.astype(str))
+
+
+def test_old_final_root_is_preserved_when_new_execution_is_partial(tmp_path):
+    kwargs, _, _ = _inputs(tmp_path)
+    cli.run_unshielded_comparator(**kwargs)
+    root = Path(kwargs["result_root"])
+    old = (root / "eval_raw.csv").read_bytes()
+    kwargs["resume"] = False
+    kwargs["episode_runner"] = lambda *args, **inner: (_ for _ in ()).throw(
+        RuntimeError("arbitrary runtime")
+    )
+    with pytest.raises(RuntimeError, match="arbitrary"):
+        cli.run_unshielded_comparator(**kwargs)
+    assert (root / "eval_raw.csv").read_bytes() == old
+
+
+def test_publish_rename_failure_uses_copy_fallback(tmp_path, monkeypatch):
+    kwargs, _, _ = _inputs(tmp_path)
+    original = Path.rename
+    monkeypatch.setattr(Path, "rename", lambda self, target: (_ for _ in ()).throw(OSError("rename")))
+    frame = cli.run_unshielded_comparator(**kwargs)
+    assert len(frame) == 32
+    assert (Path(kwargs["result_root"]) / "eval_raw.csv").is_file()
+    monkeypatch.setattr(Path, "rename", original)
+
+
+def test_publish_copy_fallback_failure_restores_unique_old_root(tmp_path, monkeypatch):
+    kwargs, _, _ = _inputs(tmp_path)
+    cli.run_unshielded_comparator(**kwargs)
+    root = Path(kwargs["result_root"])
+    old = (root / "eval_raw.csv").read_bytes()
+    kwargs["resume"] = False
+    monkeypatch.setattr(Path, "rename", lambda self, target: (_ for _ in ()).throw(OSError("rename")))
+    real_copytree = cli.shutil.copytree
+    calls = {"count": 0}
+    def broken_copytree(source, destination, *args, **copy_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("copy interrupted")
+        return real_copytree(source, destination, *args, **copy_kwargs)
+    monkeypatch.setattr(cli.shutil, "copytree", broken_copytree)
+    with pytest.raises(OSError, match="copy interrupted"):
+        cli.run_unshielded_comparator(**kwargs)
+    assert (root / "eval_raw.csv").read_bytes() == old
+    backups = list(root.parent.glob(f".{root.name}.backup*"))
+    assert len(backups) <= 1
+
+
+def test_publish_rename_interruption_restores_old_root(tmp_path, monkeypatch):
+    kwargs, _, _ = _inputs(tmp_path)
+    cli.run_unshielded_comparator(**kwargs)
+    root = Path(kwargs["result_root"])
+    old = (root / "eval_raw.csv").read_bytes()
+    kwargs["resume"] = False
+    real_rename = Path.rename
+    calls = {"count": 0}
+    def interrupted_rename(self, destination):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise KeyboardInterrupt()
+        return real_rename(self, destination)
+    monkeypatch.setattr(Path, "rename", interrupted_rename)
+    with pytest.raises(KeyboardInterrupt):
+        cli.run_unshielded_comparator(**kwargs)
+    assert (root / "eval_raw.csv").read_bytes() == old
+    assert not (root.parent / f".{root.name}.backup").exists()
+
+
+def test_round_trip_rejection_restores_old_final_root(tmp_path, monkeypatch):
+    kwargs, _, _ = _inputs(tmp_path)
+    cli.run_unshielded_comparator(**kwargs)
+    root = Path(kwargs["result_root"])
+    old = (root / "eval_raw.csv").read_bytes()
+    kwargs["resume"] = False
+    monkeypatch.setattr(
+        cli, "_load_published_comparator",
+        lambda *args, **inner: (_ for _ in ()).throw(ValueError("consumer rejected")),
+    )
+    with pytest.raises(ValueError, match="consumer rejected"):
+        cli.run_unshielded_comparator(**kwargs)
+    assert (root / "eval_raw.csv").read_bytes() == old
+
+
+@pytest.mark.parametrize("source_name", ["source_manifest", "source_tasks_csv"])
+@pytest.mark.parametrize("lifecycle", ["work", "stage", "backup", "failure"])
+def test_source_inputs_must_not_live_in_mutable_output_topology(
+    tmp_path, source_name, lifecycle
+):
+    kwargs, _, _ = _inputs(tmp_path)
+    root = Path(kwargs["result_root"])
+    locations = {
+        "work": cli._work_root(root),
+        "stage": root.parent / f".{root.name}.publish",
+        "backup": root.parent / f".{root.name}.backup",
+        "failure": Path(kwargs["failure_root"]),
+    }
+    source = locations[lifecycle] / f"{source_name}.dat"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("x", encoding="utf-8")
+    kwargs[source_name] = source
+    with pytest.raises(ValueError, match="topology|disjoint"):
+        cli.run_unshielded_comparator(**kwargs)
 
 
 def test_exact_early_wrapper_with_one_matching_capsule_continues_multiple_failures(tmp_path):
@@ -604,7 +765,8 @@ def test_resume_recomputes_failed_row_when_capsule_identity_changes(tmp_path):
     key = (42, cli.DIAGNOSTIC_TASK_IDS[0], cli.MODES[0])
     kwargs, calls, _ = _inputs(tmp_path, failure_modes={key})
     frame = cli.run_unshielded_comparator(**kwargs)
-    manifest = Path(frame.loc[~frame.completed, "failure_evidence_path"].iloc[0])
+    progress = pd.read_csv(_progress_path(kwargs))
+    manifest = Path(progress.loc[progress.status.eq("ode_failure"), "failure_evidence_path"].iloc[0])
     _RECORDER_BY_ROOT[manifest.parent.parent].identity = "c" * 64
     calls.clear()
     kwargs["resume"] = True
@@ -634,7 +796,8 @@ def test_resume_recomputes_failed_row_when_capsule_is_not_valid(tmp_path, damage
     key = (42, cli.DIAGNOSTIC_TASK_IDS[0], cli.MODES[0])
     kwargs, calls, _ = _inputs(tmp_path, failure_modes={key})
     frame = cli.run_unshielded_comparator(**kwargs)
-    manifest = Path(frame.loc[~frame.completed, "failure_evidence_path"].iloc[0])
+    progress = pd.read_csv(_progress_path(kwargs))
+    manifest = Path(progress.loc[progress.status.eq("ode_failure"), "failure_evidence_path"].iloc[0])
     if damage == "missing":
         manifest.unlink()
     elif damage == "corrupt":
@@ -777,9 +940,9 @@ def test_legacy_import_copies_valid_trace_and_resigns_identity(tmp_path):
     old, calls, _ = _inputs(tmp_path / "old")
     old_frame = cli.run_unshielded_comparator(**old)
     legacy = _progress_path(old)
-    legacy_row = _legacy_row(old_frame)
+    legacy_row = _legacy_row(pd.read_csv(legacy))
     legacy_row.to_csv(legacy, index=False)
-    old_trace = Path(old_frame.iloc[0].action_trace_path)
+    old_trace = Path(legacy_row.iloc[0].action_trace_path)
 
     calls.clear()
     new = dict(old)
@@ -791,12 +954,10 @@ def test_legacy_import_copies_valid_trace_and_resigns_identity(tmp_path):
     imported = frame.iloc[0]
     assert len(calls) == 31
     assert Path(imported.action_trace_path) != old_trace
-    assert Path(imported.action_trace_path) == cli._trace_path(
-        _progress_path(new).parent,
-        int(imported.seed),
-        str(imported.task_id),
-        str(imported.inference_mode),
-    )
+    assert Path(imported.action_trace_path) == (
+        Path(new["result_root"]) / "traces"
+        / f"seed{int(imported.seed)}__{imported.task_id}__{imported.inference_mode}.npy"
+    ).resolve()
     assert Path(imported.action_trace_path).read_bytes() == old_trace.read_bytes()
     assert len(imported.row_identity_sha256) == 64
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from datetime import datetime, timezone
 import hashlib
 import json
 from numbers import Integral
@@ -54,6 +55,9 @@ from gl_gym.experiments.suite_evaluation import (
     task_from_row,
 )
 from gl_gym.experiments.suite_schema import load_suite_manifest
+from experiments.scripts.run_shielded_context_ab import (
+    load_unshielded_comparator as _load_published_comparator,
+)
 
 
 DEFAULT_RESULT_ROOT = Path(
@@ -288,6 +292,186 @@ def _replace_progress(rows: list[dict[str, Any]], path: Path) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _strict_json(path: str | Path) -> dict[str, Any]:
+    value = json.loads(
+        Path(path).read_text(encoding="utf-8"),
+        parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
+    )
+    if not isinstance(value, dict):
+        raise ValueError(f"JSON document must be an object: {path}")
+    return value
+
+
+def _relocate_tree(source: Path, destination: Path) -> None:
+    """Move a complete tree, using a recoverable copy when rename is unavailable."""
+
+    if destination.exists():
+        raise FileExistsError(f"tree destination already exists: {destination}")
+    try:
+        source.rename(destination)
+        return
+    except OSError:
+        pass
+    try:
+        shutil.copytree(source, destination)
+    except BaseException:
+        if destination.exists():
+            shutil.rmtree(destination)
+        raise
+    shutil.rmtree(source)
+
+
+def _published_row(
+    row: Mapping[str, Any], *, root: Path, work: Path, failure_work: Path, stage: Path
+) -> dict[str, Any]:
+    published = dict(row)
+    key = _key(row)
+    if bool(row["completed"]):
+        source = Path(str(row["action_trace_path"])).resolve()
+        expected = _trace_path(work, *key)
+        if source != expected or not source.is_file():
+            raise ValueError("completed row action trace is not canonical work evidence")
+        relative = Path("traces") / source.name
+        destination = stage / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        published["action_trace_path"] = str((root / relative).resolve())
+        published["action_trace_sha256"] = sha256_file(destination)
+        published["failure_evidence_path"] = ""
+        published["failure_capsule_identity_sha256"] = ""
+    else:
+        source = Path(str(row["failure_evidence_path"])).resolve()
+        try:
+            relative_source = source.relative_to(failure_work.resolve())
+        except ValueError as error:
+            raise ValueError("failure capsule is not canonical work evidence") from error
+        if source.name != "manifest.json" or not source.is_file():
+            raise ValueError("failed row capsule manifest is missing")
+        capsule_dir = source.parent
+        relative = Path("failures") / relative_source.parent
+        destination = stage / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(capsule_dir, destination)
+        published["failure_evidence_path"] = str(
+            (root / relative / "manifest.json").resolve()
+        )
+        published["action_trace_path"] = ""
+        published["action_trace_sha256"] = ""
+    return _signed_row(published)
+
+
+def _publish_comparator(
+    rows: list[dict[str, Any]],
+    *,
+    root: Path,
+    work: Path,
+    failure_work: Path,
+    suite: Any,
+    runs: list[dict[str, Any]],
+    source_manifest: str | Path,
+    source_tasks_csv: str | Path,
+    provenance: Mapping[str, Any],
+    runtime_source_tree_sha256: str,
+    capsule_loader: Callable[[str | Path], Any],
+) -> pd.DataFrame:
+    """Publish one exact comparator while preserving any prior accepted root."""
+
+    if len(rows) != 32 or {_key(row) for row in rows} != {
+        (seed, task_id, mode)
+        for seed in APPROVED_SEEDS
+        for task_id in DIAGNOSTIC_TASK_IDS
+        for mode in MODES
+    }:
+        raise RuntimeError("only the exact 32-key comparator may be published")
+    stage = root.parent / f".{root.name}.publish"
+    backup = root.parent / f".{root.name}.backup"
+    if backup.exists() and not root.exists():
+        _relocate_tree(backup, root)
+    if backup.exists():
+        raise RuntimeError("ambiguous comparator backup recovery state")
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage.mkdir(parents=True)
+    (stage / "traces").mkdir()
+    (stage / "failures").mkdir()
+    published_rows: list[dict[str, Any]] = []
+    try:
+        for row in rows:
+            published_rows.append(
+                _published_row(
+                    row, root=root, work=work, failure_work=failure_work, stage=stage
+                )
+            )
+        table = pd.DataFrame(published_rows)
+        table.to_csv(stage / "eval_raw.csv", index=False)
+        file_hashes = {
+            path.relative_to(stage).as_posix(): sha256_file(path)
+            for path in sorted(stage.rglob("*"))
+            if path.is_file()
+        }
+        checkpoints = [
+            {
+                name: (int(run[name]) if name == "seed" else str(run[name]))
+                for name in (
+                    "seed", "model_path", "vecnormalize_path",
+                    "model_sha256", "vecnormalize_sha256",
+                )
+            }
+            for run in runs
+        ]
+        manifest = {
+            "schema_version": 1,
+            "artifact_type": "failure_tolerant_unshielded_context_comparator",
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "result_root": str(root.resolve()),
+            "source_suite_id": str(suite.suite_id),
+            "source_suite_result_root": str(Path(suite.result_root).resolve()),
+            "source_manifest": str(Path(source_manifest).resolve()),
+            "source_tasks_csv": str(Path(source_tasks_csv).resolve()),
+            "checkpoints": checkpoints,
+            "solver": {"backend": "CVODES", "options": dict(FORMAL_CVODES_OPTIONS)},
+            "runtime_source_tree_sha256": runtime_source_tree_sha256,
+            "row_identities": [str(row["row_identity_sha256"]) for row in published_rows],
+            "row_keys": [list(_key(row)) for row in published_rows],
+            "published_file_sha256": file_hashes,
+            **dict(provenance),
+        }
+        (stage / "context_ab_manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
+        had_old = root.exists()
+        if had_old:
+            _relocate_tree(root, backup)
+        try:
+            _relocate_tree(stage, root)
+            expected_checkpoints = {int(run["seed"]): run for run in runs}
+            loaded, _, _ = _load_published_comparator(
+                root,
+                expected_provenance=dict(provenance),
+                expected_checkpoints=expected_checkpoints,
+                capsule_loader=capsule_loader,
+            )
+            if len(loaded) != 32 or set(loaded[["seed", "task_id", "inference_mode"]].itertuples(index=False, name=None)) != {
+                _key(row) for row in published_rows
+            }:
+                raise ValueError("published comparator consumer round-trip changed exact keys")
+        except BaseException:
+            if root.exists():
+                shutil.rmtree(root)
+            if had_old and backup.exists():
+                _relocate_tree(backup, root)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+        return table
+    except BaseException:
+        if stage.exists():
+            shutil.rmtree(stage)
+        raise
 
 
 def _validate_scoring_metrics(
@@ -610,10 +794,19 @@ def run_unshielded_comparator(
     root, capsule_root = validate_output_roots(
         result_root, failure_root, suite.result_root
     )
-    if root.exists():
-        raise ValueError("Task-1 comparator must not publish or reuse the final result root")
     work = _work_root(root)
     failure_work = _failure_work_root(capsule_root, root)
+    source_inputs = (Path(source_manifest).resolve(), Path(source_tasks_csv).resolve())
+    mutable_roots = (
+        root.resolve(),
+        work.resolve(),
+        capsule_root.resolve(),
+        failure_work.resolve(),
+        (root.parent / f".{root.name}.publish").resolve(),
+        (root.parent / f".{root.name}.backup").resolve(),
+    )
+    if any(_overlaps(source, owned) for source in source_inputs for owned in mutable_roots):
+        raise ValueError("source inputs and comparator output topology must be disjoint")
     if not resume:
         for path in (work, failure_work):
             if path.exists():
@@ -895,7 +1088,19 @@ def run_unshielded_comparator(
                 _replace_progress(rows, progress_path)
     if len(rows) != 32:
         raise RuntimeError(f"comparator completed {len(rows)} of 32 required episodes")
-    return pd.DataFrame(rows)
+    return _publish_comparator(
+        rows,
+        root=root,
+        work=work,
+        failure_work=failure_work,
+        suite=suite,
+        runs=runs,
+        source_manifest=source_manifest,
+        source_tasks_csv=source_tasks_csv,
+        provenance=provenance,
+        runtime_source_tree_sha256=runtime_source_tree_sha256,
+        capsule_loader=capsule_loader,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
