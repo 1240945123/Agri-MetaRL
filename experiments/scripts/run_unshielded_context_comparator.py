@@ -26,6 +26,7 @@ from experiments.scripts.run_context_ab import (
     DIAGNOSTIC_TASK_IDS,
     HASH_FIELDS,
     MODES,
+    PROVENANCE_FIELDS,
     RELEVANT_SOURCE_FIELDS,
     _evaluation_provenance,
     _package_versions,
@@ -62,6 +63,24 @@ STATUS_FIELDS = (
     "status",
     "ode_failure_count",
     "failure_evidence_path",
+)
+RESERVED_ROW_FIELDS = frozenset(
+    {
+        "seed",
+        "task_id",
+        "split",
+        "inference_mode",
+        "checkpoint_steps",
+        "checkpoint_path",
+        "model_path",
+        "vecnormalize_path",
+        "action_trace_path",
+        "source_manifest",
+        "source_tasks_csv",
+        *STATUS_FIELDS,
+        *HASH_FIELDS,
+        *PROVENANCE_FIELDS,
+    }
 )
 
 
@@ -159,7 +178,9 @@ def _finite_metrics(metrics: Any) -> dict[str, Any]:
     return normalized
 
 
-def _success_diagnostics(diagnostics: Any) -> tuple[dict[str, Any], np.ndarray]:
+def _success_diagnostics(
+    diagnostics: Any, *, metric_names: set[str]
+) -> tuple[dict[str, Any], np.ndarray]:
     if not isinstance(diagnostics, Mapping):
         raise TypeError("episode diagnostics must be a mapping")
     values = dict(diagnostics)
@@ -171,6 +192,12 @@ def _success_diagnostics(diagnostics: Any) -> tuple[dict[str, Any], np.ndarray]:
     }.difference(values)
     if missing:
         raise KeyError(f"episode diagnostics are missing required keys: {sorted(missing)}")
+    collisions = set(values).intersection(metric_names | RESERVED_ROW_FIELDS)
+    if collisions:
+        raise ValueError(
+            "episode diagnostics collide with metric or reserved row fields: "
+            f"{sorted(collisions)}"
+        )
     trace = np.asarray(values.pop("action_trace"), dtype=np.float32)
     if trace.ndim != 2 or not trace.shape[0] or not trace.shape[1]:
         raise ValueError("action_trace must be a nonempty two-dimensional array")
@@ -188,6 +215,26 @@ def _success_diagnostics(diagnostics: Any) -> tuple[dict[str, Any], np.ndarray]:
         elif value is not None and not isinstance(value, (str, bool, int, float)):
             raise TypeError(f"diagnostic {name!r} must be a CSV-safe scalar")
     return values, trace
+
+
+def _validate_completed_row(row: Mapping[str, Any]) -> None:
+    """Validate the final merged row before it becomes resumable progress."""
+
+    if (
+        row.get("completed") is not True
+        or row.get("status") != "completed"
+        or row.get("ode_failure_count") != 0
+        or row.get("failure_evidence_path") != ""
+    ):
+        raise ValueError("completed comparator row has an invalid status schema")
+    try:
+        metrics = np.asarray(
+            [float(row[name]) for name in REQUIRED_METRICS], dtype=float
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("completed comparator row has invalid required metrics") from error
+    if not np.isfinite(metrics).all():
+        raise ValueError("completed comparator row required metrics must be finite")
 
 
 def _validate_capsule(
@@ -402,7 +449,9 @@ def run_unshielded_comparator(
                             "successful comparator episode unexpectedly produced a failure capsule"
                         )
                     normalized_metrics = _finite_metrics(metrics)
-                    normalized_diagnostics, trace = _success_diagnostics(diagnostics)
+                    normalized_diagnostics, trace = _success_diagnostics(
+                        diagnostics, metric_names=set(normalized_metrics)
+                    )
                     trace_path = _trace_path(work, seed, task.task_id, mode)
                     np.save(trace_path, trace, allow_pickle=False)
                     row = {
@@ -415,6 +464,7 @@ def run_unshielded_comparator(
                         "ode_failure_count": 0,
                         "failure_evidence_path": "",
                     }
+                    _validate_completed_row(row)
                     if attempt.exists():
                         shutil.rmtree(attempt)
                 rows.append(row)
@@ -430,7 +480,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source_tasks_csv", required=True)
     parser.add_argument("--model_root", required=True)
     parser.add_argument("--result_root", default=str(DEFAULT_RESULT_ROOT))
-    parser.add_argument("--failure_root", default=str(DEFAULT_FAILURE_ROOT))
+    parser.add_argument("--failure_root", required=True)
     parser.add_argument("--seeds", nargs="+", type=int, required=True)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--resume", action="store_true")

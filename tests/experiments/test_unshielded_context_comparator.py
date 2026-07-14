@@ -406,6 +406,54 @@ def test_model_or_malformed_success_output_propagates(tmp_path, kind):
         cli.run_unshielded_comparator(**kwargs)
 
 
+@pytest.mark.parametrize(
+    ("collision", "value"),
+    [
+        ("episode_return", np.nan),
+        ("status", "forged"),
+        ("model_sha256", "f" * 64),
+        ("failure_evidence_path", "forged/manifest.json"),
+    ],
+)
+def test_diagnostics_cannot_override_metrics_or_reserved_row_fields(
+    tmp_path, collision, value
+):
+    kwargs, _, _ = _inputs(tmp_path)
+
+    def runner(*args, **runner_kwargs):
+        metrics = {name: 1.0 for name in cli.REQUIRED_METRICS}
+        diagnostics = {
+            "support_ready_step": 1.0,
+            "context_norm_mean": 0.5,
+            "context_norm_max": 1.0,
+            "action_trace": np.ones((3, 2)),
+            collision: value,
+        }
+        return metrics, diagnostics
+
+    kwargs["episode_runner"] = runner
+    with pytest.raises(ValueError, match="collide"):
+        cli.run_unshielded_comparator(**kwargs)
+
+
+def test_parser_requires_explicit_failure_root():
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--source_manifest",
+                "manifest.json",
+                "--source_tasks_csv",
+                "tasks.csv",
+                "--model_root",
+                "models",
+                "--seeds",
+                "42",
+                "123",
+            ]
+        )
+
+
 def test_output_roots_must_be_pairwise_disjoint(tmp_path):
     kwargs, _, _ = _inputs(tmp_path)
     kwargs["result_root"] = kwargs["suite"].result_root / "child"
