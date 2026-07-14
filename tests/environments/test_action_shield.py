@@ -7,6 +7,8 @@ from gl_gym.environments.action_shield import (
     DEFAULT_LAMBDAS,
     ActionCandidate,
     ActionShieldConfig,
+    CandidateAttempt,
+    ProjectionResult,
     build_candidates,
     control_to_reference_action,
     project_first_feasible,
@@ -17,21 +19,38 @@ def test_control_to_reference_action_rate_limits_each_element() -> None:
     target = np.array([13.0, -1.0, 2.5])
     previous = np.array([10.0, 1.0, 2.0])
 
-    reference = control_to_reference_action(target, previous, delta_u_max=2.0)
+    reference = control_to_reference_action(
+        target, previous, delta_u_max=np.array([2.0, 2.0, 2.0])
+    )
 
     np.testing.assert_allclose(reference, [1.0, -1.0, 0.25])
     assert not reference.flags.writeable
 
 
-@pytest.mark.parametrize("delta", [0.0, -1.0, np.nan])
-def test_control_to_reference_action_rejects_invalid_delta(delta: float) -> None:
+@pytest.mark.parametrize(
+    "delta",
+    [
+        np.array([0.0]),
+        np.array([-1.0]),
+        np.array([np.nan]),
+        np.array([np.inf]),
+    ],
+)
+def test_control_to_reference_action_rejects_invalid_delta(delta: np.ndarray) -> None:
     with pytest.raises(ValueError):
         control_to_reference_action(np.array([1.0]), np.array([0.0]), delta)
 
 
 def test_control_to_reference_action_rejects_mismatched_shapes() -> None:
     with pytest.raises(ValueError, match="shape"):
-        control_to_reference_action(np.ones(2), np.ones(3), 1.0)
+        control_to_reference_action(np.ones(2), np.ones(3), np.ones(2))
+    with pytest.raises(ValueError, match="shape"):
+        control_to_reference_action(np.ones(2), np.ones(2), np.ones(3))
+
+
+def test_control_to_reference_action_rejects_scalar_delta() -> None:
+    with pytest.raises(ValueError, match="shape"):
+        control_to_reference_action(np.ones(2), np.zeros(2), 0.1)
 
 
 def test_build_candidates_uses_exact_order_and_convex_formula() -> None:
@@ -42,9 +61,11 @@ def test_build_candidates_uses_exact_order_and_convex_formula() -> None:
 
     assert tuple(candidate.lambda_value for candidate in candidates) == DEFAULT_LAMBDAS
     for candidate, lambda_value in zip(candidates, DEFAULT_LAMBDAS, strict=True):
-        expected = lambda_value * policy + (1.0 - lambda_value) * reference
+        expected = (1.0 - lambda_value) * policy + lambda_value * reference
         np.testing.assert_allclose(candidate.action, expected)
         assert not candidate.action.flags.writeable
+
+    np.testing.assert_allclose(candidates[0].action, [0.875, -0.90625])
 
 
 def test_config_is_frozen_slotted_and_rejects_alternate_grid() -> None:
@@ -59,6 +80,41 @@ def test_config_is_frozen_slotted_and_rejects_alternate_grid() -> None:
         ActionShieldConfig(lambdas=(1.0,))
     with pytest.raises(ValueError, match="fixed"):
         build_candidates(np.zeros(1), np.zeros(1), lambdas=(1.0,))
+
+
+def test_evidence_dataclasses_are_frozen_and_slotted() -> None:
+    candidate = ActionCandidate(0.25, np.array([0.5]))
+    attempt = CandidateAttempt(0.25, np.array([0.5]), True, 0.01, None, None)
+    result = ProjectionResult(candidate, np.array([2.0]), (attempt,))
+
+    for value in (candidate, attempt, result):
+        assert not hasattr(value, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        candidate.lambda_value = 0.5  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        attempt.success = False  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        result.selected = None  # type: ignore[misc]
+
+
+def test_direct_evidence_dataclasses_detach_and_freeze_arrays() -> None:
+    candidate_source = np.array([0.5])
+    attempt_source = np.array([-0.5])
+    state_source = np.array([2.0])
+    candidate = ActionCandidate(0.25, candidate_source)
+    attempt = CandidateAttempt(0.25, attempt_source, True, 0.01, None, None)
+    result = ProjectionResult(candidate, state_source, (attempt,))
+
+    candidate_source[:] = 1.0
+    attempt_source[:] = 1.0
+    state_source[:] = 1.0
+
+    np.testing.assert_allclose(candidate.action, [0.5])
+    np.testing.assert_allclose(attempt.action, [-0.5])
+    np.testing.assert_allclose(result.final_state, [2.0])
+    assert not candidate.action.flags.writeable
+    assert not attempt.action.flags.writeable
+    assert result.final_state is not None and not result.final_state.flags.writeable
 
 
 @pytest.mark.parametrize(
@@ -139,7 +195,7 @@ def test_result_evidence_is_detached_and_read_only() -> None:
     external_state[:] = 99.0
 
     assert result.selected is not None
-    np.testing.assert_allclose(result.selected.action, [1.0 / 16.0, -15.0 / 16.0])
+    np.testing.assert_allclose(result.selected.action, [15.0 / 16.0, -1.0 / 16.0])
     np.testing.assert_allclose(result.attempts[0].action, result.selected.action)
     np.testing.assert_allclose(result.final_state, [2.0, 3.0])
     assert not result.selected.action.flags.writeable
@@ -160,8 +216,8 @@ def test_integration_cannot_mutate_stored_candidate_evidence() -> None:
     )
 
     assert result.selected is not None
-    np.testing.assert_allclose(result.selected.action, [-7.0 / 8.0])
-    np.testing.assert_allclose(result.attempts[0].action, [-7.0 / 8.0])
+    np.testing.assert_allclose(result.selected.action, [7.0 / 8.0])
+    np.testing.assert_allclose(result.attempts[0].action, [7.0 / 8.0])
 
 
 def test_action_candidate_detaches_and_freezes_its_array() -> None:

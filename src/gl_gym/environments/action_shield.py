@@ -112,7 +112,7 @@ class ProjectionResult:
 def control_to_reference_action(
     target: ArrayLike,
     previous: ArrayLike,
-    delta_u_max: float,
+    delta_u_max: ArrayLike,
 ) -> NDArray[np.float64]:
     """Convert a physical control target to a normalized, rate-limited action."""
 
@@ -120,11 +120,11 @@ def control_to_reference_action(
     previous_vector = _immutable_vector(previous, name="previous")
     if target_vector.shape != previous_vector.shape:
         raise ValueError("target and previous must have exactly matching shapes")
-    if not np.isscalar(delta_u_max):
-        raise ValueError("delta_u_max must be a strictly positive finite scalar")
-    delta = float(delta_u_max)
-    if not np.isfinite(delta) or delta <= 0.0:
-        raise ValueError("delta_u_max must be strictly positive and finite")
+    if np.asarray(delta_u_max).shape != target_vector.shape:
+        raise ValueError("delta_u_max must have exactly the same shape as target")
+    delta = _immutable_vector(delta_u_max, name="delta_u_max")
+    if np.any(delta <= 0.0):
+        raise ValueError("delta_u_max must contain only strictly positive values")
     return _immutable_vector(
         np.clip((target_vector - previous_vector) / delta, -1.0, 1.0),
         name="reference_action",
@@ -150,7 +150,7 @@ def build_candidates(
     return tuple(
         ActionCandidate(
             lambda_value,
-            lambda_value * policy + (1.0 - lambda_value) * reference,
+            (1.0 - lambda_value) * policy + lambda_value * reference,
         )
         for lambda_value in grid
     )
