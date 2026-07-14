@@ -51,11 +51,11 @@ class _Recorder:
         self.identity = "a" * 64
 
     def emit(self, step: int = 2):
-        first = self.root / "capsule-a"
+        first = self.root / self.identity
         first.mkdir(parents=True)
         (first / "manifest.json").write_text("{}", encoding="utf-8")
         if self.malformed == "multiple":
-            second = self.root / "capsule-b"
+            second = self.root / ("b" * 64)
             second.mkdir()
             (second / "manifest.json").write_text("{}", encoding="utf-8")
 
@@ -80,6 +80,7 @@ def _capsule_loader(path: str | Path):
             "exception": {"type": "RuntimeError", "message": "CVODES failed"},
             "solver": {"options": dict(FORMAL_CVODES_OPTIONS)},
             "content_identity_sha256": recorder.identity,
+            "failure_id": path.name,
         },
         history_arrays={"step_index": np.asarray([step], dtype=np.int64)},
         failure_inputs={"timestep": np.asarray(step, dtype=np.int64)},
@@ -249,6 +250,53 @@ def test_failed_rows_and_capsules_are_rewritten_beneath_final_root(tmp_path):
     assert root in evidence.parents and evidence.is_file()
     assert all(root in Path(path).resolve().parents for path in frame.loc[frame.completed, "action_trace_path"])
     assert not any(".work" in str(path) for path in frame.action_trace_path.astype(str))
+
+
+def test_failure_capsule_publication_uses_short_deterministic_layout(tmp_path, request):
+    target_root_length = 123
+    padding = "r" * max(
+        8, target_root_length - len(str(tmp_path.resolve())) - 1
+    )
+    root = (tmp_path / padding).resolve()
+    stage = root.parent / f".{root.name}.publish"
+    stage.mkdir(parents=True)
+    work = root.parent / f".{root.name}.work"
+    failure_work = (
+        Path("E:/t/f")
+        / cli.hashlib.sha256(str(tmp_path).encode("utf-8")).hexdigest()[:8]
+    ).resolve()
+    request.addfinalizer(
+        lambda: cli.shutil.rmtree(failure_work, ignore_errors=True)
+    )
+    key = (42, "heldout_" + "long_task_" * 9, "online_context")
+    attempt = cli._attempt_root(failure_work, *key)
+    capsule = attempt / "42" / key[1] / key[2] / ("c" * 64)
+    capsule.mkdir(parents=True)
+    (capsule / "manifest.json").write_text("{}", encoding="utf-8")
+    (capsule / "failure_inputs.npz").write_bytes(b"evidence")
+    source_manifest = capsule / "manifest.json"
+    old_destination = stage / "failures" / source_manifest.relative_to(failure_work)
+    assert len(str(old_destination)) > 259
+    row = cli._signed_row(
+        {
+            "seed": key[0],
+            "task_id": key[1],
+            "inference_mode": key[2],
+            "completed": False,
+            "failure_evidence_path": str(source_manifest),
+            "action_trace_path": "",
+            "action_trace_sha256": "",
+        }
+    )
+
+    published = cli._published_row(
+        row, root=root, work=work, failure_work=failure_work, stage=stage
+    )
+
+    evidence = Path(published["failure_evidence_path"])
+    assert evidence.parts[-4:-1] == ("failures", cli._attempt_root(failure_work, *key).name, "c" * 64)
+    assert max(len(str(path.resolve())) for path in stage.rglob("*") if path.is_file()) < 240
+    assert (stage / evidence.relative_to(root)).read_bytes() == b"{}"
 
 
 def test_old_final_root_is_preserved_when_new_execution_is_partial(tmp_path):

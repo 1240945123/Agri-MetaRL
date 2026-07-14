@@ -583,15 +583,22 @@ def _published_row(
         published["failure_capsule_identity_sha256"] = ""
     else:
         source = Path(str(row["failure_evidence_path"])).resolve()
+        attempt = _attempt_root(failure_work, *key).resolve()
+        capsule_dir = source.parent
         try:
-            relative_source = source.relative_to(failure_work.resolve())
+            capsule_dir.relative_to(attempt)
         except ValueError as error:
             raise ValueError("failure capsule is not canonical work evidence") from error
         if source.name != "manifest.json" or not source.is_file():
             raise ValueError("failed row capsule manifest is missing")
-        capsule_dir = source.parent
-        relative = Path("failures") / relative_source.parent
-        destination = stage / relative
+        if re.fullmatch(r"[0-9a-f]{64}", capsule_dir.name) is None:
+            raise ValueError("failure capsule directory must be a 64-character SHA-256 identity")
+        relative = Path("failures") / attempt.name / capsule_dir.name
+        destination = (stage / relative).resolve()
+        if stage.resolve() not in destination.parents:
+            raise ValueError("published failure capsule destination escapes stage root")
+        if destination.exists():
+            raise ValueError("published failure capsule destination collision")
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(capsule_dir, destination)
         published["failure_evidence_path"] = str(
