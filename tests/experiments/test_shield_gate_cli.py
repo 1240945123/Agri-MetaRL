@@ -117,10 +117,31 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
     )
     class Model:
         num_timesteps = 10
+        def predict(self, observation, deterministic):
+            return np.array([[0.0]], dtype=np.float32), None
     class Loader:
         @staticmethod
         def load(path, device): return Model()
     class Env:
+        def __init__(self): self.step_count = 0
+        def get_attr(self, name):
+            if name == "N": return [3]
+            raise AttributeError(name)
+        def env_method(self, name, enabled):
+            assert name == "set_ode_diagnostics_enabled"
+        def reset(self): return np.array([[0.0, 1.0]], dtype=np.float32)
+        def step(self, actions):
+            from tests.experiments.test_ode_failure import _info
+            info = _info(0, failure=True)
+            failure = info["integration_failure"]
+            failure["solver_options"] = dict(stage2_source.FORMAL_CVODES_OPTIONS)
+            failure["exception_message"] = "CV_CONV_FAILURE"
+            failure["traceback"] = "RuntimeError: CV_CONV_FAILURE\n"
+            self.step_count += 1
+            return (
+                np.array([[2.0, 3.0]], dtype=np.float32), np.array([-1.0]),
+                np.array([True]), [info],
+            )
         def close(self): pass
     unshield_calls = 0
 
@@ -128,15 +149,9 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
         nonlocal unshield_calls
         unshield_calls += 1
         if unshield_failure and unshield_calls == 1:
-            from tests.experiments.test_ode_failure import _info
-            info = _info(8, failure=True)
-            info["integration_failure"]["solver_options"] = dict(
-                stage2_source.FORMAL_CVODES_OPTIONS
+            return evaluator.run_deterministic_episode(
+                model, env, failure_recorder=failure_recorder
             )
-            failure_recorder.record_step(
-                8, np.array([8.0, 10.0]), -1.0, True, info
-            )
-            raise RuntimeError("CVODES failed deterministically")
         return {
             "episode_return": 100.0, "temp_violation": 1.0,
             "co2_violation": 1.0, "rh_violation": 1.0,

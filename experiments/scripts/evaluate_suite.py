@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import tempfile
 import shutil
 import uuid
@@ -58,6 +59,9 @@ STAGE2_CONDITIONS = (
     "paired_violation_burden_within_5pct",
 )
 FORMAL_UNSHIELDED_METHOD = "agri_metarl_unshielded_formal_v1"
+EARLY_HORIZON_FAILURE = re.compile(
+    r"evaluation episode terminated before configured horizon: step ([1-9]\d*) of ([1-9]\d*)"
+)
 
 
 ALG_MAP = {
@@ -88,6 +92,12 @@ def _validate_attempt_capsule(
     expected_solver_options: Mapping[str, Any],
     error: Exception,
 ) -> tuple[str, Any]:
+    match = EARLY_HORIZON_FAILURE.fullmatch(str(error))
+    if type(error) is not RuntimeError or match is None:
+        raise ValueError("caught exception is not the exact early-horizon RuntimeError")
+    episode_step, configured_horizon = (int(value) for value in match.groups())
+    if episode_step >= configured_horizon:
+        raise ValueError("early-horizon RuntimeError has inconsistent step/horizon")
     capsule = load_failure_capsule(manifest_path.parent)
     expected = {
         "seed": int(expected_context.seed),
@@ -106,8 +116,17 @@ def _validate_attempt_capsule(
     if manifest.get("context") != expected:
         raise ValueError("failure capsule context does not match this evaluation attempt")
     exception = manifest.get("exception", {})
-    if exception != {"type": type(error).__name__, "message": str(error)}:
-        raise ValueError("failure capsule exception does not match the caught exception")
+    if not exception.get("type") or not exception.get("message"):
+        raise ValueError("failure capsule underlying exception fields are empty")
+    if (
+        exception["type"] not in capsule.traceback_text
+        or exception["message"] not in capsule.traceback_text
+    ):
+        raise ValueError("failure capsule traceback does not bind its underlying exception")
+    recorded_step = int(capsule.history_arrays["step_index"][-1])
+    failure_timestep = int(capsule.failure_inputs["timestep"])
+    if recorded_step != episode_step - 1 or failure_timestep != recorded_step:
+        raise ValueError("failure capsule timestep does not match the early episode step")
     solver_options = manifest.get("solver", {}).get("options")
     if solver_options != dict(expected_solver_options) or not solver_options:
         raise ValueError("failure capsule does not prove a configured solver call")

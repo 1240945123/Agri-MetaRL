@@ -201,12 +201,46 @@ def _formal_unshielded_fixture(cli, tmp_path: Path):
     class Model:
         num_timesteps = 10
 
+        def predict(self, observation, deterministic):
+            return np.array([[0.0]], dtype=np.float32), None
+
     class Loader:
         @staticmethod
         def load(path, device):
             return Model()
 
     class Env:
+        def __init__(self):
+            self.step_count = 0
+
+        def get_attr(self, name):
+            if name == "N":
+                return [3]
+            raise AttributeError(name)
+
+        def env_method(self, name, enabled):
+            assert name == "set_ode_diagnostics_enabled"
+
+        def reset(self):
+            return np.array([[0.0, 1.0]], dtype=np.float32)
+
+        def step(self, actions):
+            from tests.experiments.test_ode_failure import _info
+            from experiments.scripts.run_shielded_context_ab import FORMAL_CVODES_OPTIONS
+
+            self.step_count += 1
+            info = _info(0, failure=True)
+            failure = info["integration_failure"]
+            failure["solver_options"] = dict(FORMAL_CVODES_OPTIONS)
+            failure["exception_message"] = "CV_CONV_FAILURE"
+            failure["traceback"] = "RuntimeError: CV_CONV_FAILURE\n"
+            return (
+                np.array([[2.0, 3.0]], dtype=np.float32),
+                np.array([-1.0], dtype=np.float32),
+                np.array([True]),
+                [info],
+            )
+
         def close(self):
             pass
 
@@ -232,6 +266,36 @@ def test_formal_unshielded_rejects_ordinary_failure_without_new_capsule(tmp_path
     assert not (root.parent / f".{root.name}.work" / "eval_raw.csv").exists()
 
 
+def test_formal_unshielded_rejects_capsule_with_non_horizon_runtime_error(tmp_path):
+    from tests.experiments.test_ode_failure import _info
+    from experiments.scripts.run_shielded_context_ab import FORMAL_CVODES_OPTIONS
+
+    cli = _module()
+    args, root, model_map, env_loader = _formal_unshielded_fixture(cli, tmp_path)
+
+    def unrelated_wrapper(model, env, *, failure_recorder):
+        info = _info(0, failure=True)
+        failure = info["integration_failure"]
+        failure["solver_options"] = dict(FORMAL_CVODES_OPTIONS)
+        failure["exception_message"] = "model prediction failed after capsule"
+        failure["traceback"] = "RuntimeError: model prediction failed after capsule\n"
+        failure_recorder.record_step(
+            0, np.array([0.0, 1.0]), -1.0, True, info
+        )
+        raise RuntimeError("model prediction failed after capsule")
+
+    with pytest.raises(RuntimeError, match="model prediction failed after capsule") as caught:
+        cli.run(
+            args,
+            model_map=model_map,
+            env_loader=env_loader,
+            episode_runner=unrelated_wrapper,
+        )
+    assert any("not the exact early-horizon" in note for note in caught.value.__notes__)
+    assert not root.exists()
+    assert not (root.parent / f".{root.name}.work" / "eval_raw.csv").exists()
+
+
 def test_formal_unshielded_never_classifies_keyboard_interrupt(tmp_path):
     cli = _module()
     args, root, model_map, env_loader = _formal_unshielded_fixture(cli, tmp_path)
@@ -251,23 +315,17 @@ def test_formal_unshielded_never_classifies_keyboard_interrupt(tmp_path):
 
 
 def test_formal_unshielded_accepts_exactly_one_matching_failure_capsule(tmp_path):
-    from tests.experiments.test_ode_failure import _info
-
     cli = _module()
     args, root, model_map, env_loader = _formal_unshielded_fixture(cli, tmp_path)
     calls = 0
 
-    def one_solver_failure(model, env, *, failure_recorder):
+    def one_wrapped_solver_failure(model, env, *, failure_recorder):
         nonlocal calls
         calls += 1
         if calls == 1:
-            from experiments.scripts.run_shielded_context_ab import FORMAL_CVODES_OPTIONS
-            info = _info(8, failure=True)
-            info["integration_failure"]["solver_options"] = dict(FORMAL_CVODES_OPTIONS)
-            failure_recorder.record_step(
-                8, np.array([8.0, 10.0]), -1.0, True, info
+            return cli.run_deterministic_episode(
+                model, env, failure_recorder=failure_recorder
             )
-            raise RuntimeError("CVODES failed deterministically")
         return {
             "episode_return": 100.0,
             "temp_violation": 1.0,
@@ -279,7 +337,7 @@ def test_formal_unshielded_accepts_exactly_one_matching_failure_capsule(tmp_path
         args,
         model_map=model_map,
         env_loader=env_loader,
-        episode_runner=one_solver_failure,
+        episode_runner=one_wrapped_solver_failure,
     ) == 182
     frame = pd.read_csv(root / "eval_raw.csv")
     failed = frame.loc[~frame["completed"]]
