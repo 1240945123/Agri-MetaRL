@@ -176,6 +176,37 @@ def test_bootstrap_help_works_outside_repository(tmp_path):
     assert "--legacy_progress" in result.stdout
 
 
+def test_comparator_csv_loader_preserves_culprit_float_identity(tmp_path):
+    culprit = 22696.930518448917
+    row = cli._signed_row({"episode_return": culprit, "status": "completed"})
+    path = tmp_path / "identity.csv"
+    pd.DataFrame([row]).to_csv(path, index=False)
+    default = pd.read_csv(path).iloc[0].to_dict()
+    assert float(default["episode_return"]).hex() != culprit.hex()
+
+    loaded = cli._load_rows(path)[0]
+    assert float(loaded["episode_return"]).hex() == culprit.hex()
+    assert cli._row_identity(loaded) == loaded["row_identity_sha256"]
+
+
+def test_culprit_float_publishes_and_resume_does_not_recompute(tmp_path):
+    culprit = 22696.930518448917
+    kwargs, calls, _ = _inputs(tmp_path)
+    original = kwargs["episode_runner"]
+    def runner(*args, **inner):
+        metrics, diagnostics = original(*args, **inner)
+        metrics["episode_return"] = culprit
+        return metrics, diagnostics
+    kwargs["episode_runner"] = runner
+
+    published = cli.run_unshielded_comparator(**kwargs)
+    assert all(float(value).hex() == culprit.hex() for value in published.episode_return)
+    calls.clear()
+    kwargs["resume"] = True
+    cli.run_unshielded_comparator(**kwargs)
+    assert calls == []
+
+
 def test_injected_successes_publish_exact_immutable_result(tmp_path):
     kwargs, calls, envs = _inputs(tmp_path)
     frame = cli.run_unshielded_comparator(**kwargs)

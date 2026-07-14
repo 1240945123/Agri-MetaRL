@@ -75,6 +75,7 @@ STATUS_FIELDS = (
     "failure_evidence_path",
 )
 EPISODE_SCORING_METRICS = tuple(DEFAULT_METRICS)
+COMPARATOR_CSV_READ_OPTIONS = {"float_precision": "round_trip"}
 RESERVED_ROW_FIELDS = frozenset(
     {
         "seed",
@@ -241,7 +242,9 @@ def _load_rows(path: Path | None) -> list[dict[str, Any]]:
     if path is None or not path.is_file():
         return []
     try:
-        return pd.read_csv(path).to_dict(orient="records")
+        return pd.read_csv(path, **COMPARATOR_CSV_READ_OPTIONS).to_dict(
+            orient="records"
+        )
     except (OSError, UnicodeError, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError):
         return []
 
@@ -406,7 +409,6 @@ def _installed_path(root: Path, value: Any, *, name: str) -> Path:
 
 def _validate_installed_integrity(
     root: Path,
-    table: pd.DataFrame,
     manifest: Mapping[str, Any],
     capsule_evidence: list[Mapping[str, Any]],
     *,
@@ -450,6 +452,12 @@ def _validate_installed_integrity(
         if installed != actual_files[relative] or sha256_file(installed) != digest:
             raise ValueError(f"published file hash mismatch: {relative}")
 
+    try:
+        table = pd.read_csv(
+            root / "eval_raw.csv", **COMPARATOR_CSV_READ_OPTIONS
+        )
+    except (OSError, UnicodeError, ValueError, pd.errors.ParserError) as error:
+        raise ValueError("installed comparator eval_raw.csv is unreadable") from error
     identities = manifest.get("row_identities")
     if not isinstance(identities, list) or "row_identity_sha256" not in table:
         raise ValueError("installed comparator row identities are missing")
@@ -711,7 +719,6 @@ def _publish_comparator(
                 raise ValueError("published comparator consumer round-trip changed exact keys")
             _validate_installed_integrity(
                 root,
-                loaded,
                 loaded_manifest,
                 loaded_capsules,
                 expected_manifest=manifest,
