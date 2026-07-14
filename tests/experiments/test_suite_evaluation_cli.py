@@ -399,6 +399,53 @@ def test_formal_unshielded_accepts_exactly_one_matching_failure_capsule(tmp_path
     assert resumed_calls == 0
 
 
+@pytest.mark.parametrize("tamper", ["delete", "bytes", "identity", "context"])
+def test_formal_unshielded_resume_reruns_stale_failure_capsule(tmp_path, tamper):
+    cli = _module()
+    args, root, model_map, env_loader = _formal_unshielded_fixture(cli, tmp_path)
+    calls = 0
+
+    def initial_runner(model, env, *, failure_recorder):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return cli.run_deterministic_episode(model, env, failure_recorder=failure_recorder)
+        return {"episode_return": 100.0, "temp_violation": 1.0,
+                "co2_violation": 1.0, "rh_violation": 1.0}
+
+    assert cli.run(args, model_map=model_map, env_loader=env_loader, episode_runner=initial_runner) == 182
+    frame = pd.read_csv(root / "eval_raw.csv")
+    capsule_manifest = root / frame.loc[~frame["completed"], "failure_evidence_path"].iloc[0]
+    capsule_dir = capsule_manifest.parent
+    if tamper == "delete":
+        capsule_manifest.unlink()
+    elif tamper == "bytes":
+        with (capsule_dir / "history.npz").open("ab") as handle:
+            handle.write(b"corrupt")
+    else:
+        manifest = json.loads(capsule_manifest.read_text(encoding="utf-8"))
+        if tamper == "identity":
+            manifest["content_identity_sha256"] = "0" * 64
+        else:
+            manifest["context"]["task_id"] = "wrong-task"
+        capsule_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+    args.resume_eval = True
+    rerun_calls = 0
+    def rerun_one(model, env, *, failure_recorder):
+        nonlocal rerun_calls
+        rerun_calls += 1
+        if rerun_calls == 1:
+            return cli.run_deterministic_episode(model, env, failure_recorder=failure_recorder)
+        raise AssertionError("only the stale failed row may rerun")
+    assert cli.run(args, model_map=model_map, env_loader=env_loader, episode_runner=rerun_one) == 182
+    assert rerun_calls == 1
+    repaired = pd.read_csv(root / "eval_raw.csv")
+    repaired_manifest = root / repaired.loc[~repaired["completed"], "failure_evidence_path"].iloc[0]
+    from gl_gym.experiments.ode_failure import load_failure_capsule
+    load_failure_capsule(repaired_manifest.parent)
+
+
 def test_stage2_five_artifact_identity_recomputes_gate_and_rejects_forgery(tmp_path):
     cli = _module()
     decision = _stage2_fixture(cli, tmp_path / "stage2")

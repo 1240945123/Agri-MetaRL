@@ -339,6 +339,7 @@ def _validate_unshielded_status(
     required = {
         "completed", "status", "ode_failure_count", "failure_evidence_path",
         "failure_evidence_identity_sha256", "episode_evidence_identity_sha256",
+        "failure_episode_step", "failure_configured_horizon",
     }
     if not required.issubset(frame.columns):
         raise ValueError("unshielded rows lack explicit completion/failure evidence")
@@ -356,6 +357,8 @@ def _validate_unshielded_status(
                 row.status != "completed" or row.ode_failure_count != 0
                 or not pd.isna(row.failure_evidence_path)
                 or not pd.isna(row.failure_evidence_identity_sha256)
+                or not pd.isna(row.failure_episode_step)
+                or not pd.isna(row.failure_configured_horizon)
             ):
                 raise ValueError("completed unshielded row has inconsistent status evidence")
             if not all(np.isfinite(getattr(row, name)) for name in ("episode_return", "temp_violation", "co2_violation", "rh_violation")):
@@ -398,6 +401,14 @@ def _validate_unshielded_status(
                 != stage2.get("formal_solver_options")
             ):
                 raise ValueError("unshielded failure capsule identity/solver proof mismatch")
+            episode_step = normalized_row["failure_episode_step"]
+            horizon = normalized_row["failure_configured_horizon"]
+            if (
+                episode_step is None or horizon is None or horizon <= episode_step
+                or int(capsule.history_arrays["step_index"][-1]) != episode_step - 1
+                or int(capsule.failure_inputs["timestep"]) != episode_step - 1
+            ):
+                raise ValueError("unshielded failure capsule wrapper/timestep mismatch")
             for evidence_file in path.parent.iterdir():
                 relative = evidence_file.relative_to(root).as_posix()
                 referenced.add(relative)

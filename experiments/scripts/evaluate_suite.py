@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 import shutil
 import uuid
@@ -85,19 +86,13 @@ def _formal_source_checksums(args: argparse.Namespace, payload: Mapping[str, str
     }
 
 
-def _validate_attempt_capsule(
+def _validate_capsule_content(
     manifest_path: Path,
     *,
     expected_context: CapsuleContext,
     expected_solver_options: Mapping[str, Any],
-    error: Exception,
+    episode_step: int,
 ) -> tuple[str, Any]:
-    match = EARLY_HORIZON_FAILURE.fullmatch(str(error))
-    if type(error) is not RuntimeError or match is None:
-        raise ValueError("caught exception is not the exact early-horizon RuntimeError")
-    episode_step, configured_horizon = (int(value) for value in match.groups())
-    if episode_step >= configured_horizon:
-        raise ValueError("early-horizon RuntimeError has inconsistent step/horizon")
     capsule = load_failure_capsule(manifest_path.parent)
     expected = {
         "seed": int(expected_context.seed),
@@ -134,6 +129,86 @@ def _validate_attempt_capsule(
     if not isinstance(identity, str) or len(identity) != 64:
         raise ValueError("failure capsule content identity is invalid")
     return identity, capsule
+
+
+def _validate_attempt_capsule(
+    manifest_path: Path,
+    *,
+    expected_context: CapsuleContext,
+    expected_solver_options: Mapping[str, Any],
+    error: Exception,
+) -> tuple[str, Any, int, int]:
+    match = EARLY_HORIZON_FAILURE.fullmatch(str(error))
+    if type(error) is not RuntimeError or match is None:
+        raise ValueError("caught exception is not the exact early-horizon RuntimeError")
+    episode_step, configured_horizon = (int(value) for value in match.groups())
+    if episode_step >= configured_horizon:
+        raise ValueError("early-horizon RuntimeError has inconsistent step/horizon")
+    identity, capsule = _validate_capsule_content(
+        manifest_path,
+        expected_context=expected_context,
+        expected_solver_options=expected_solver_options,
+        episode_step=episode_step,
+    )
+    return identity, capsule, episode_step, configured_horizon
+
+
+def _path_has_reparse_between(path: Path, root: Path) -> bool:
+    current = path
+    while True:
+        metadata = current.lstat()
+        attributes = getattr(metadata, "st_file_attributes", 0)
+        if current.is_symlink() or attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+            return True
+        if current == root:
+            return False
+        if root not in current.parents:
+            return True
+        current = current.parent
+
+
+def _resumed_failure_capsule_valid(
+    row: Mapping[str, Any], *, expected_context: CapsuleContext,
+    expected_solver_options: Mapping[str, Any], work: Path, result_root: Path,
+) -> bool:
+    try:
+        if (
+            row.get("completed") is not False
+            or row.get("status") != "ode_failure"
+            or row.get("ode_failure_count") != 1
+        ):
+            return False
+        manifest_path = Path(str(row.get("failure_evidence_path", "")))
+        if not manifest_path.is_absolute() or manifest_path.name != "manifest.json":
+            return False
+        resolved = manifest_path.resolve()
+        allowed_roots = (
+            _long_path(work / "failures" / "attempts"),
+            result_root.resolve(),
+        )
+        containing_root = next(
+            (candidate for candidate in allowed_roots if resolved.is_relative_to(candidate)),
+            None,
+        )
+        if containing_root is None or not resolved.is_file() or _path_has_reparse_between(resolved, containing_root):
+            return False
+        episode_step = row.get("failure_episode_step")
+        horizon = row.get("failure_configured_horizon")
+        if (
+            isinstance(episode_step, bool) or not isinstance(episode_step, int)
+            or isinstance(horizon, bool) or not isinstance(horizon, int)
+            or episode_step < 1 or horizon <= episode_step
+        ):
+            return False
+        identity, _ = _validate_capsule_content(
+            resolved,
+            expected_context=expected_context,
+            expected_solver_options=expected_solver_options,
+            episode_step=episode_step,
+        )
+        return identity == row.get("failure_evidence_identity_sha256")
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        return False
 
 
 def filter_tasks(
@@ -237,6 +312,9 @@ _ROW_NULLABLE_METRICS = frozenset({
 _ROW_EMPTY_TEXT_FIELDS = frozenset({
     "failure_evidence_path", "failure_evidence_identity_sha256",
 })
+_ROW_NULLABLE_INTEGER_FIELDS = frozenset({
+    "failure_episode_step", "failure_configured_horizon",
+})
 
 
 def canonical_evaluation_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -251,6 +329,13 @@ def canonical_evaluation_row(row: Mapping[str, Any]) -> dict[str, Any]:
         )
         if name in _ROW_EMPTY_TEXT_FIELDS:
             result[name] = "" if missing else str(value)
+        elif name in _ROW_NULLABLE_INTEGER_FIELDS:
+            if missing:
+                result[name] = None
+            elif isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)) or not float(value).is_integer():
+                raise TypeError(f"evaluation row {name} must be a nullable strict integer")
+            else:
+                result[name] = int(value)
         elif name in _ROW_NULLABLE_METRICS and missing:
             result[name] = None
         elif name in _ROW_INTEGER_FIELDS:
@@ -959,6 +1044,7 @@ def run_formal_unshielded_evaluation(
     except AssertionError as error:
         raise ValueError("formal unshielded evaluation requires exact canonical tasks") from error
     task_records = [task_from_row(row) for row in tasks.itertuples(index=False)]
+    task_by_id = {task.task_id: task for task in task_records}
     approved = {int(item["seed"]): item for item in stage2_manifest["checkpoints"]}
     if set(approved) != {42, 123} or any("checkpoint_steps" not in item for item in approved.values()):
         raise ValueError("authentic Stage-2 checkpoints must bind seeds and checkpoint_steps")
@@ -996,6 +1082,7 @@ def run_formal_unshielded_evaluation(
         "source_manifest_sha256", "runs_csv_sha256", "tasks_csv_sha256",
         "stage2_identity_sha256", "episode_evidence_identity_sha256", "completed", "status",
         "ode_failure_count", "failure_evidence_path", "failure_evidence_identity_sha256",
+        "failure_episode_step", "failure_configured_horizon",
     }
     if not progress.empty and (
         not required_progress.issubset(progress.columns) or progress.duplicated(["seed", "task_id"]).any()
@@ -1032,7 +1119,33 @@ def run_formal_unshielded_evaluation(
             try:
                 normalized_old = canonical_evaluation_row(old)
                 if all(normalized_old[name] == value for name, value in expected_fields.items()):
-                    if normalized_old["episode_evidence_identity_sha256"] == evaluation_row_identity(normalized_old):
+                    task = task_by_id[str(normalized_old["task_id"])]
+                    expected_context = CapsuleContext(
+                        seed=int(run_row.seed), task_id=task.task_id,
+                        inference_mode="stage3_unshielded", task=dict(vars(task)),
+                        checkpoint_path=str(Path(run_row.model_path).resolve()),
+                        checkpoint_sha256=model_sha,
+                        git_head=execution_provenance["git_commit"],
+                        dirty=execution_provenance["dirty"],
+                        source_checksums=source_checksums,
+                        package_versions=package_versions,
+                        formal_result_root=str(root.resolve()),
+                    )
+                    status_valid = (
+                        normalized_old["completed"] is True
+                        and normalized_old["status"] == "completed"
+                        and normalized_old["failure_evidence_path"] == ""
+                        and normalized_old["failure_evidence_identity_sha256"] == ""
+                        and normalized_old["failure_episode_step"] is None
+                        and normalized_old["failure_configured_horizon"] is None
+                    ) or _resumed_failure_capsule_valid(
+                        normalized_old,
+                        expected_context=expected_context,
+                        expected_solver_options=stage2_manifest["formal_solver_options"],
+                        work=work,
+                        result_root=root,
+                    )
+                    if status_valid and normalized_old["episode_evidence_identity_sha256"] == evaluation_row_identity(normalized_old):
                         completed[(int(run_row.seed), str(normalized_old["task_id"]))] = normalized_old
             except (KeyError, TypeError, ValueError): pass
         for task in task_records:
@@ -1065,13 +1178,18 @@ def run_formal_unshielded_evaluation(
             manifests = sorted(attempt_root.rglob("manifest.json")) if attempt_root.exists() else []
             failure_path = ""
             failure_identity = ""
+            failure_episode_step = None
+            failure_configured_horizon = None
             if error is not None:
                 try:
                     if len(manifests) != 1:
                         raise ValueError(
                             f"expected exactly one new failure capsule, found {len(manifests)}"
                         )
-                    failure_identity, _ = _validate_attempt_capsule(
+                    (
+                        failure_identity, _, failure_episode_step,
+                        failure_configured_horizon,
+                    ) = _validate_attempt_capsule(
                         manifests[0], expected_context=context,
                         expected_solver_options=stage2_manifest["formal_solver_options"],
                         error=error,
@@ -1094,6 +1212,8 @@ def run_formal_unshielded_evaluation(
                 **metrics, "completed": error is None, "status": "completed" if error is None else "ode_failure",
                 "ode_failure_count": 0 if error is None else 1, "failure_evidence_path": failure_path,
                 "failure_evidence_identity_sha256": failure_identity,
+                "failure_episode_step": failure_episode_step,
+                "failure_configured_horizon": failure_configured_horizon,
                 "model_sha256": model_sha, "vecnormalize_sha256": vec_sha,
                 "checkpoint_steps": int(checkpoint_steps), "source_fingerprint_sha256": source_fingerprint,
                 "runtime_source_tree_sha256": runtime_sha,
