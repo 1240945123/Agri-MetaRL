@@ -335,7 +335,7 @@ def test_first_publish_partial_copy_is_removed_before_retry_episode(
     assert not root.exists()
 
 
-def test_verified_copy_with_interrupted_stage_cleanup_is_rejected_on_restart(
+def test_verified_copy_with_interrupted_stage_cleanup_is_kept_on_restart(
     tmp_path, monkeypatch
 ):
     kwargs, _, _ = _inputs(tmp_path)
@@ -360,12 +360,61 @@ def test_verified_copy_with_interrupted_stage_cleanup_is_rejected_on_restart(
     observed = []
     def fail_after_recovery(*args, **inner):
         observed.append(root.exists())
-        raise RuntimeError("rerun untrusted candidate")
+        raise RuntimeError("verified final remained")
     kwargs["episode_runner"] = fail_after_recovery
-    with pytest.raises(RuntimeError, match="rerun untrusted candidate"):
+    with pytest.raises(RuntimeError, match="verified final remained"):
         cli.run_unshielded_comparator(**kwargs)
-    assert observed == [False]
-    assert not root.exists() and not stage.exists()
+    assert observed == [True]
+    assert root.exists() and not stage.exists()
+
+
+def test_verified_commit_survives_backup_cleanup_marker_interruption(
+    tmp_path, monkeypatch
+):
+    kwargs, _, _ = _inputs(tmp_path)
+    cli.run_unshielded_comparator(**kwargs)
+    root = Path(kwargs["result_root"])
+    marker = cli._transaction_path(root)
+    real_unlink = Path.unlink
+    kwargs["resume"] = True
+    def interrupt_verified_marker(self, *args, **inner):
+        if self.resolve() == marker.resolve() and self.is_file():
+            payload = cli._strict_json(self)
+            if payload.get("state") == "consumer_verified":
+                raise KeyboardInterrupt()
+        return real_unlink(self, *args, **inner)
+    monkeypatch.setattr(Path, "unlink", interrupt_verified_marker)
+    with pytest.raises(KeyboardInterrupt):
+        cli.run_unshielded_comparator(**kwargs)
+    backup = root.parent / f".{root.name}.backup"
+    assert root.exists() and marker.exists() and not backup.exists()
+
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    observed = []
+    kwargs["resume"] = False
+    def fail_after_recovery(*args, **inner):
+        observed.append(root.exists())
+        raise RuntimeError("verified commit recovered")
+    kwargs["episode_runner"] = fail_after_recovery
+    with pytest.raises(RuntimeError, match="verified commit recovered"):
+        cli.run_unshielded_comparator(**kwargs)
+    assert observed == [True]
+    assert root.exists() and not marker.exists()
+
+
+def test_tampered_verified_commit_is_never_accepted(tmp_path):
+    kwargs, calls, _ = _inputs(tmp_path)
+    cli.run_unshielded_comparator(**kwargs)
+    root = Path(kwargs["result_root"])
+    cli._write_transaction(
+        root, "consumer_verified", tree_identity_sha256=cli._tree_identity(root)
+    )
+    (root / "eval_raw.csv").write_text("tampered", encoding="utf-8")
+    calls.clear()
+    kwargs["resume"] = False
+    with pytest.raises(RuntimeError, match="verified.*identity|identity.*verified"):
+        cli.run_unshielded_comparator(**kwargs)
+    assert calls == []
 
 
 def test_publish_copy_fallback_failure_restores_unique_old_root(tmp_path, monkeypatch):

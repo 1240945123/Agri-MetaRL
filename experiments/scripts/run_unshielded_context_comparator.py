@@ -349,11 +349,16 @@ def _transaction_temporary_path(root: Path) -> Path:
     return _transaction_path(root).with_suffix(".tmp")
 
 
-def _write_transaction(root: Path, state: str) -> None:
+def _write_transaction(
+    root: Path, state: str, *, tree_identity_sha256: str | None = None
+) -> None:
     marker = _transaction_path(root)
     temporary = _transaction_temporary_path(root)
+    payload = {"state": state, "result_root": str(root.resolve())}
+    if tree_identity_sha256 is not None:
+        payload["tree_identity_sha256"] = tree_identity_sha256
     temporary.write_text(
-        json.dumps({"state": state, "result_root": str(root.resolve())}),
+        json.dumps(payload, sort_keys=True),
         encoding="utf-8",
     )
     temporary.replace(marker)
@@ -365,6 +370,28 @@ def _tree_file_hashes(root: Path) -> dict[str, str]:
         for path in root.rglob("*")
         if path.is_file()
     }
+
+
+def _tree_identity(root: Path) -> str:
+    canonical = json.dumps(
+        _tree_file_hashes(root), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _verified_transaction_matches(
+    root: Path, transaction: Mapping[str, Any]
+) -> bool:
+    try:
+        identity = str(transaction["tree_identity_sha256"])
+        return (
+            transaction.get("state") == "consumer_verified"
+            and Path(str(transaction["result_root"])).resolve() == root.resolve()
+            and len(identity) == 64
+            and identity == _tree_identity(root)
+        )
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
 
 
 def _restore_backup(root: Path, backup: Path) -> None:
@@ -382,13 +409,22 @@ def _recover_publication(root: Path) -> None:
 
     backup = root.parent / f".{root.name}.backup"
     marker = _transaction_path(root)
+    transaction: dict[str, Any] = {}
     state: str | None = None
     if marker.is_file():
-        state = str(_strict_json(marker).get("state"))
+        transaction = _strict_json(marker)
+        state = str(transaction.get("state"))
     if not backup.exists():
-        if state in {
-            "candidate_pending", "candidate_installed", "consumer_verified"
-        }:
+        if state == "consumer_verified":
+            if not root.exists() or not _verified_transaction_matches(root, transaction):
+                raise RuntimeError("verified comparator transaction identity mismatch")
+            stage = root.parent / f".{root.name}.publish"
+            if stage.exists():
+                shutil.rmtree(stage)
+            _transaction_temporary_path(root).unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+            return
+        if state in {"candidate_pending", "candidate_installed"}:
             stage = root.parent / f".{root.name}.publish"
             if root.exists():
                 shutil.rmtree(root)
@@ -417,7 +453,19 @@ def _recover_publication(root: Path) -> None:
         else:
             _restore_backup(root, backup)
         return
-    if state in {"candidate_pending", "candidate_installed", "consumer_verified"}:
+    if state == "consumer_verified":
+        stage = root.parent / f".{root.name}.publish"
+        if root.exists() and _verified_transaction_matches(root, transaction):
+            shutil.rmtree(backup)
+            if stage.exists():
+                shutil.rmtree(stage)
+            marker.unlink(missing_ok=True)
+        else:
+            _restore_backup(root, backup)
+            if stage.exists():
+                shutil.rmtree(stage)
+        return
+    if state in {"candidate_pending", "candidate_installed"}:
         _restore_backup(root, backup)
         return
     if state == "restored_copy":
@@ -566,7 +614,11 @@ def _publish_comparator(
                 _key(row) for row in published_rows
             }:
                 raise ValueError("published comparator consumer round-trip changed exact keys")
-            _write_transaction(root, "consumer_verified")
+            _write_transaction(
+                root,
+                "consumer_verified",
+                tree_identity_sha256=_tree_identity(root),
+            )
         except BaseException:
             if had_old and backup.exists():
                 _restore_backup(root, backup)
