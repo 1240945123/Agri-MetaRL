@@ -200,30 +200,90 @@ def _load_evaluation_manifest(eval_path: str | Path, *, label: str) -> dict[str,
         not isinstance(manifest.get("checkpoints"), list)
         or not manifest.get("source_fingerprint_sha256")
         or not manifest.get("runtime_source_tree_sha256")
+        or not isinstance(manifest.get("source_fingerprint_inputs"), dict)
     ):
         raise ValueError(f"{label} evaluation manifest checkpoint/source provenance is incomplete")
+    from experiments.scripts.evaluate_suite import _canonical_hash
+    source_inputs = manifest["source_fingerprint_inputs"]
+    if set(source_inputs) != {"runtime_source_tree_sha256", "evaluator_source_sha256", "gate_source_sha256"}:
+        raise ValueError(f"{label} source fingerprint inputs have invalid exact schema")
+    if manifest["source_fingerprint_sha256"] != _canonical_hash(source_inputs):
+        raise ValueError(f"{label} source fingerprint is not authentic to its inputs")
     from experiments.scripts.run_shielded_context_ab import _runtime_source_tree_sha256
     if manifest["runtime_source_tree_sha256"] != _runtime_source_tree_sha256():
         raise ValueError(f"{label} runtime source provenance is stale")
+    if manifest.get("evaluator_source_sha256") != _sha(ROOT / "experiments/scripts/evaluate_suite.py"):
+        raise ValueError(f"{label} evaluator source provenance is stale")
+    if manifest.get("gate_source_sha256") != _sha(Path(__file__)):
+        raise ValueError(f"{label} gate source provenance is stale")
+    if (
+        source_inputs["runtime_source_tree_sha256"] != manifest["runtime_source_tree_sha256"]
+        or source_inputs["evaluator_source_sha256"] != manifest["evaluator_source_sha256"]
+        or source_inputs["gate_source_sha256"] != manifest["gate_source_sha256"]
+    ):
+        raise ValueError(f"{label} source fingerprint inputs are stale")
     return manifest
 
 
-def _validate_metric_provenance(frame: pd.DataFrame, manifest: dict[str, Any], *, label: str) -> None:
-    required = {"model_sha256", "vecnormalize_sha256", "checkpoint_steps", "source_fingerprint_sha256"}
+def _validate_metric_provenance(
+    frame: pd.DataFrame, manifest: dict[str, Any], *, label: str,
+    approved: dict[int, dict[str, Any]], stage2_identity: str, runtime_sha: str,
+) -> None:
+    required = {
+        "model_sha256", "vecnormalize_sha256", "checkpoint_steps", "source_fingerprint_sha256",
+        "runtime_source_tree_sha256", "stage2_identity_sha256",
+    }
     if not required.issubset(frame.columns):
         raise ValueError(f"{label} rows are missing checkpoint/source provenance")
     checkpoints = {int(row["seed"]): row for row in manifest["checkpoints"]}
     for row in frame.itertuples(index=False):
         expected = checkpoints.get(int(row.seed))
-        if expected is None or row.model_sha256 != expected["model_sha256"] or row.vecnormalize_sha256 != expected["vecnormalize_sha256"]:
+        authentic = approved.get(int(row.seed))
+        if (
+            expected is None or authentic is None
+            or row.model_sha256 != expected["model_sha256"] or row.vecnormalize_sha256 != expected["vecnormalize_sha256"]
+            or row.model_sha256 != authentic["model_sha256"] or row.vecnormalize_sha256 != authentic["vecnormalize_sha256"]
+        ):
             raise ValueError(f"{label} row checkpoint provenance is invalid")
         steps = row.checkpoint_steps
         if isinstance(steps, (bool, np.bool_)) or not isinstance(steps, (int, np.integer)) or int(steps) < 0:
             raise ValueError(f"{label} checkpoint_steps must be a strict nonnegative integer")
-        if "checkpoint_steps" in expected and int(steps) != expected["checkpoint_steps"]:
+        if int(steps) != expected.get("checkpoint_steps") or int(steps) != authentic.get("checkpoint_steps"):
             raise ValueError(f"{label} checkpoint_steps mismatch")
         if row.source_fingerprint_sha256 != manifest["source_fingerprint_sha256"]:
             raise ValueError(f"{label} source fingerprint mismatch")
+        if row.runtime_source_tree_sha256 != runtime_sha or row.stage2_identity_sha256 != stage2_identity:
+            raise ValueError(f"{label} runtime/Stage-2 provenance mismatch")
+
+
+def _validate_unshielded_status(frame: pd.DataFrame, manifest: dict[str, Any], eval_path: str | Path) -> None:
+    required = {"completed", "status", "ode_failure_count", "failure_evidence_path"}
+    if not required.issubset(frame.columns):
+        raise ValueError("unshielded rows lack explicit completion/failure evidence")
+    root = Path(eval_path).resolve().parent
+    referenced: set[str] = set()
+    for row in frame.itertuples(index=False):
+        completed = row.completed
+        if not isinstance(completed, (bool, np.bool_)):
+            raise ValueError("unshielded completed must be strict boolean")
+        if completed:
+            if row.status != "completed" or row.ode_failure_count != 0 or not pd.isna(row.failure_evidence_path):
+                raise ValueError("completed unshielded row has inconsistent status evidence")
+            if not all(np.isfinite(getattr(row, name)) for name in ("episode_return", "temp_violation", "co2_violation", "rh_violation")):
+                raise ValueError("completed unshielded metrics must be finite")
+        else:
+            if row.status != "ode_failure" or row.ode_failure_count < 1:
+                raise ValueError("incomplete unshielded row lacks ODE failure status")
+            if not all(pd.isna(getattr(row, name)) for name in ("episode_return", "temp_violation", "co2_violation", "rh_violation")):
+                raise ValueError("incomplete unshielded metrics must be non-scoring")
+            path = _evidence_path(row.failure_evidence_path, eval_path)
+            if not path.is_relative_to(root) or not path.is_file() or path.is_symlink():
+                raise ValueError("unshielded failure evidence is missing/outside result root")
+            relative = path.relative_to(root).as_posix(); referenced.add(relative)
+            if manifest.get("failure_evidence_sha256", {}).get(relative) != _sha(path):
+                raise ValueError("unshielded failure evidence hash is stale")
+    if set(manifest.get("failure_evidence_sha256", {})) != referenced:
+        raise ValueError("unshielded failure evidence tree has missing/extra identities")
 
 
 def _validate_intervention_evidence(
@@ -292,6 +352,7 @@ def _validate_intervention_evidence(
             name: getattr(row, name) for name in (
                 "algorithm", "method", "model_sha256", "vecnormalize_sha256", "checkpoint_steps",
                 "source_fingerprint_sha256", "stage2_identity_sha256", "suite_id", "seed", "task_id",
+                "runtime_source_tree_sha256",
                 "split", "weather_year", "start_day", "uncertainty_scale", "economic_scenario",
                 "climate_constraint_scenario", "executed_action_trace_sha256",
                 "requested_action_trace_sha256", "intervention_records_sha256",
@@ -328,8 +389,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if seeds != {42, 123} or len(checkpoints) != 2:
         raise ValueError("Stage-3 requires the exact approved seeds 42 and 123")
     expected = {(seed, task_id) for seed in seeds for task_id in tasks["task_id"]}
+    approved_map = {int(item["seed"]): item for item in checkpoints}
+    if any("checkpoint_steps" not in item for item in approved_map.values()):
+        raise ValueError("authentic Stage-2 checkpoints are missing checkpoint_steps")
+    runtime_sha = stage2["runtime_source_tree_sha256"]
     shield_manifest = _load_evaluation_manifest(args.shielded_eval, label="shielded")
     unshield_manifest = _load_evaluation_manifest(args.unshielded_eval, label="unshielded")
+    if shield_manifest.get("schema_version") != "full-suite-shield-evaluation-v1" or shield_manifest.get("method") != SHIELD_METHOD:
+        raise ValueError("shielded evaluation manifest schema/method is invalid")
+    from experiments.scripts.evaluate_suite import FORMAL_UNSHIELDED_METHOD
+    if (
+        unshield_manifest.get("schema_version") != "formal-unshielded-evaluation-v1"
+        or unshield_manifest.get("method") != FORMAL_UNSHIELDED_METHOD
+        or unshield_manifest.get("formal_complete") is not True
+    ):
+        raise ValueError("unshielded evaluation manifest is not the formal comparator protocol")
+    if shield_manifest["source_fingerprint_sha256"] != unshield_manifest["source_fingerprint_sha256"]:
+        raise ValueError("shielded and unshielded source fingerprints do not match")
     for label, manifest in (("shielded", shield_manifest), ("unshielded", unshield_manifest)):
         manifest_seeds = [int(item["seed"]) for item in manifest["checkpoints"]]
         if len(manifest_seeds) != len(seeds) or set(manifest_seeds) != seeds:
@@ -342,8 +418,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("shielded evaluation Stage-2 identity is stale")
     shield = _strict_keys(pd.read_csv(args.shielded_eval), label="shielded", expected=expected)
     unshield = _strict_keys(pd.read_csv(args.unshielded_eval), label="unshielded", expected=expected)
-    _validate_metric_provenance(shield, shield_manifest, label="shielded")
-    _validate_metric_provenance(unshield, unshield_manifest, label="unshielded")
+    _validate_metric_provenance(shield, shield_manifest, label="shielded", approved=approved_map, stage2_identity=stage2["stage2_identity_sha256"], runtime_sha=runtime_sha)
+    _validate_metric_provenance(unshield, unshield_manifest, label="unshielded", approved=approved_map, stage2_identity=stage2["stage2_identity_sha256"], runtime_sha=runtime_sha)
+    _validate_unshielded_status(unshield, unshield_manifest, args.unshielded_eval)
     if set(shield["algorithm"]) != {SHIELD_ALGORITHM} or set(unshield["algorithm"]) != {BASE_ALGORITHM}:
         raise ValueError("shielded/unshielded algorithm identifiers are invalid")
     if "method" in shield and set(shield["method"]) != {SHIELD_METHOD}:
@@ -353,7 +430,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _validate_descriptors(shield, tasks, "shielded"); _validate_descriptors(unshield, tasks, "unshielded")
 
     interventions = _strict_keys(pd.read_csv(args.interventions), label="interventions", expected=expected)
-    _validate_metric_provenance(interventions, shield_manifest, label="interventions")
+    _validate_metric_provenance(interventions, shield_manifest, label="interventions", approved=approved_map, stage2_identity=stage2["stage2_identity_sha256"], runtime_sha=runtime_sha)
     if "method" not in interventions or set(interventions["method"]) != {SHIELD_METHOD}:
         raise ValueError("intervention method provenance is invalid")
     if set(interventions["algorithm"]) != {SHIELD_ALGORITHM}:

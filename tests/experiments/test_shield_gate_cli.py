@@ -78,37 +78,62 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
         "rule_config_sha256": rule_sha,
         "env_config_sha256": evaluator._sha(stage2_source.ENV_CONFIG_PATH),
         "runtime_source_tree_sha256": stage2_source._runtime_source_tree_sha256(),
+        "evaluator_source_sha256": evaluator._sha(Path(evaluator.__file__)),
+        "gate_source_sha256": evaluator._sha(Path(cli.__file__)),
         "fixed_lambdas": list(stage2_source.DEFAULT_LAMBDAS),
         "formal_solver_options": dict(stage2_source.FORMAL_CVODES_OPTIONS),
         **stage2_source._behavior_source_hashes(),
     })
+    model_paths, vec_paths = {}, {}
+    for seed in (42, 123):
+        model_paths[seed] = tmp_path / f"model-{seed}.zip"; model_paths[seed].write_bytes(f"model{seed}".encode())
+        vec_paths[seed] = tmp_path / f"vec-{seed}.pkl"; vec_paths[seed].write_bytes(f"vec{seed}".encode())
+    stage2_manifest["checkpoints"] = [
+        {"seed": seed, "model_sha256": evaluator._sha(model_paths[seed]),
+         "vecnormalize_sha256": evaluator._sha(vec_paths[seed]), "checkpoint_steps": 10}
+        for seed in (42, 123)
+    ]
     stage2_manifest_path.write_text(json.dumps(stage2_manifest), encoding="utf-8")
     stage2_identity = evaluator.load_stage2_evidence(stage2_decision)["stage2_identity_sha256"]
     seeds = (42, 123)
     checkpoint_map = {int(item["seed"]): item for item in stage2_manifest["checkpoints"]}
-    source_fingerprint = "e" * 64
+    source_inputs = {
+        "runtime_source_tree_sha256": stage2_source._runtime_source_tree_sha256(),
+        "evaluator_source_sha256": evaluator._sha(Path(evaluator.__file__)),
+        "gate_source_sha256": evaluator._sha(Path(cli.__file__)),
+    }
+    source_fingerprint = evaluator._canonical_hash(source_inputs)
     descriptors = [
         {**row._asdict(), "seed": seed, "suite_id": suite.suite_id}
         for seed in seeds for row in tasks.itertuples(index=False)
     ]
-    unshield = pd.DataFrame([
-        {**row, "algorithm": cli.BASE_ALGORITHM, "episode_return": 100.0,
-         "temp_violation": 1.0, "co2_violation": 1.0, "rh_violation": 1.0,
-         "completed": True, "ode_failure_count": 0,
-         "model_sha256": checkpoint_map[row["seed"]]["model_sha256"],
-         "vecnormalize_sha256": checkpoint_map[row["seed"]]["vecnormalize_sha256"],
-         "checkpoint_steps": 10, "source_fingerprint_sha256": source_fingerprint}
-        for row in descriptors
-    ])
-    unshield_root = tmp_path / "unshielded-full"; unshield_root.mkdir()
-    unshield_path = unshield_root / "eval_raw.csv"; unshield.to_csv(unshield_path, index=False)
-    unshield_manifest = {
-        "result_root": str(unshield_root.resolve()), "eval_raw_sha256": evaluator._sha(unshield_path),
-        "checkpoints": [{**item, "checkpoint_steps": 10} for item in stage2_manifest["checkpoints"]],
-        "source_fingerprint_sha256": source_fingerprint,
-        "runtime_source_tree_sha256": stage2_source._runtime_source_tree_sha256(),
-    }
-    (unshield_root / "evaluation_manifest.json").write_text(json.dumps(unshield_manifest), encoding="utf-8")
+    runs = pd.DataFrame([{
+        "suite_id": suite.suite_id, "algorithm": "agri_metarl", "seed": seed,
+        "run_name": f"agri_metarl_seed{seed}", "model_path": str(model_paths[seed]),
+        "vecnormalize_path": str(vec_paths[seed]), "status": "completed",
+    } for seed in (42, 123)])
+    runs_path = tmp_path / "runs.csv"; runs.to_csv(runs_path, index=False)
+    unshield_root = tmp_path / "unshielded-full"
+    unshield_args = SimpleNamespace(
+        manifest=str(manifest_path), runs_csv=str(runs_path), tasks_csv=str(tasks_path),
+        algorithms=["agri_metarl"], seeds=[42, 123], splits=None, task_ids=None, limit_tasks=None,
+        resume_eval=False, action_shield=False, formal_unshielded_provenance=True,
+        stage2_decision=str(stage2_decision), result_root=str(unshield_root), interventions_out=None,
+    )
+    class Model:
+        num_timesteps = 10
+    class Loader:
+        @staticmethod
+        def load(path, device): return Model()
+    class Env:
+        def close(self): pass
+    evaluator.run(
+        unshield_args, model_map={"agri_metarl": Loader},
+        env_loader=lambda *args, **kwargs: Env(),
+        episode_runner=lambda model, env: {"episode_return": 100.0, "temp_violation": 1.0,
+                                           "co2_violation": 1.0, "rh_violation": 1.0},
+    )
+    unshield_path = unshield_root / "eval_raw.csv"
     work = tmp_path / "shield-work"; work.mkdir()
     shield_rows, intervention_rows = [], []
     base_record = {
@@ -156,6 +181,7 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
             "model_sha256": checkpoint_map[row["seed"]]["model_sha256"],
             "vecnormalize_sha256": checkpoint_map[row["seed"]]["vecnormalize_sha256"],
             "checkpoint_steps": 10, "source_fingerprint_sha256": source_fingerprint,
+            "runtime_source_tree_sha256": stage2_source._runtime_source_tree_sha256(),
             "stage2_identity_sha256": stage2_identity,
             "completed": ode_failures == 0 or bool(shield_rows),
             "formal_complete": True, "ode_failure_count": 0,
@@ -168,6 +194,7 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
         identity_payload = {name: common[name] for name in (
             "algorithm", "method", "model_sha256", "vecnormalize_sha256", "checkpoint_steps",
             "source_fingerprint_sha256", "stage2_identity_sha256", "suite_id", "seed", "task_id",
+            "runtime_source_tree_sha256",
             "split", "weather_year", "start_day", "uncertainty_scale", "economic_scenario",
             "climate_constraint_scenario", "episode_return", "temp_violation", "co2_violation",
             "rh_violation", "executed_action_trace_sha256", "requested_action_trace_sha256",
@@ -184,6 +211,9 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
             "checkpoints": [{**item, "checkpoint_steps": 10} for item in stage2_manifest["checkpoints"]],
             "stage2_identity_sha256": stage2_identity, "source_fingerprint_sha256": source_fingerprint,
             "runtime_source_tree_sha256": stage2_source._runtime_source_tree_sha256(),
+            "evaluator_source_sha256": evaluator._sha(Path(evaluator.__file__)),
+            "gate_source_sha256": evaluator._sha(Path(cli.__file__)),
+            "source_fingerprint_inputs": source_inputs,
         },
     )
     paths = {
@@ -263,6 +293,23 @@ def test_wrong_checkpoint_row_rejected_even_with_updated_file_hash(tmp_path, mon
         manifest["eval_raw_sha256"] = evaluator._sha(paths["shielded_eval"])
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="checkpoint"):
+        _gate_case(cli, tmp_path, monkeypatch, tamper=tamper)
+
+
+@pytest.mark.parametrize("field", ["model_sha256", "checkpoint_steps", "source_fingerprint_sha256"])
+def test_unshielded_self_declared_provenance_rejected(tmp_path, monkeypatch, field):
+    cli = _module()
+    def tamper(paths):
+        frame = pd.read_csv(paths["unshielded_eval"])
+        frame.loc[0, field] = "0" * 64 if field != "checkpoint_steps" else 999
+        frame.to_csv(paths["unshielded_eval"], index=False)
+        manifest_path = paths["unshielded_eval"].parent / "evaluation_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["eval_raw_sha256"] = evaluator._sha(paths["unshielded_eval"])
+        if field == "source_fingerprint_sha256":
+            manifest[field] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="checkpoint|source"):
         _gate_case(cli, tmp_path, monkeypatch, tamper=tamper)
 
 

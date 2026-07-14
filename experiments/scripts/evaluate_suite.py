@@ -52,6 +52,7 @@ STAGE2_CONDITIONS = (
     "paired_return_loss_within_2pct",
     "paired_violation_burden_within_5pct",
 )
+FORMAL_UNSHIELDED_METHOD = "agri_metarl_unshielded_formal_v1"
 
 
 ALG_MAP = {
@@ -98,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip algorithm/seed/task rows already present in eval_raw.csv.",
     )
     parser.add_argument("--action_shield", action="store_true")
+    parser.add_argument("--formal_unshielded_provenance", action="store_true")
     parser.add_argument("--stage2_decision")
     parser.add_argument("--result_root")
     parser.add_argument("--interventions_out")
@@ -106,9 +108,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_cli_mode(args: argparse.Namespace) -> None:
     shield_only = (args.stage2_decision, args.result_root, args.interventions_out)
-    if args.action_shield:
+    formal_unshielded = getattr(args, "formal_unshielded_provenance", False)
+    if args.action_shield and formal_unshielded:
+        raise ValueError("shielded and formal unshielded modes are mutually exclusive")
+    if args.action_shield or formal_unshielded:
         if args.stage2_decision is None or args.result_root is None:
-            raise ValueError("--action_shield requires --stage2_decision and --result_root")
+            raise ValueError("formal evaluation requires --stage2_decision and --result_root")
     elif any(value is not None for value in shield_only):
         raise ValueError("shield-only arguments require --action_shield")
 
@@ -155,9 +160,11 @@ def load_stage2_evidence(decision_path: str | Path) -> dict[str, Any]:
         raise ValueError("Stage-2 manifest schema/method is invalid")
     if Path(str(manifest.get("result_root", ""))).resolve() != root:
         raise ValueError("Stage-2 manifest result_root does not bind the artifact root")
+    from experiments.scripts.run_context_ab import APPROVED_SEEDS
+    from gl_gym.experiments.context_ab import DIAGNOSTIC_TASK_IDS, MODES
     seeds, task_ids, modes = manifest.get("seeds"), manifest.get("task_ids"), manifest.get("inference_modes")
-    if not all(isinstance(value, list) and value for value in (seeds, task_ids, modes)):
-        raise ValueError("Stage-2 manifest protocol design is incomplete")
+    if seeds != list(APPROVED_SEEDS) or task_ids != list(DIAGNOSTIC_TASK_IDS) or modes != list(MODES):
+        raise ValueError("Stage-2 manifest is not the exact approved diagnostic protocol")
     expected = {(seed, task, mode) for seed in seeds for task in task_ids for mode in modes}
     raw = pd.read_csv(paths["eval_raw.csv"])
     stored_paired = pd.read_csv(paths["paired_deltas.csv"])
@@ -168,6 +175,11 @@ def load_stage2_evidence(decision_path: str | Path) -> dict[str, Any]:
             raise ValueError(f"Stage-2 {label} keys are invalid")
         if set(frame[key_columns].itertuples(index=False, name=None)) != expected:
             raise ValueError(f"Stage-2 {label} keys do not match its manifest protocol")
+    trace_columns = (
+        "executed_action_trace_path", "requested_action_trace_path", "intervention_records_path"
+    )
+    if any(column not in raw for column in trace_columns):
+        raise ValueError("Stage-2 raw evidence is missing required trace/record paths")
     unshielded_root = Path(str(manifest.get("unshielded_result_root", ""))).resolve()
     unshielded_path = unshielded_root / "eval_raw.csv"
     manifest_candidates = [unshielded_root / name for name in ("shield_manifest.json", "manifest.json", "context_ab_manifest.json", "diagnostic_manifest.json")]
@@ -207,21 +219,39 @@ def load_stage2_evidence(decision_path: str | Path) -> dict[str, Any]:
     for column in summary_columns:
         if not merged[f"{column}_raw"].equals(merged[f"{column}_interventions"]):
             raise ValueError(f"Stage-2 intervention evidence mismatch: {column}")
+    from experiments.scripts.run_shielded_context_ab import (
+        _json_records, _validate_trace_record_consistency,
+    )
     evidence_hashes: dict[str, str] = {}
-    for column in ("executed_action_trace_path", "requested_action_trace_path", "intervention_records_path"):
-        if column not in raw:
-            continue
-        hash_column = column.removesuffix("_path") + "_sha256"
-        for value, expected_hash in zip(raw[column], raw[hash_column] if hash_column in raw else [None] * len(raw), strict=True):
-            evidence_path = Path(str(value))
+    for row in raw.itertuples(index=False):
+        resolved: list[Path] = []
+        for column in trace_columns:
+            evidence_path = Path(str(getattr(row, column)))
             if not evidence_path.is_absolute(): evidence_path = root / evidence_path
             evidence_path = evidence_path.resolve()
-            if not evidence_path.is_file() or evidence_path.is_symlink():
-                raise ValueError("Stage-2 referenced trace/record evidence is missing")
-            observed = _sha(evidence_path)
-            if expected_hash is not None and str(expected_hash) != observed:
-                raise ValueError("Stage-2 referenced evidence hash is stale")
-            evidence_hashes[str(evidence_path)] = observed
+            if not evidence_path.is_relative_to(root) or not evidence_path.is_file() or evidence_path.is_symlink():
+                raise ValueError("Stage-2 trace/record evidence must be a final-root regular descendant")
+            resolved.append(evidence_path)
+            evidence_hashes[evidence_path.relative_to(root).as_posix()] = _sha(evidence_path)
+        executed, requested, records = _validate_trace_record_consistency(
+            __import__("numpy").load(resolved[0], allow_pickle=False),
+            __import__("numpy").load(resolved[1], allow_pickle=False),
+            _json_records(resolved[2]), decorate_steps=False,
+        )
+        summary = aggregate_episode_interventions(records, executed.shape[1])
+        match = interventions.loc[
+            (interventions["seed"] == row.seed) & (interventions["task_id"] == row.task_id)
+            & (interventions["inference_mode"] == row.inference_mode)
+        ]
+        if len(match) != 1:
+            raise ValueError("Stage-2 trace evidence has no one-to-one intervention summary")
+        for name, value in summary.items():
+            observed = match.iloc[0][name]
+            if isinstance(value, list): observed = json.loads(observed) if isinstance(observed, str) else list(observed)
+            if value is None and pd.isna(observed): continue
+            if isinstance(value, float):
+                if not __import__("numpy").isclose(float(observed), value, rtol=1e-12, atol=1e-12): raise ValueError("Stage-2 aggregate evidence mismatch")
+            elif observed != value: raise ValueError("Stage-2 aggregate evidence mismatch")
     artifact_hashes = {name: _sha(path) for name, path in paths.items()}
     identity = _canonical_hash({
         "artifacts": artifact_hashes,
@@ -451,7 +481,8 @@ def _shield_row_valid(
             "episode_return", "temp_violation", "co2_violation", "rh_violation",
             "executed_action_trace_sha256", "requested_action_trace_sha256", "intervention_records_sha256",
         )})
-        return row["episode_evidence_identity_sha256"] == _canonical_hash(identity_payload) == evidence["episode_evidence_identity_sha256"]
+        computed = _canonical_hash(identity_payload)
+        return row["episode_evidence_identity_sha256"] == computed == evidence["episode_evidence_identity_sha256"]
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return False
 
@@ -585,8 +616,14 @@ def run_shield_evaluation(
         "env_config_sha256": _sha(stage2.ENV_CONFIG_PATH),
         "runtime_source_tree_sha256": stage2._runtime_source_tree_sha256(),
         "evaluator_source_sha256": _sha(Path(__file__)),
+        "gate_source_sha256": _sha(ROOT / "experiments/scripts/evaluate_shield_gate.py"),
     }
-    source_fingerprint = _canonical_hash(source_payload)
+    source_identity_inputs = {
+        name: source_payload[name] for name in (
+            "runtime_source_tree_sha256", "evaluator_source_sha256", "gate_source_sha256"
+        )
+    }
+    source_fingerprint = _canonical_hash(source_identity_inputs)
     completed: dict[tuple[str, int, str], tuple[dict[str, Any], dict[str, Any]]] = {}
     published_checkpoints: dict[int, dict[str, Any]] = {}
     selected_runs = [row for row in runs.itertuples(index=False) if row.status == "completed"]
@@ -598,11 +635,23 @@ def run_shield_evaluation(
         import numpy as np
         if isinstance(checkpoint_steps, (bool, np.bool_)) or not isinstance(checkpoint_steps, (int, np.integer)) or int(checkpoint_steps) < 0:
             raise ValueError("model checkpoint_steps must be a nonnegative strict integer")
+        authentic_checkpoint = next(
+            (item for item in stage2_manifest["checkpoints"] if int(item["seed"]) == int(run_row.seed)),
+            None,
+        )
+        if (
+            authentic_checkpoint is None
+            or authentic_checkpoint.get("checkpoint_steps") != int(checkpoint_steps)
+            or authentic_checkpoint.get("model_sha256") != model_sha
+            or authentic_checkpoint.get("vecnormalize_sha256") != vec_sha
+        ):
+            raise ValueError("shield checkpoint provenance does not match authentic Stage-2")
         expected_common = {
             "algorithm": "agri_metarl" + SHIELD_SUFFIX, "method": SHIELD_METHOD,
             "model_sha256": model_sha, "vecnormalize_sha256": vec_sha,
             "checkpoint_steps": int(checkpoint_steps), "source_fingerprint_sha256": source_fingerprint,
             "stage2_identity_sha256": stage2_identity,
+            "runtime_source_tree_sha256": source_payload["runtime_source_tree_sha256"],
         }
         published_checkpoints[int(run_row.seed)] = {
             "seed": int(run_row.seed), "model_sha256": model_sha,
@@ -689,10 +738,159 @@ def run_shield_evaluation(
         "checkpoints": [published_checkpoints[seed] for seed in sorted(published_checkpoints)],
         "stage2_identity_sha256": stage2_identity,
         "source_fingerprint_sha256": source_fingerprint, **source_payload,
+        "source_fingerprint_inputs": source_identity_inputs,
     }
     _publish_shield_final(root, work, raw, interventions, manifest_base=manifest_base)
     print(f"Published {len(raw)} shield rows atomically to {root}")
     return len(raw)
+
+
+def run_formal_unshielded_evaluation(
+    args: argparse.Namespace, suite: Any, runs: pd.DataFrame, tasks: pd.DataFrame,
+    *, model_map: Mapping[str, Any], env_loader: Callable[..., Any], episode_runner: Callable[..., Any],
+) -> int:
+    """Produce the provenance-bearing full-suite unshielded comparator atomically."""
+    if args.interventions_out is not None or args.splits or args.task_ids or args.limit_tasks is not None:
+        raise ValueError("formal unshielded evaluation forbids smoke filters/intervention output")
+    if set(runs["algorithm"]) != {"agri_metarl"}:
+        raise ValueError("formal unshielded evaluation supports only agri_metarl")
+    root, stage2_manifest, stage2_decision = _validate_shield_prerequisite(args, suite, runs)
+    canonical = pd.DataFrame(vars(item) for item in build_evaluation_tasks(suite))
+    try:
+        pd.testing.assert_frame_equal(tasks.reset_index(drop=True), canonical, check_dtype=False, check_exact=True)
+    except AssertionError as error:
+        raise ValueError("formal unshielded evaluation requires exact canonical tasks") from error
+    task_records = [task_from_row(row) for row in tasks.itertuples(index=False)]
+    approved = {int(item["seed"]): item for item in stage2_manifest["checkpoints"]}
+    if set(approved) != {42, 123} or any("checkpoint_steps" not in item for item in approved.values()):
+        raise ValueError("authentic Stage-2 checkpoints must bind seeds and checkpoint_steps")
+    work = root.parent / f".{root.name}.work"
+    if not args.resume_eval: _clear_shield_work(work)
+    else: work.mkdir(parents=True, exist_ok=True)
+    progress_path = work / "eval_raw.csv"
+    try:
+        progress = pd.read_csv(progress_path) if args.resume_eval and progress_path.is_file() else pd.DataFrame()
+    except Exception:
+        _clear_shield_work(work); progress = pd.DataFrame()
+    from experiments.scripts import run_shielded_context_ab as source
+    runtime_sha = source._runtime_source_tree_sha256()
+    source_payload = {
+        "manifest_sha256": _sha(args.manifest), "runs_sha256": _sha(args.runs_csv),
+        "tasks_sha256": _sha(args.tasks_csv), "runtime_source_tree_sha256": runtime_sha,
+        "evaluator_source_sha256": _sha(Path(__file__)),
+        "gate_source_sha256": _sha(ROOT / "experiments/scripts/evaluate_shield_gate.py"),
+    }
+    source_identity_inputs = {
+        name: source_payload[name] for name in (
+            "runtime_source_tree_sha256", "evaluator_source_sha256", "gate_source_sha256"
+        )
+    }
+    source_fingerprint = _canonical_hash(source_identity_inputs)
+    completed: dict[tuple[int, str], dict[str, Any]] = {}
+    required_progress = {
+        "seed", "task_id", "algorithm", "method", "model_sha256", "vecnormalize_sha256",
+        "checkpoint_steps", "source_fingerprint_sha256", "runtime_source_tree_sha256",
+        "stage2_identity_sha256", "episode_evidence_identity_sha256", "completed", "status",
+        "ode_failure_count", "failure_evidence_path",
+    }
+    if not progress.empty and (
+        not required_progress.issubset(progress.columns) or progress.duplicated(["seed", "task_id"]).any()
+    ):
+        _clear_shield_work(work); progress = pd.DataFrame()
+    checkpoint_records: list[dict[str, Any]] = []
+    for run_row in [row for row in runs.itertuples(index=False) if row.status == "completed"]:
+        validate_completed_run_paths(run_row)
+        model_sha, vec_sha = _sha(run_row.model_path), _sha(run_row.vecnormalize_path)
+        expected_checkpoint = approved[int(run_row.seed)]
+        if (model_sha, vec_sha) != (expected_checkpoint["model_sha256"], expected_checkpoint["vecnormalize_sha256"]):
+            raise ValueError("unshielded checkpoint hashes do not match authentic Stage-2")
+        model = model_map[run_row.algorithm].load(run_row.model_path, device="cpu")
+        import numpy as np
+        checkpoint_steps = getattr(model, "num_timesteps", None)
+        if isinstance(checkpoint_steps, (bool, np.bool_)) or not isinstance(checkpoint_steps, (int, np.integer)) or int(checkpoint_steps) != expected_checkpoint["checkpoint_steps"]:
+            raise ValueError("unshielded checkpoint_steps do not match authentic Stage-2")
+        checkpoint_records.append({
+            "seed": int(run_row.seed), "model_sha256": model_sha, "vecnormalize_sha256": vec_sha,
+            "checkpoint_steps": int(checkpoint_steps), "source_fingerprint_sha256": source_fingerprint,
+            "runtime_source_tree_sha256": runtime_sha,
+        })
+        for old in progress.loc[progress.get("seed", pd.Series(dtype=object)) == int(run_row.seed)].to_dict("records") if not progress.empty else []:
+            expected_fields = {
+                "algorithm": "agri_metarl", "method": FORMAL_UNSHIELDED_METHOD,
+                "model_sha256": model_sha, "vecnormalize_sha256": vec_sha,
+                "checkpoint_steps": int(checkpoint_steps), "source_fingerprint_sha256": source_fingerprint,
+                "runtime_source_tree_sha256": runtime_sha,
+                "stage2_identity_sha256": stage2_decision["stage2_identity_sha256"],
+            }
+            try:
+                if all(old[name] == value for name, value in expected_fields.items()):
+                    identity_fields = {name: old[name] for name in old if name != "episode_evidence_identity_sha256" and not pd.isna(old[name])}
+                    if old["episode_evidence_identity_sha256"] == _canonical_hash(identity_fields):
+                        completed[(int(run_row.seed), str(old["task_id"]))] = old
+            except (KeyError, TypeError, ValueError): pass
+        for task in task_records:
+            key = (int(run_row.seed), task.task_id)
+            if key in completed: continue
+            env = env_loader(suite, task, run_row.vecnormalize_path)
+            error: BaseException | None = None
+            try:
+                metrics = episode_runner(model, env)
+            except BaseException as caught:
+                error = caught
+                metrics = {name: None for name in ("episode_return", "temp_violation", "co2_violation", "rh_violation")}
+            finally:
+                close_environment(env, error)
+            failure_path = ""
+            if error is not None:
+                failure_file = work / "failure_evidence" / f"seed{key[0]}__{key[1]}.json"
+                _atomic_json(failure_file, {"exception_type": type(error).__name__, "exception_message": str(error)})
+                failure_path = str(failure_file.resolve())
+            row = {
+                "suite_id": suite.suite_id, "algorithm": "agri_metarl", "method": FORMAL_UNSHIELDED_METHOD,
+                "seed": key[0], "run_name": run_row.run_name, "task_id": task.task_id,
+                "split": task.split, "weather_year": task.weather_year, "start_day": task.start_day,
+                "uncertainty_scale": task.uncertainty_scale, "economic_scenario": task.economic_scenario,
+                "climate_constraint_scenario": task.climate_constraint_scenario,
+                **metrics, "completed": error is None, "status": "completed" if error is None else "ode_failure",
+                "ode_failure_count": 0 if error is None else 1, "failure_evidence_path": failure_path,
+                "model_sha256": model_sha, "vecnormalize_sha256": vec_sha,
+                "checkpoint_steps": int(checkpoint_steps), "source_fingerprint_sha256": source_fingerprint,
+                "runtime_source_tree_sha256": runtime_sha,
+                "stage2_identity_sha256": stage2_decision["stage2_identity_sha256"],
+            }
+            row["episode_evidence_identity_sha256"] = _canonical_hash(row)
+            completed[key] = row
+            _replace_csv(pd.DataFrame([completed[item] for item in sorted(completed)]), progress_path)
+    expected = {(seed, task.task_id) for seed in approved for task in task_records}
+    if set(completed) != expected:
+        raise RuntimeError(f"formal unshielded comparator incomplete: expected 182 keys, got {len(completed)}")
+    final = pd.DataFrame([completed[key] for key in sorted(completed)])
+    stage = Path(tempfile.mkdtemp(prefix=f".{root.name}.stage-", dir=root.parent))
+    try:
+        published = final.copy(); evidence_hashes = {}
+        for index, row in final.loc[~final["completed"]].iterrows():
+            source_path = Path(row.failure_evidence_path)
+            relative = Path("failure_evidence") / source_path.name
+            (stage / relative).parent.mkdir(parents=True, exist_ok=True); shutil.copy2(source_path, stage / relative)
+            published.at[index, "failure_evidence_path"] = relative.as_posix()
+            evidence_hashes[relative.as_posix()] = _sha(stage / relative)
+        published.to_csv(stage / "eval_raw.csv", index=False)
+        manifest = {
+            "schema_version": "formal-unshielded-evaluation-v1", "result_root": str(root),
+            "formal_complete": True, "method": FORMAL_UNSHIELDED_METHOD,
+            "eval_raw_sha256": _sha(stage / "eval_raw.csv"), "checkpoints": checkpoint_records,
+            "source_fingerprint_sha256": source_fingerprint, "runtime_source_tree_sha256": runtime_sha,
+            "source_fingerprint_inputs": source_identity_inputs,
+            "stage2_identity_sha256": stage2_decision["stage2_identity_sha256"],
+            "evaluator_source_sha256": source_payload["evaluator_source_sha256"],
+            "gate_source_sha256": source_payload["gate_source_sha256"], "failure_evidence_sha256": evidence_hashes,
+        }
+        _atomic_json(stage / "evaluation_manifest.json", manifest)
+        replace_directory_atomic(stage, root)
+    except BaseException:
+        if stage.exists(): shutil.rmtree(stage, ignore_errors=True)
+        raise
+    return len(final)
 
 
 def run(
@@ -714,6 +912,11 @@ def run(
         runs = runs[runs["seed"].isin(args.seeds)]
     if args.action_shield:
         return run_shield_evaluation(
+            args, suite, runs, tasks, model_map=model_map,
+            env_loader=env_loader, episode_runner=episode_runner,
+        )
+    if args.formal_unshielded_provenance:
+        return run_formal_unshielded_evaluation(
             args, suite, runs, tasks, model_map=model_map,
             env_loader=env_loader, episode_runner=episode_runner,
         )

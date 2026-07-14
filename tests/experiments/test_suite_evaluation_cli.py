@@ -7,7 +7,9 @@ import json
 import pandas as pd
 import numpy as np
 
-from gl_gym.experiments.shield_evaluation import build_paired_shield_deltas, evaluate_shield_gate
+from gl_gym.experiments.shield_evaluation import (
+    aggregate_episode_interventions, build_paired_shield_deltas, evaluate_shield_gate,
+)
 from gl_gym.experiments.suite_schema import create_default_suite_config, write_suite_manifest
 from gl_gym.experiments.suite_tasks import build_evaluation_tasks
 
@@ -59,18 +61,42 @@ def test_environment_close_error_is_not_allowed_to_replace_episode_error():
 
 def _stage2_fixture(cli, root: Path) -> Path:
     root.mkdir()
-    unshielded_root = root.parent / "unshielded"
+    unshielded_root = root.parent / f"{root.name}-unshielded"
     unshielded_root.mkdir()
-    keys = [(seed, task, mode) for seed in (42, 123) for task in ("t1", "t2") for mode in ("zero_context", "online_context")]
-    common = [
-        {"seed": seed, "task_id": task, "inference_mode": mode,
-         "completed": True, "ode_failure_count": 0, "episode_return": 100.0,
-         "temp_violation": 1.0, "co2_violation": 1.0, "rh_violation": 1.0}
-        for seed, task, mode in keys
-    ]
+    from experiments.scripts.run_context_ab import APPROVED_SEEDS
+    from gl_gym.experiments.context_ab import DIAGNOSTIC_TASK_IDS, MODES
+    keys = [(seed, task, mode) for seed in APPROVED_SEEDS for task in DIAGNOSTIC_TASK_IDS for mode in MODES]
+    trace_dir = root / "traces"; trace_dir.mkdir()
+    records_dir = root / "intervention_records"; records_dir.mkdir()
+    record = {
+        "step_index": 0, "schema_version": "minimal-feasibility-action-shield-v1",
+        "intervened": False, "requested_action": [0.0], "reference_action": None,
+        "executed_action": [0.0], "selected_lambda": 0.0, "candidate_attempts": [],
+        "intervention_l1": 0.0, "intervention_l2": 0.0, "intervention_linf": 0.0,
+        "per_channel_changed": [False], "extra_solver_attempts": 0,
+        "elapsed_seconds": 0.0, "original_failure": None,
+    }
+    common = []
+    for seed, task, mode in keys:
+        token = f"seed{seed}__{task}__{mode}"
+        executed = trace_dir / f"{token}__executed.npy"
+        requested = trace_dir / f"{token}__requested.npy"
+        records = records_dir / f"{token}.json"
+        np.save(executed, np.zeros((1, 1), dtype=np.float32), allow_pickle=False)
+        np.save(requested, np.zeros((1, 1), dtype=np.float32), allow_pickle=False)
+        records.write_text(json.dumps([record]), encoding="utf-8")
+        common.append({
+            "seed": seed, "task_id": task, "inference_mode": mode,
+            "completed": True, "ode_failure_count": 0, "episode_return": 100.0,
+            "temp_violation": 1.0, "co2_violation": 1.0, "rh_violation": 1.0,
+            "executed_action_trace_path": f"traces/{executed.name}",
+            "requested_action_trace_path": f"traces/{requested.name}",
+            "intervention_records_path": f"intervention_records/{records.name}",
+        })
     unshielded = pd.DataFrame(common)
-    raw = pd.DataFrame([{**row, "total_steps": 100, "intervention_count": 0} for row in common])
-    interventions = raw[["seed", "task_id", "inference_mode", "total_steps", "intervention_count", "ode_failure_count"]].copy()
+    summary = aggregate_episode_interventions([record], 1)
+    raw = pd.DataFrame([{**row, "total_steps": 1, "intervention_count": 0} for row in common])
+    interventions = pd.DataFrame([{**{key: row[key] for key in ("seed", "task_id", "inference_mode")}, **summary} for row in common])
     expected = set(keys)
     paired = build_paired_shield_deltas(raw, unshielded, expected)
     gate = evaluate_shield_gate(raw, unshielded, expected)
@@ -82,11 +108,11 @@ def _stage2_fixture(cli, root: Path) -> Path:
         "schema_version": "shielded-context-ab-stage2-v1", "method": cli.SHIELD_METHOD,
         "result_root": str(root.resolve()), "unshielded_result_root": str(unshielded_root.resolve()),
         "unshielded_manifest_sha256": cli._sha(unshielded_root / "diagnostic_manifest.json"),
-        "seeds": [42, 123], "task_ids": ["t1", "t2"],
-        "inference_modes": ["zero_context", "online_context"],
+        "seeds": list(APPROVED_SEEDS), "task_ids": list(DIAGNOSTIC_TASK_IDS),
+        "inference_modes": list(MODES),
         "checkpoints": [
-            {"seed": 42, "model_sha256": "a" * 64, "vecnormalize_sha256": "b" * 64},
-            {"seed": 123, "model_sha256": "c" * 64, "vecnormalize_sha256": "d" * 64},
+            {"seed": 42, "model_sha256": "a" * 64, "vecnormalize_sha256": "b" * 64, "checkpoint_steps": 10},
+            {"seed": 123, "model_sha256": "c" * 64, "vecnormalize_sha256": "d" * 64, "checkpoint_steps": 10},
         ],
     }
     raw.to_csv(root / "eval_raw.csv", index=False)
@@ -107,6 +133,22 @@ def test_stage2_five_artifact_identity_recomputes_gate_and_rejects_forgery(tmp_p
     forged["evidence"]["paired_count"] = 999
     decision.write_text(json.dumps(forged), encoding="utf-8")
     with pytest.raises(ValueError, match="recomputed|authentic"):
+        cli.load_stage2_evidence(decision)
+
+
+def test_stage2_rejects_abbreviated_protocol_and_missing_trace(tmp_path):
+    cli = _module()
+    decision = _stage2_fixture(cli, tmp_path / "stage2")
+    manifest_path = decision.parent / "shield_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["task_ids"] = manifest["task_ids"][:2]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="exact approved"):
+        cli.load_stage2_evidence(decision)
+    decision = _stage2_fixture(cli, tmp_path / "stage2-second")
+    first = pd.read_csv(decision.parent / "eval_raw.csv").iloc[0]
+    (decision.parent / first.executed_action_trace_path).unlink(missing_ok=True)
+    with pytest.raises(ValueError, match="trace|evidence"):
         cli.load_stage2_evidence(decision)
 
 
@@ -148,7 +190,8 @@ def test_real_shield_smoke_runs_only_in_work_with_provenance(tmp_path):
         "fixed_lambdas": list(stage2_source.DEFAULT_LAMBDAS),
         "formal_solver_options": dict(stage2_source.FORMAL_CVODES_OPTIONS),
         "checkpoints": [{"seed": seed, "model_sha256": cli._sha(model_paths[seed]),
-                         "vecnormalize_sha256": cli._sha(vec_paths[seed])} for seed in (42, 123)],
+                         "vecnormalize_sha256": cli._sha(vec_paths[seed]),
+                         "checkpoint_steps": 77} for seed in (42, 123)],
         **stage2_source._behavior_source_hashes(),
     })
     stage2_manifest_path.write_text(json.dumps(stage2_manifest), encoding="utf-8")
@@ -192,6 +235,12 @@ def test_real_shield_smoke_runs_only_in_work_with_provenance(tmp_path):
     assert raw["method"].eq(cli.SHIELD_METHOD).all()
     assert raw["checkpoint_steps"].eq(77).all()
     assert raw["formal_complete"].eq(False).all()
+    Path(raw.iloc[0].executed_action_trace_path).write_bytes(b"corrupt")
+    calls.clear(); closed.clear(); args.resume_eval = True
+    assert cli.run(args, model_map={"agri_metarl": Loader}, env_loader=env_loader, episode_runner=episode_runner) == 2
+    assert len(calls) == len(closed) >= 1
+    resumed = pd.read_csv(work / "eval_raw.csv")
+    assert len(resumed) == 2 and not resumed.duplicated(["seed", "task_id"]).any()
     pd.DataFrame([{"wrong": 1}]).to_csv(work / "eval_raw.csv", index=False)
     pd.DataFrame([{"wrong": 1}]).to_csv(work / "interventions.csv", index=False)
     raw, interventions = cli._read_shield_progress(work)
