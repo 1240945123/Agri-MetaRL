@@ -9,7 +9,10 @@ from types import SimpleNamespace
 
 from gl_gym.experiments.suite_schema import create_default_suite_config, write_suite_manifest
 from gl_gym.experiments.suite_tasks import build_evaluation_tasks
-from gl_gym.experiments.shield_evaluation import aggregate_episode_interventions
+from gl_gym.experiments.shield_evaluation import (
+    SCHEMA_VERSION as SHIELD_SCHEMA_VERSION,
+    aggregate_episode_interventions,
+)
 from tests.experiments.test_suite_evaluation_cli import _stage2_fixture
 from experiments.scripts import evaluate_suite as evaluator
 from experiments.scripts import run_shielded_context_ab as stage2_source
@@ -179,7 +182,7 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
     work = tmp_path / "shield-work"; work.mkdir()
     shield_rows, intervention_rows = [], []
     base_record = {
-        "schema_version": "minimal-feasibility-action-shield-v1", "intervened": False,
+        "schema_version": SHIELD_SCHEMA_VERSION, "intervened": False,
         "requested_action": [0.0], "reference_action": None, "executed_action": [0.0],
         "selected_lambda": 0.0, "candidate_attempts": [], "intervention_l1": 0.0,
         "intervention_l2": 0.0, "intervention_linf": 0.0,

@@ -9,6 +9,7 @@ import numpy as np
 import os
 
 from gl_gym.experiments.shield_evaluation import (
+    SCHEMA_VERSION as SHIELD_SCHEMA_VERSION,
     aggregate_episode_interventions, build_paired_shield_deltas, evaluate_shield_gate,
 )
 from gl_gym.experiments.suite_schema import create_default_suite_config, write_suite_manifest
@@ -205,7 +206,7 @@ def _stage2_fixture(cli, root: Path) -> Path:
     trace_dir = root / "traces"; trace_dir.mkdir()
     records_dir = root / "intervention_records"; records_dir.mkdir()
     record = {
-        "step_index": 0, "schema_version": "minimal-feasibility-action-shield-v1",
+        "step_index": 0, "schema_version": SHIELD_SCHEMA_VERSION,
         "intervened": False, "requested_action": [0.0], "reference_action": None,
         "executed_action": [0.0], "selected_lambda": 0.0, "candidate_attempts": [],
         "intervention_l1": 0.0, "intervention_l2": 0.0, "intervention_linf": 0.0,
@@ -639,7 +640,7 @@ def test_real_shield_smoke_runs_only_in_work_with_provenance(tmp_path):
         calls.append((task.task_id, Path(vec_path)))
         return Env()
     record = {
-        "schema_version": "minimal-feasibility-action-shield-v1", "intervened": False,
+        "schema_version": SHIELD_SCHEMA_VERSION, "intervened": False,
         "requested_action": [0.0], "reference_action": None, "executed_action": [0.0],
         "selected_lambda": 0.0, "candidate_attempts": [], "intervention_l1": 0.0,
         "intervention_l2": 0.0, "intervention_linf": 0.0, "per_channel_changed": [False],
