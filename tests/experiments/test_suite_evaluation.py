@@ -992,7 +992,7 @@ def test_action_shield_v2_rejects_nonprefix_legacy_success():
         suite_evaluation._shielded_executed_action(record, requested)
 
 
-@pytest.mark.parametrize("bad_lambda", ["1.0", True, float("nan")])
+@pytest.mark.parametrize("bad_lambda", ["1.0", True, float("nan"), 10**309])
 def test_action_shield_v2_rejects_non_real_candidate_lambda_as_value_error(
     bad_lambda,
 ):
@@ -1009,7 +1009,7 @@ def test_action_shield_v2_rejects_non_real_candidate_lambda_as_value_error(
         suite_evaluation._shielded_executed_action(record, requested)
 
 
-@pytest.mark.parametrize("bad_lambda", ["1.0", True, float("nan")])
+@pytest.mark.parametrize("bad_lambda", ["1.0", True, float("nan"), 10**309])
 def test_action_shield_v2_rejects_non_real_selected_lambda_as_value_error(
     bad_lambda,
 ):

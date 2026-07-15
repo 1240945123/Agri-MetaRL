@@ -143,13 +143,17 @@ def _validated_action_vector(
 
 
 def _validated_finite_real(value: Any, *, name: str) -> float:
+    error_message = f"action_shield {name} must be a finite real number"
     if isinstance(value, (bool, np.bool_)) or not isinstance(
         value, (Real, np.integer, np.floating)
     ):
-        raise ValueError(f"action_shield {name} must be a finite real number")
-    numeric_value = float(value)
+        raise ValueError(error_message)
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(error_message) from None
     if not np.isfinite(numeric_value):
-        raise ValueError(f"action_shield {name} must be a finite real number")
+        raise ValueError(error_message)
     return numeric_value
 
 
