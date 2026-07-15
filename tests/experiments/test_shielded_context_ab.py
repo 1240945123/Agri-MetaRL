@@ -66,6 +66,50 @@ def test_load_stage1_validates_npz_without_pickle_and_returns_identity(tmp_path:
     assert loaded["selected_lambda"] == cli.DEFAULT_LAMBDAS[0]
 
 
+def test_load_stage1_accepts_conditions_serialized_with_canonical_sorted_keys(
+    tmp_path: Path,
+):
+    root = tmp_path / "stage1"
+    report = _stage1(root)
+    (root / "stage1_results.json").write_text(
+        json.dumps(report, sort_keys=True), encoding="utf-8"
+    )
+    (root / "decision.json").write_text(
+        json.dumps(
+            {key: report[key] for key in ("outcome", "conditions", "selected_lambda")},
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = cli.load_stage1_prerequisite(root)
+
+    assert set(loaded["report"]["conditions"]) == set(cli.STAGE1_CONDITIONS)
+
+
+@pytest.mark.parametrize("invalid", ["missing", "extra", "false", "non_bool"])
+def test_load_stage1_rejects_invalid_condition_mapping(
+    tmp_path: Path, invalid: str
+):
+    root = tmp_path / "stage1"
+    report = _stage1(root)
+    conditions = report["conditions"]
+    if invalid == "missing":
+        conditions.pop(cli.STAGE1_CONDITIONS[0])
+    elif invalid == "extra":
+        conditions["unexpected"] = True
+    elif invalid == "false":
+        conditions[cli.STAGE1_CONDITIONS[0]] = False
+    else:
+        conditions[cli.STAGE1_CONDITIONS[0]] = 1
+    (root / "stage1_results.json").write_text(
+        json.dumps(report, sort_keys=True), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="conditions"):
+        cli.load_stage1_prerequisite(root)
+
+
 @pytest.mark.parametrize("field", ["formal_solver_options", "fixed_lambdas"])
 def test_stage1_rejects_stale_solver_or_lambda_grid(tmp_path: Path, field: str):
     root = tmp_path / "stage1"

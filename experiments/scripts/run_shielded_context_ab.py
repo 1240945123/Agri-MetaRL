@@ -161,7 +161,7 @@ def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
     conditions = report.get("conditions")
     if (
         not isinstance(conditions, dict)
-        or tuple(conditions) != STAGE1_CONDITIONS
+        or set(conditions) != set(STAGE1_CONDITIONS)
         or any(value is not True for value in conditions.values())
     ):
         raise ValueError("Stage-1 conditions must be the four exact passing conditions")
