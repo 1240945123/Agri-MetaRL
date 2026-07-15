@@ -27,6 +27,17 @@ def _stage1(root: Path) -> dict:
         "rule_config_sha256": "f" * 64,
         "fixed_lambdas": list(cli.DEFAULT_LAMBDAS),
         "selected_lambda": cli.DEFAULT_LAMBDAS[0],
+        "candidate_attempts": [
+            {
+                "lambda": cli.DEFAULT_LAMBDAS[0],
+                "action": [0.0, 0.0],
+                "control": [0.0, 0.0],
+                "success": True,
+                "exception_type": None,
+                "exception_message": None,
+                "elapsed_seconds": 0.01,
+            }
+        ],
         "conditions": {name: True for name in cli.STAGE1_CONDITIONS},
         "outcome": "continue_to_context_ab",
     }
@@ -51,6 +62,42 @@ def _stage1(root: Path) -> dict:
         selected_available=np.array(True, dtype=np.bool_),
     )
     return report
+
+
+def _forge_success_before_last(report: dict) -> None:
+    report["candidate_attempts"].append(
+        {
+            **report["candidate_attempts"][0],
+            "lambda": cli.DEFAULT_LAMBDAS[1],
+        }
+    )
+    report["selected_lambda"] = cli.DEFAULT_LAMBDAS[1]
+
+
+def _forge_last_lambda_mismatch(report: dict) -> None:
+    first = report["candidate_attempts"][0]
+    first.update(
+        success=False,
+        exception_type="RuntimeError",
+        exception_message="failed",
+    )
+    report["candidate_attempts"].append(
+        {
+            **first,
+            "lambda": cli.DEFAULT_LAMBDAS[1],
+            "success": True,
+            "exception_type": None,
+            "exception_message": None,
+        }
+    )
+
+
+def _forge_all_failed(report: dict) -> None:
+    report["candidate_attempts"][0].update(
+        success=False,
+        exception_type="RuntimeError",
+        exception_message="failed",
+    )
 
 
 def test_load_stage1_rejects_extra_artifact_and_failing_decision(tmp_path: Path):
@@ -88,6 +135,48 @@ def test_load_stage1_rejects_otherwise_valid_v1_decision(tmp_path: Path):
     (root / "decision.json").write_text(json.dumps(decision), encoding="utf-8")
 
     with pytest.raises(ValueError, match="schema"):
+        cli.load_stage1_prerequisite(root)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda report: report.pop("candidate_attempts"),
+        lambda report: report["candidate_attempts"][0].__setitem__(
+            "lambda", cli.DEFAULT_LAMBDAS[1]
+        ),
+        _forge_success_before_last,
+        _forge_all_failed,
+        _forge_last_lambda_mismatch,
+        lambda report: report.__setitem__("candidate_attempts", []),
+    ],
+    ids=(
+        "missing",
+        "nonprefix",
+        "success_before_last",
+        "all_failed",
+        "last_lambda_mismatch",
+        "empty",
+    ),
+)
+def test_load_stage1_rejects_forged_candidate_attempts(tmp_path: Path, mutate):
+    root = tmp_path / "stage1"
+    report = _stage1(root)
+    mutate(report)
+    (root / "stage1_results.json").write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="candidate|lambda|success"):
+        cli.load_stage1_prerequisite(root)
+
+
+@pytest.mark.parametrize("value", ["1.0", True, float("nan"), 10**309])
+def test_load_stage1_rejects_invalid_candidate_lambda(tmp_path: Path, value):
+    root = tmp_path / "stage1"
+    report = _stage1(root)
+    report["candidate_attempts"][0]["lambda"] = value
+    (root / "stage1_results.json").write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lambda|strict JSON"):
         cli.load_stage1_prerequisite(root)
 
 

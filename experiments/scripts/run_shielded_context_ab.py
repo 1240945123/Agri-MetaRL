@@ -33,6 +33,7 @@ from experiments.scripts.run_context_ab import (
     build_diagnostic_runs,
     sha256_file,
 )
+from experiments.scripts.run_shield_stage1 import _validate_stage1_candidate_attempts
 from gl_gym.RL.agri_metarl import AgriMetaRL
 from gl_gym.environments.action_shield import ActionShieldConfig, DEFAULT_LAMBDAS
 from gl_gym.environments.models.utils import FORMAL_CVODES_OPTIONS
@@ -198,6 +199,11 @@ def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
         or float(selected) not in DEFAULT_LAMBDAS
     ):
         raise ValueError("Stage-1 selected_lambda must be a positive fixed-grid value")
+    if "candidate_attempts" not in report:
+        raise ValueError("Stage-1 results are missing candidate_attempts")
+    _validate_stage1_candidate_attempts(
+        report["candidate_attempts"], selected, require_success=True
+    )
     decision_conditions = decision.get("conditions")
     if (
         not isinstance(decision_conditions, dict)

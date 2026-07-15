@@ -623,6 +623,105 @@ def _attempt_records(attempts: Any, controls: list[np.ndarray]) -> list[dict[str
     ]
 
 
+_ATTEMPT_FIELDS = {
+    "lambda", "action", "control", "success", "exception_type",
+    "exception_message", "elapsed_seconds",
+}
+
+
+def _stage1_lambda(value: Any, *, name: str) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be a finite real number")
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a finite fixed-grid value") from error
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be a finite fixed-grid value")
+    return result
+
+
+def _stage1_attempt_vector(value: Any, *, name: str) -> np.ndarray:
+    raw = np.asarray(value)
+    if (
+        raw.ndim != 1
+        or raw.size == 0
+        or not np.issubdtype(raw.dtype, np.number)
+        or np.issubdtype(raw.dtype, np.bool_)
+        or np.issubdtype(raw.dtype, np.complexfloating)
+    ):
+        raise ValueError(f"{name} must be a nonempty finite numeric vector")
+    result = np.asarray(raw, dtype=np.float64)
+    if not np.isfinite(result).all():
+        raise ValueError(f"{name} must be a nonempty finite numeric vector")
+    return result
+
+
+def _validate_stage1_candidate_attempts(
+    attempts: Any,
+    selected_lambda: Any,
+    *,
+    require_success: bool,
+) -> None:
+    if not isinstance(attempts, list):
+        raise TypeError("candidate_attempts must be a list")
+    if not attempts:
+        if require_success:
+            raise ValueError("candidate_attempts must contain the successful fixed-grid prefix")
+        if selected_lambda is not None:
+            raise ValueError("selected_lambda requires successful candidate_attempts")
+        return
+    if len(attempts) > len(DEFAULT_LAMBDAS):
+        raise ValueError("candidate_attempts must be a descending fixed-grid prefix")
+
+    vector_shape: tuple[int, ...] | None = None
+    success_indices: list[int] = []
+    for index, attempt in enumerate(attempts):
+        if not isinstance(attempt, Mapping) or set(attempt) != _ATTEMPT_FIELDS:
+            raise ValueError("each candidate attempt must contain the exact Stage-1 fields")
+        lam = _stage1_lambda(attempt["lambda"], name="candidate attempt lambda")
+        if lam != DEFAULT_LAMBDAS[index]:
+            raise ValueError("candidate_attempts must be a descending fixed-grid prefix")
+        action = _stage1_attempt_vector(attempt["action"], name="candidate attempt action")
+        control = _stage1_attempt_vector(attempt["control"], name="candidate attempt control")
+        if action.shape != control.shape:
+            raise ValueError("candidate attempt action/control shapes must match")
+        if vector_shape is None:
+            vector_shape = action.shape
+        elif action.shape != vector_shape:
+            raise ValueError("candidate attempt vector shapes must be consistent")
+        success = attempt["success"]
+        if type(success) is not bool:
+            raise TypeError("candidate attempt success must be a strict bool")
+        elapsed = attempt["elapsed_seconds"]
+        if isinstance(elapsed, (bool, np.bool_)) or not isinstance(elapsed, Real):
+            raise TypeError("candidate attempt elapsed_seconds must be numeric")
+        try:
+            finite_elapsed = float(elapsed)
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError("candidate attempt elapsed_seconds must be finite and nonnegative") from error
+        if not math.isfinite(finite_elapsed) or finite_elapsed < 0.0:
+            raise ValueError("candidate attempt elapsed_seconds must be finite and nonnegative")
+        exception_type = attempt["exception_type"]
+        exception_message = attempt["exception_message"]
+        if success:
+            success_indices.append(index)
+            if exception_type is not None or exception_message is not None:
+                raise ValueError("successful candidate attempt cannot contain an exception")
+        elif not isinstance(exception_type, str) or not isinstance(exception_message, str):
+            raise ValueError("failed candidate attempt must contain exception strings")
+
+    if require_success:
+        selected = _stage1_lambda(selected_lambda, name="selected_lambda")
+        expected_count = DEFAULT_LAMBDAS.index(selected) + 1 if selected in DEFAULT_LAMBDAS else 0
+        if expected_count == 0 or len(attempts) != expected_count:
+            raise ValueError("selected_lambda must equal the final descending-prefix candidate")
+        if success_indices != [len(attempts) - 1]:
+            raise ValueError("only the final selected candidate attempt may succeed")
+    elif success_indices or selected_lambda is not None:
+        raise ValueError("unsuccessful Stage-1 evidence cannot select a successful candidate")
+
+
 def _validate_report(
     report: Mapping[str, Any], x0: np.ndarray, selected_state: np.ndarray | None
 ) -> None:
@@ -648,6 +747,16 @@ def _validate_report(
         or any(type(value) is not bool for value in conditions.values())
     ):
         raise ValueError("invalid stage-1 decision conditions")
+    selection_succeeded = conditions["legal_candidate_succeeded"]
+    if conditions["first_successful_candidate_selected"] is not selection_succeeded:
+        raise ValueError("stage-1 candidate success conditions are inconsistent")
+    if "candidate_attempts" not in report:
+        raise ValueError("stage-1 report is missing candidate_attempts")
+    _validate_stage1_candidate_attempts(
+        report["candidate_attempts"],
+        report.get("selected_lambda"),
+        require_success=selection_succeeded,
+    )
     expected = (
         "continue_to_context_ab"
         if all(conditions.values())

@@ -198,11 +198,35 @@ def test_failure_then_fixed_candidates_selects_first_success(tmp_path):
     assert payload["dirty"] is True
     assert payload["reference_control"] == [0.4, 0.6]
     assert payload["selected_lambda"] == cli.DEFAULT_LAMBDAS[2]
-    assert [item["success"] for item in payload["candidate_attempts"]] == [
+    attempts = payload["candidate_attempts"]
+    assert [set(item) for item in attempts] == [
+        {
+            "lambda", "action", "control", "success", "exception_type",
+            "exception_message", "elapsed_seconds",
+        }
+    ] * 3
+    assert [item["lambda"] for item in attempts] == list(cli.DEFAULT_LAMBDAS[:3])
+    assert [item["action"] for item in attempts] == [
+        action.tolist() for action in expected_actions
+    ]
+    assert [item["control"] for item in attempts] == [
+        control.tolist() for control in expected_controls
+    ]
+    assert [item["success"] for item in attempts] == [
         False,
         False,
         True,
     ]
+    assert [item["exception_type"] for item in attempts] == [
+        "RuntimeError", "RuntimeError", None,
+    ]
+    assert [item["exception_message"] for item in attempts] == ["c1", "c2", None]
+    assert all(
+        isinstance(item["elapsed_seconds"], float)
+        and np.isfinite(item["elapsed_seconds"])
+        and item["elapsed_seconds"] >= 0.0
+        for item in attempts
+    )
     assert payload["outcome"] == "continue_to_context_ab"
     assert payload["delta_u_max"] == delta.tolist()
     decision = json.loads((result / "decision.json").read_text(encoding="utf-8"))

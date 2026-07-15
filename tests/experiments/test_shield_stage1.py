@@ -20,11 +20,47 @@ def _report() -> dict:
         "capsule_identity_sha256": "e" * 64,
         "checkpoint_sha256": "f" * 64,
         "selected_lambda": cli.DEFAULT_LAMBDAS[1],
+        "candidate_attempts": [
+            {
+                "lambda": cli.DEFAULT_LAMBDAS[0],
+                "action": [0.0, 0.0],
+                "control": [0.0, 0.0],
+                "success": False,
+                "exception_type": "RuntimeError",
+                "exception_message": "failed",
+                "elapsed_seconds": 0.01,
+            },
+            {
+                "lambda": cli.DEFAULT_LAMBDAS[1],
+                "action": [0.0, 0.0],
+                "control": [0.0, 0.0],
+                "success": True,
+                "exception_type": None,
+                "exception_message": None,
+                "elapsed_seconds": 0.01,
+            },
+        ],
         "conditions": conditions,
         "outcome": "continue_to_context_ab",
     }
     report["shield_fingerprint"] = cli._shield_fingerprint(report)
     return report
+
+
+def _forge_success_before_last(report: dict) -> None:
+    report["candidate_attempts"][0].update(
+        success=True,
+        exception_type=None,
+        exception_message=None,
+    )
+
+
+def _forge_all_failed(report: dict) -> None:
+    report["candidate_attempts"][-1].update(
+        success=False,
+        exception_type="RuntimeError",
+        exception_message="failed",
+    )
 
 
 def test_stage1_v2_decision_binds_schema_method_grid_and_fingerprint(tmp_path: Path):
@@ -62,4 +98,31 @@ def test_stage1_report_rejects_source_provenance_tampering():
     report = _report()
     report["source_checksums"]["source"] = "0" * 64
     with pytest.raises(ValueError, match="fingerprint"):
+        cli._validate_report(report, np.ones(2), np.ones(2))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda report: report.pop("candidate_attempts"),
+        lambda report: report.__setitem__("candidate_attempts", report["candidate_attempts"][1:]),
+        _forge_success_before_last,
+        lambda report: report.__setitem__("selected_lambda", cli.DEFAULT_LAMBDAS[2]),
+        _forge_all_failed,
+        lambda report: report.__setitem__("candidate_attempts", []),
+    ],
+    ids=("missing", "nonprefix", "success_before_last", "selected_mismatch", "all_failed", "empty"),
+)
+def test_stage1_passing_report_rejects_forged_candidate_attempts(mutate):
+    report = _report()
+    mutate(report)
+    with pytest.raises(ValueError, match="candidate|lambda|success"):
+        cli._validate_report(report, np.ones(2), np.ones(2))
+
+
+@pytest.mark.parametrize("value", ["1.0", True, np.nan, 10**309])
+def test_stage1_passing_report_rejects_invalid_candidate_lambda(value):
+    report = _report()
+    report["candidate_attempts"][0]["lambda"] = value
+    with pytest.raises(ValueError, match="lambda"):
         cli._validate_report(report, np.ones(2), np.ones(2))
