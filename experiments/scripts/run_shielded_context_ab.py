@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -788,6 +789,14 @@ def _write_progress(rows: list[dict[str, Any]], path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _csv_canonical_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return the values pandas' default CSV writer/reader will publish and load."""
+    buffer = StringIO()
+    frame.to_csv(buffer, index=False)
+    buffer.seek(0)
+    return pd.read_csv(buffer)
+
+
 def _validated_context_diagnostics(
     values: Mapping[str, Any], *, inference_mode: str, episode_steps: int
 ) -> dict[str, int | float]:
@@ -1099,8 +1108,6 @@ def run_shielded_diagnostic(
     raw = pd.DataFrame(rows)
     if set(raw[["seed", "task_id", "inference_mode"]].itertuples(index=False, name=None)) != targets:
         raise RuntimeError("shielded diagnostic final keys are not the exact 32-key design")
-    gate = evaluate_shield_gate(raw, unshielded, targets)
-    paired = build_paired_shield_deltas(raw, unshielded, targets)
     intervention_columns = ["seed", "task_id", "split", "inference_mode", "method", "total_steps", "intervention_count", "intervention_rate", "first_intervention_step", "selected_lambda_mean", "selected_lambda_max", "intervention_l1_mean", "intervention_l1_max", "intervention_l2_mean", "intervention_l2_max", "intervention_linf_mean", "intervention_linf_max", "per_channel_intervention_counts", "extra_solver_attempts", "shield_elapsed_seconds", "ode_failure_count", "intervention_records_path"]
     interventions = raw[intervention_columns].copy()
     evidence_files: dict[str, Path] = {}
@@ -1114,6 +1121,10 @@ def run_shielded_diagnostic(
                 interventions.at[index, column] = relative
     if len(evidence_files) != 3 * len(raw):
         raise RuntimeError("publication evidence destinations must be globally unique")
+    raw = _csv_canonical_frame(raw)
+    canonical_unshielded = _csv_canonical_frame(unshielded)
+    gate = evaluate_shield_gate(raw, canonical_unshielded, targets)
+    paired = build_paired_shield_deltas(raw, canonical_unshielded, targets)
     decision = _stage2_decision(gate, shield_fingerprint=shield_fingerprint)
     manifest = {
         **fingerprint_payload, "shield_fingerprint": shield_fingerprint,

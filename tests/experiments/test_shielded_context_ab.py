@@ -746,6 +746,7 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
     unshielded_root = tmp_path / "unshielded"
     unshielded_root.mkdir()
     (unshielded_root / "diagnostic_manifest.json").write_text("{}", encoding="utf-8")
+    unshielded.to_csv(unshielded_root / "eval_raw.csv", index=False)
     fake_capsule = unshielded_root / ("f" * 64)
     fake_capsule.mkdir()
     fake_manifest = fake_capsule / "manifest.json"
@@ -800,7 +801,8 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
 
     def episode_runner(model, env, *, inference_mode, return_diagnostics, failure_recorder):
         assert return_diagnostics and failure_recorder is not None
-        return ({"episode_return": 100.0, "EPI": 1.0, "temp_violation": 1.0,
+        return ({"episode_return": 100.0 - 4.63639323048223e-06,
+                 "EPI": 1.0, "temp_violation": 1.0,
                  "co2_violation": 1.0, "rh_violation": 1.0},
                 {"action_trace": np.zeros((3, 2)), "requested_action_trace": np.zeros((3, 2)),
                  "action_shield_records": [dict(record) for _ in range(3)],
@@ -860,6 +862,11 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
     assert manifest["fixed_lambdas"] == list(cli.DEFAULT_LAMBDAS)
     assert decision["shield_fingerprint"] == manifest["shield_fingerprint"]
     assert result["shield_fingerprint"].eq(manifest["shield_fingerprint"]).all()
+    from experiments.scripts import evaluate_suite as stage3_consumer
+    authenticated = stage3_consumer.load_stage2_evidence(
+        tmp_path / "shielded" / "decision.json"
+    )
+    assert authenticated["decision"] == decision
 
     calls.clear()
     resumed = cli.run_shielded_diagnostic(
