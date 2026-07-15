@@ -15,8 +15,8 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 
-DEFAULT_LAMBDAS = (1.0 / 16.0, 1.0 / 8.0, 1.0 / 4.0, 1.0 / 2.0, 1.0)
-_SCHEMA_VERSION = "minimal-feasibility-action-shield-v1"
+DEFAULT_LAMBDAS = (1.0, 0.5, 0.25, 0.125, 0.0625)
+_SCHEMA_VERSION = "conservative-feasibility-action-shield-v2"
 
 
 def _immutable_vector(value: ArrayLike, *, name: str) -> NDArray[np.float64]:

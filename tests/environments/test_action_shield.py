@@ -59,20 +59,21 @@ def test_build_candidates_uses_exact_order_and_convex_formula() -> None:
 
     candidates = build_candidates(policy, reference)
 
+    assert DEFAULT_LAMBDAS == (1.0, 0.5, 0.25, 0.125, 0.0625)
     assert tuple(candidate.lambda_value for candidate in candidates) == DEFAULT_LAMBDAS
     for candidate, lambda_value in zip(candidates, DEFAULT_LAMBDAS, strict=True):
         expected = (1.0 - lambda_value) * policy + lambda_value * reference
         np.testing.assert_allclose(candidate.action, expected)
         assert not candidate.action.flags.writeable
 
-    np.testing.assert_allclose(candidates[0].action, [0.875, -0.90625])
+    np.testing.assert_allclose(candidates[0].action, reference)
 
 
 def test_config_is_frozen_slotted_and_rejects_alternate_grid() -> None:
     config = ActionShieldConfig()
 
     assert config.lambdas == DEFAULT_LAMBDAS
-    assert config.schema_version == "minimal-feasibility-action-shield-v1"
+    assert config.schema_version == "conservative-feasibility-action-shield-v2"
     assert not hasattr(config, "__dict__")
     with pytest.raises(FrozenInstanceError):
         config.schema_version = "changed"  # type: ignore[misc]
@@ -80,6 +81,8 @@ def test_config_is_frozen_slotted_and_rejects_alternate_grid() -> None:
         ActionShieldConfig(lambdas=(1.0,))
     with pytest.raises(ValueError, match="fixed"):
         build_candidates(np.zeros(1), np.zeros(1), lambdas=(1.0,))
+    with pytest.raises(ValueError, match="fixed"):
+        ActionShieldConfig(lambdas=(0.0625, 0.125, 0.25, 0.5, 1.0))
 
 
 def test_evidence_dataclasses_are_frozen_and_slotted() -> None:
@@ -160,6 +163,27 @@ def test_project_stops_at_first_success_and_records_three_attempts() -> None:
         assert attempt.elapsed_seconds >= 0.0
 
 
+def test_project_tries_conservative_candidates_first_and_stops_immediately() -> None:
+    attempted_lambdas: list[float] = []
+    policy = np.array([1.0])
+    reference = np.array([-1.0])
+
+    def integrate(action: np.ndarray) -> np.ndarray:
+        attempted_lambdas.append((1.0 - action[0]) / 2.0)
+        if len(attempted_lambdas) == 1:
+            raise RuntimeError("most conservative candidate rejected")
+        return np.array([3.0])
+
+    result = project_first_feasible(
+        policy, reference, integrate, ActionShieldConfig()
+    )
+
+    assert attempted_lambdas == [1.0, 0.5]
+    assert tuple(attempt.lambda_value for attempt in result.attempts) == (1.0, 0.5)
+    assert result.selected is not None
+    assert result.selected.lambda_value == 0.5
+
+
 @pytest.mark.parametrize(
     "bad_state",
     [np.array([]), np.array([np.nan]), np.array([np.inf]), np.zeros((1, 1))],
@@ -195,7 +219,7 @@ def test_result_evidence_is_detached_and_read_only() -> None:
     external_state[:] = 99.0
 
     assert result.selected is not None
-    np.testing.assert_allclose(result.selected.action, [15.0 / 16.0, -1.0 / 16.0])
+    np.testing.assert_allclose(result.selected.action, [0.0, -1.0])
     np.testing.assert_allclose(result.attempts[0].action, result.selected.action)
     np.testing.assert_allclose(result.final_state, [2.0, 3.0])
     assert not result.selected.action.flags.writeable
@@ -216,8 +240,8 @@ def test_integration_cannot_mutate_stored_candidate_evidence() -> None:
     )
 
     assert result.selected is not None
-    np.testing.assert_allclose(result.selected.action, [7.0 / 8.0])
-    np.testing.assert_allclose(result.attempts[0].action, [7.0 / 8.0])
+    np.testing.assert_allclose(result.selected.action, [-1.0])
+    np.testing.assert_allclose(result.attempts[0].action, [-1.0])
 
 
 def test_action_candidate_detaches_and_freezes_its_array() -> None:
