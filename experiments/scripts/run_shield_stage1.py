@@ -609,7 +609,9 @@ def _execution_source_checksums(
     for name in capsule_sources:
         path = Path(name).expanduser()
         if not path.is_absolute():
-            continue
+            raise ValueError(
+                f"Stage-1 execution source path must be absolute: {name}"
+            )
         path = path.absolute()
         if path.is_symlink() or not path.is_file() or _is_reparse(path):
             raise ValueError(

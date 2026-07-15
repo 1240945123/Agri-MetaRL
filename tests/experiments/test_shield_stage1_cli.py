@@ -924,3 +924,13 @@ def test_execution_source_checksums_reject_symlink(tmp_path, monkeypatch):
     )
     with pytest.raises(ValueError, match="symlink|regular file"):
         cli._execution_source_checksums({str(target.absolute()): "a" * 64})
+
+
+def test_execution_source_checksums_reject_relative_entry_in_mixed_mapping(tmp_path):
+    valid = tmp_path / "valid.py"
+    valid.write_text("valid", encoding="utf-8")
+    with pytest.raises(ValueError, match="absolute"):
+        cli._execution_source_checksums({
+            str(valid.resolve()): "a" * 64,
+            "missing-relative.py": "b" * 64,
+        })
