@@ -13,6 +13,7 @@ import tempfile
 import shutil
 import uuid
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -620,10 +621,21 @@ def _replace_csv(frame: pd.DataFrame, path: Path) -> None:
     os.close(handle)
     try:
         frame.to_csv(temporary, index=False)
-        os.replace(temporary, path)
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _read_progress_csv(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path, float_precision="round_trip")
 
 
 def replace_directory_atomic(stage: Path, root: Path) -> None:
@@ -678,7 +690,7 @@ def _read_shield_progress(work: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         return pd.DataFrame(), pd.DataFrame()
     if not raw_path.is_file(): return pd.DataFrame(), pd.DataFrame()
     try:
-        raw, evidence = pd.read_csv(raw_path), pd.read_csv(evidence_path)
+        raw, evidence = _read_progress_csv(raw_path), _read_progress_csv(evidence_path)
     except Exception:
         _clear_shield_work(work)
         return pd.DataFrame(), pd.DataFrame()
@@ -1066,7 +1078,7 @@ def run_formal_unshielded_evaluation(
     else: work.mkdir(parents=True, exist_ok=True)
     progress_path = work / "eval_raw.csv"
     try:
-        progress = pd.read_csv(progress_path) if args.resume_eval and progress_path.is_file() else pd.DataFrame()
+        progress = _read_progress_csv(progress_path) if args.resume_eval and progress_path.is_file() else pd.DataFrame()
     except Exception:
         _clear_shield_work(work); progress = pd.DataFrame()
     from experiments.scripts import run_shielded_context_ab as source

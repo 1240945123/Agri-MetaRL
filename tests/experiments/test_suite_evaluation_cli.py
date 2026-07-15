@@ -6,6 +6,7 @@ import pytest
 import json
 import pandas as pd
 import numpy as np
+import os
 
 from gl_gym.experiments.shield_evaluation import (
     aggregate_episode_interventions, build_paired_shield_deltas, evaluate_shield_gate,
@@ -85,6 +86,45 @@ def test_canonical_evaluation_row_identity_survives_csv_roundtrip(tmp_path, comp
     assert roundtrip["future_schema_column"] == "preserved"
     assert roundtrip["twb_percent"] is None
     assert roundtrip["episode_evidence_identity_sha256"] == cli.evaluation_row_identity(roundtrip)
+
+
+def test_progress_csv_reader_preserves_float_identity(tmp_path):
+    cli = _module()
+    row = cli.canonical_evaluation_row({
+        "completed": True,
+        "episode_return": 1586.6603368137262,
+        "temp_violation": 4404.799277449111,
+        "co2_violation": 1218.5648929994,
+        "rh_violation": 6545.083808080402,
+        "twb_percent": None,
+    })
+    row["episode_evidence_identity_sha256"] = cli.evaluation_row_identity(row)
+    path = tmp_path / "progress.csv"
+    pd.DataFrame([row]).to_csv(path, index=False)
+
+    restored = cli.canonical_evaluation_row(cli._read_progress_csv(path).iloc[0].to_dict())
+
+    assert restored["episode_evidence_identity_sha256"] == cli.evaluation_row_identity(restored)
+
+
+def test_replace_csv_retries_transient_windows_lock(tmp_path, monkeypatch):
+    cli = _module()
+    destination = tmp_path / "progress.csv"
+    real_replace = os.replace
+    attempts = 0
+
+    def locked_once(source, target):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError("destination temporarily locked")
+        real_replace(source, target)
+
+    monkeypatch.setattr(cli.os, "replace", locked_once)
+    cli._replace_csv(pd.DataFrame([{"value": 1}]), destination)
+
+    assert attempts == 2
+    assert pd.read_csv(destination).to_dict("records") == [{"value": 1}]
 
 
 @pytest.mark.parametrize("value", [0, 12.5, np.float32(37.25)])
