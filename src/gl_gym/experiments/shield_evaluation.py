@@ -16,10 +16,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from gl_gym.environments.action_shield import DEFAULT_LAMBDAS
+from gl_gym.environments.action_shield import ActionShieldConfig, DEFAULT_LAMBDAS
 
 
-SCHEMA_VERSION = "minimal-feasibility-action-shield-v1"
+SCHEMA_VERSION = ActionShieldConfig().schema_version
 EPSILON = 1e-9
 RETURN_LOSS_THRESHOLD = 0.02
 VIOLATION_RATIO_THRESHOLD = 1.05

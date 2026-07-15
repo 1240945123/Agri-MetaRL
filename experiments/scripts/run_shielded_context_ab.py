@@ -34,7 +34,7 @@ from experiments.scripts.run_context_ab import (
     sha256_file,
 )
 from gl_gym.RL.agri_metarl import AgriMetaRL
-from gl_gym.environments.action_shield import DEFAULT_LAMBDAS
+from gl_gym.environments.action_shield import ActionShieldConfig, DEFAULT_LAMBDAS
 from gl_gym.environments.models.utils import FORMAL_CVODES_OPTIONS
 from gl_gym.experiments.context_ab import (
     DIAGNOSTIC_TASK_IDS,
@@ -61,17 +61,22 @@ from gl_gym.experiments.suite_evaluation import (
 from gl_gym.experiments.suite_schema import load_suite_manifest
 
 
-METHOD = "minimal_feasibility_shield_v1"
-SCHEMA_VERSION = "shielded-context-ab-stage2-v1"
-STAGE1_SCHEMA_VERSION = "action-shield-stage1-v1"
+METHOD = "conservative_feasibility_shield_v2"
+SCHEMA_VERSION = ActionShieldConfig().schema_version
+STAGE1_SCHEMA_VERSION = SCHEMA_VERSION
 STAGE1_CONDITIONS = (
     "original_reproduced",
     "legal_candidate_succeeded",
-    "smallest_success_selected",
+    "first_successful_candidate_selected",
     "intervention_recorded",
 )
 STAGE1_OUTPUTS = frozenset(
     {"stage1_results.json", "stage1_states.npz", "decision.json"}
+)
+STAGE1_FINGERPRINT_FIELDS = (
+    "schema_version", "method", "fixed_lambdas", "source_checksums",
+    "formal_solver_options", "env_config_sha256", "rule_config_sha256",
+    "capsule_identity_sha256", "checkpoint_sha256",
 )
 RULE_CONFIG_PATH = ROOT / "configs" / "agents" / "rule_based.yml"
 ENV_CONFIG_PATH = ROOT / "configs" / "envs" / "TomatoEnv.yml"
@@ -141,6 +146,19 @@ def _lower_sha(value: Any, *, name: str) -> str:
     return value
 
 
+def _stage1_shield_fingerprint(report: Mapping[str, Any]) -> str:
+    missing = [name for name in STAGE1_FINGERPRINT_FIELDS if name not in report]
+    if missing:
+        raise ValueError(f"Stage-1 shield fingerprint inputs are missing: {missing}")
+    payload = {name: report[name] for name in STAGE1_FINGERPRINT_FIELDS}
+    return hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
     """Load and strictly validate the immutable three-file Stage-1 decision."""
 
@@ -154,10 +172,16 @@ def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
         raise ValueError("Stage-1 root must contain exactly three regular artifacts")
     report = _strict_json(root / "stage1_results.json")
     decision = _strict_json(root / "decision.json")
-    if set(decision) != {"outcome", "conditions", "selected_lambda"}:
+    decision_fields = {
+        "schema_version", "method", "fixed_lambdas", "shield_fingerprint",
+        "outcome", "conditions", "selected_lambda",
+    }
+    if set(decision) != decision_fields:
         raise ValueError("Stage-1 decision must contain exact keys")
     if report.get("schema_version") != STAGE1_SCHEMA_VERSION:
         raise ValueError("invalid Stage-1 results schema")
+    if report.get("method") != METHOD:
+        raise ValueError("invalid Stage-1 method")
     conditions = report.get("conditions")
     if (
         not isinstance(conditions, dict)
@@ -182,24 +206,25 @@ def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
     ):
         raise ValueError("Stage-1 decision conditions must be the four exact passing conditions")
     expected_decision = {
+        "schema_version": STAGE1_SCHEMA_VERSION,
+        "method": METHOD,
+        "fixed_lambdas": list(DEFAULT_LAMBDAS),
+        "shield_fingerprint": report.get("shield_fingerprint"),
         "outcome": "continue_to_context_ab",
         "conditions": conditions,
         "selected_lambda": selected,
     }
     if (
         report.get("outcome") != "continue_to_context_ab"
-        or type(decision["outcome"]) is not type(expected_decision["outcome"])
-        or decision["outcome"] != expected_decision["outcome"]
-        or decision_conditions != conditions
+        or decision != expected_decision
         or type(decision["selected_lambda"]) is not type(selected)
-        or decision["selected_lambda"] != expected_decision["selected_lambda"]
     ):
         raise ValueError("Stage-1 outcome/decision is inconsistent with passing evidence")
     required = {
         "failure_id", "capsule_identity_sha256", "checkpoint_path",
         "checkpoint_sha256", "source_checksums", "git_head", "dirty",
         "formal_solver_options", "env_config_sha256", "rule_config_sha256",
-        "fixed_lambdas",
+        "fixed_lambdas", "method", "shield_fingerprint",
     }
     missing = sorted(required.difference(report))
     if missing:
@@ -214,6 +239,9 @@ def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
         raise ValueError("Stage-1 formal solver options are stale")
     if report["fixed_lambdas"] != list(DEFAULT_LAMBDAS):
         raise ValueError("Stage-1 fixed lambda grid is stale")
+    _lower_sha(report["shield_fingerprint"], name="Stage-1 shield fingerprint")
+    if report["shield_fingerprint"] != _stage1_shield_fingerprint(report):
+        raise ValueError("Stage-1 shield fingerprint does not bind its provenance")
     sources = report["source_checksums"]
     if not isinstance(sources, dict) or not sources:
         raise ValueError("Stage-1 source checksums must be a nonempty mapping")
@@ -375,8 +403,16 @@ def _runtime_source_tree_sha256(root: str | Path = ROOT) -> str:
     return digest.hexdigest()
 
 
-def _stage2_decision(gate: Mapping[str, Any]) -> dict[str, Any]:
+def _stage2_decision(
+    gate: Mapping[str, Any], *, shield_fingerprint: str
+) -> dict[str, Any]:
     decision = dict(gate)
+    decision.update(
+        schema_version=SCHEMA_VERSION,
+        method=METHOD,
+        fixed_lambdas=list(DEFAULT_LAMBDAS),
+        shield_fingerprint=shield_fingerprint,
+    )
     decision["stage"] = "stage2_shielded_context_ab"
     decision["outcome"] = (
         "continue_to_full_suite"
@@ -677,11 +713,14 @@ def resume_row_is_complete(
     key: tuple[int, str, str],
     checkpoint_steps: int | None = None,
 ) -> bool:
-    required = {"seed", "task_id", "inference_mode", "checkpoint_steps", "completed", "executed_action_trace_path", "requested_action_trace_path", "intervention_records_path", "method", "support_ready_step", "context_norm_mean", "context_norm_max", *HASH_FIELDS, *REQUIRED_METRICS}
+    required = {"seed", "task_id", "inference_mode", "checkpoint_steps", "completed", "executed_action_trace_path", "requested_action_trace_path", "intervention_records_path", "schema_version", "method", "fixed_lambdas_json", "support_ready_step", "context_norm_mean", "context_norm_max", *HASH_FIELDS, *REQUIRED_METRICS}
     completed_value = row.get("completed")
     if (
         not required.issubset(row)
+        or row.get("schema_version") != SCHEMA_VERSION
         or row.get("method") != METHOD
+        or row.get("fixed_lambdas_json")
+        != json.dumps(list(DEFAULT_LAMBDAS), separators=(",", ":"))
         or not isinstance(completed_value, (bool, np.bool_))
         or not bool(completed_value)
     ):
@@ -806,7 +845,8 @@ def _strict_diagnostics(
     )
     normalized: dict[str, Any] = {}
     reserved = {
-        "seed", "task_id", "split", "inference_mode", "method", "status",
+        "seed", "task_id", "split", "inference_mode", "schema_version", "method",
+        "fixed_lambdas_json", "status",
         "completed", "checkpoint_steps", "executed_action_trace_path",
         "requested_action_trace_path", "intervention_records_path",
         "stage1_selected_lambda", *HASH_FIELDS, *INTERVENTION_SUMMARY_FIELDS,
@@ -1033,7 +1073,11 @@ def run_shielded_diagnostic(
                     **{name: float(value) for name, value in metrics.items()}, **model_diagnostics,
                     "seed": key[0], "task_id": task.task_id, "split": task.split,
                     "inference_mode": mode, "checkpoint_steps": checkpoint_steps,
+                    "schema_version": SCHEMA_VERSION,
                     "method": METHOD, "completed": True,
+                    "fixed_lambdas_json": json.dumps(
+                        list(DEFAULT_LAMBDAS), separators=(",", ":")
+                    ),
                     "stage1_selected_lambda": stage1["selected_lambda"],
                     "executed_action_trace_path": str(executed_path.resolve()),
                     "requested_action_trace_path": str(requested_path.resolve()),
@@ -1063,7 +1107,7 @@ def run_shielded_diagnostic(
                 interventions.at[index, column] = relative
     if len(evidence_files) != 3 * len(raw):
         raise RuntimeError("publication evidence destinations must be globally unique")
-    decision = _stage2_decision(gate)
+    decision = _stage2_decision(gate, shield_fingerprint=shield_fingerprint)
     manifest = {
         **fingerprint_payload, "shield_fingerprint": shield_fingerprint,
         "source_manifest": str(Path(source_manifest).resolve()),

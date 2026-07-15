@@ -21,7 +21,7 @@ def _record(step=0, *, intervened=True, selected_lambda=0.125):
     difference = requested - executed
     attempts = []
     if intervened:
-        grid = (0.0625, 0.125)
+        grid = shield_module.DEFAULT_LAMBDAS
         reference = np.array([0.1, -0.1])
         attempts = [
             {
@@ -36,7 +36,7 @@ def _record(step=0, *, intervened=True, selected_lambda=0.125):
         ]
     return {
         "step_index": step,
-        "schema_version": "minimal-feasibility-action-shield-v1",
+        "schema_version": "conservative-feasibility-action-shield-v2",
         "intervened": intervened,
         "requested_action": requested.tolist(),
         "reference_action": reference.tolist() if intervened else None,
@@ -74,7 +74,7 @@ def test_aggregate_episode_interventions_happy_path_is_json_safe_and_detached():
         "intervention_linf_mean": pytest.approx(0.05),
         "intervention_linf_max": pytest.approx(0.05),
         "per_channel_intervention_counts": [1, 1],
-        "extra_solver_attempts": 2,
+        "extra_solver_attempts": 4,
         "shield_elapsed_seconds": 0.5,
         "ode_failure_count": 0,
     }

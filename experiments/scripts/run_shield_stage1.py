@@ -43,13 +43,25 @@ import gl_gym.experiments.ode_replay as ode_replay_module
 from gl_gym.experiments.ode_replay import build_rule_based_controller
 
 
-SCHEMA_VERSION = "action-shield-stage1-v1"
+SCHEMA_VERSION = ActionShieldConfig().schema_version
+METHOD = "conservative_feasibility_shield_v2"
 OUTPUT_NAMES = frozenset({"stage1_results.json", "stage1_states.npz", "decision.json"})
 CONDITION_NAMES = (
     "original_reproduced",
     "legal_candidate_succeeded",
-    "smallest_success_selected",
+    "first_successful_candidate_selected",
     "intervention_recorded",
+)
+FINGERPRINT_FIELDS = (
+    "schema_version",
+    "method",
+    "fixed_lambdas",
+    "source_checksums",
+    "formal_solver_options",
+    "env_config_sha256",
+    "rule_config_sha256",
+    "capsule_identity_sha256",
+    "checkpoint_sha256",
 )
 
 
@@ -63,6 +75,22 @@ class _PostCallFailure(BaseException):
     def __init__(self, error: Exception) -> None:
         self.error = error
         self.traceback = error.__traceback__
+
+
+def _shield_fingerprint(evidence: Mapping[str, Any]) -> str:
+    missing = [name for name in FINGERPRINT_FIELDS if name not in evidence]
+    if missing:
+        raise ValueError(f"stage-1 shield fingerprint inputs are missing: {missing}")
+    payload = {name: evidence[name] for name in FINGERPRINT_FIELDS}
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -600,6 +628,19 @@ def _validate_report(
 ) -> None:
     if report.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("invalid stage-1 report schema")
+    if report.get("method") != METHOD:
+        raise ValueError("invalid stage-1 method")
+    if report.get("fixed_lambdas") != list(DEFAULT_LAMBDAS):
+        raise ValueError("invalid stage-1 descending fixed lambda priority")
+    fingerprint = report.get("shield_fingerprint")
+    if (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise ValueError("invalid stage-1 shield fingerprint")
+    if fingerprint != _shield_fingerprint(report):
+        raise ValueError("stage-1 shield fingerprint does not bind its provenance")
     conditions = report.get("conditions")
     if (
         not isinstance(conditions, dict)
@@ -626,9 +667,16 @@ def _write_outputs(
     selected_state: np.ndarray | None,
 ) -> None:
     decision = {
-        "outcome": report["outcome"],
-        "conditions": report["conditions"],
-        "selected_lambda": report["selected_lambda"],
+        key: report[key]
+        for key in (
+            "schema_version",
+            "method",
+            "fixed_lambdas",
+            "shield_fingerprint",
+            "outcome",
+            "conditions",
+            "selected_lambda",
+        )
     }
     (stage / "stage1_results.json").write_text(
         json.dumps(
@@ -669,11 +717,13 @@ def _validate_stage(stage: Path, report: Mapping[str, Any]) -> None:
     if loaded != report:
         raise ValueError("serialized stage-1 report does not match validated evidence")
     decision = json.loads((stage / "decision.json").read_text(encoding="utf-8"))
-    if set(decision) != {"outcome", "conditions", "selected_lambda"}:
+    decision_fields = {
+        "schema_version", "method", "fixed_lambdas", "shield_fingerprint",
+        "outcome", "conditions", "selected_lambda",
+    }
+    if set(decision) != decision_fields:
         raise ValueError("decision.json has invalid keys")
-    if decision != {
-        key: report[key] for key in ("outcome", "conditions", "selected_lambda")
-    }:
+    if decision != {key: report[key] for key in decision_fields}:
         raise ValueError("decision.json is inconsistent with stage1_results.json")
     with np.load(stage / "stage1_states.npz", allow_pickle=False) as archive:
         if set(archive.files) != {"x0", "selected_final_state", "selected_available"}:
@@ -920,7 +970,7 @@ def run_stage1(
             executed_control = np.array(candidate_controls[-1], copy=True)
 
     legal_succeeded = selected_state is not None
-    smallest = bool(
+    first_success = bool(
         legal_succeeded
         and attempts
         and attempts[-1]["success"]
@@ -935,7 +985,7 @@ def run_stage1(
     conditions = {
         "original_reproduced": bool(reproduced),
         "legal_candidate_succeeded": legal_succeeded,
-        "smallest_success_selected": smallest,
+        "first_successful_candidate_selected": first_success,
         "intervention_recorded": intervention,
     }
     outcome = (
@@ -945,6 +995,7 @@ def run_stage1(
     )
     report = {
         "schema_version": SCHEMA_VERSION,
+        "method": METHOD,
         **provenance,
         "failure_timestep": inputs["timestep"],
         "formal_solver_options": dict(FORMAL_CVODES_OPTIONS),
@@ -968,6 +1019,7 @@ def run_stage1(
         "conditions": conditions,
         "outcome": outcome,
     }
+    report["shield_fingerprint"] = _shield_fingerprint(report)
     _validate_report(report, inputs["x0"], selected_state)
     return _publish_atomic(
         output, report, inputs["x0"], selected_state, output_topology

@@ -13,7 +13,8 @@ from gl_gym.experiments.shield_evaluation import write_shield_artifacts_atomic
 def _stage1(root: Path) -> dict:
     root.mkdir()
     report = {
-        "schema_version": "action-shield-stage1-v1",
+        "schema_version": cli.SCHEMA_VERSION,
+        "method": cli.METHOD,
         "failure_id": "failure-1",
         "capsule_identity_sha256": "a" * 64,
         "checkpoint_path": str(root.parent / "last_model.zip"),
@@ -29,9 +30,18 @@ def _stage1(root: Path) -> dict:
         "conditions": {name: True for name in cli.STAGE1_CONDITIONS},
         "outcome": "continue_to_context_ab",
     }
+    report["shield_fingerprint"] = cli._stage1_shield_fingerprint(report)
     (root / "stage1_results.json").write_text(json.dumps(report), encoding="utf-8")
     (root / "decision.json").write_text(
-        json.dumps({key: report[key] for key in ("outcome", "conditions", "selected_lambda")}),
+        json.dumps(
+            {
+                key: report[key]
+                for key in (
+                    "schema_version", "method", "fixed_lambdas",
+                    "shield_fingerprint", "outcome", "conditions", "selected_lambda",
+                )
+            }
+        ),
         encoding="utf-8",
     )
     np.savez(
@@ -66,6 +76,21 @@ def test_load_stage1_validates_npz_without_pickle_and_returns_identity(tmp_path:
     assert loaded["selected_lambda"] == cli.DEFAULT_LAMBDAS[0]
 
 
+def test_load_stage1_rejects_otherwise_valid_v1_decision(tmp_path: Path):
+    root = tmp_path / "stage1"
+    report = _stage1(root)
+    report["schema_version"] = "action-shield-stage1-v1"
+    report["shield_fingerprint"] = cli._stage1_shield_fingerprint(report)
+    (root / "stage1_results.json").write_text(json.dumps(report), encoding="utf-8")
+    decision = json.loads((root / "decision.json").read_text(encoding="utf-8"))
+    decision["schema_version"] = report["schema_version"]
+    decision["shield_fingerprint"] = report["shield_fingerprint"]
+    (root / "decision.json").write_text(json.dumps(decision), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="schema"):
+        cli.load_stage1_prerequisite(root)
+
+
 def test_load_stage1_accepts_conditions_serialized_with_canonical_sorted_keys(
     tmp_path: Path,
 ):
@@ -76,7 +101,13 @@ def test_load_stage1_accepts_conditions_serialized_with_canonical_sorted_keys(
     )
     (root / "decision.json").write_text(
         json.dumps(
-            {key: report[key] for key in ("outcome", "conditions", "selected_lambda")},
+            {
+                key: report[key]
+                for key in (
+                    "schema_version", "method", "fixed_lambdas",
+                    "shield_fingerprint", "outcome", "conditions", "selected_lambda",
+                )
+            },
             sort_keys=True,
         ),
         encoding="utf-8",
@@ -117,7 +148,11 @@ def test_load_stage1_rejects_invalid_decision_condition_mapping(
     root = tmp_path / "stage1"
     report = _stage1(root)
     decision = {
-        key: report[key] for key in ("outcome", "conditions", "selected_lambda")
+        key: report[key]
+        for key in (
+            "schema_version", "method", "fixed_lambdas", "shield_fingerprint",
+            "outcome", "conditions", "selected_lambda",
+        )
     }
     conditions = dict(decision["conditions"])
     decision["conditions"] = conditions
@@ -145,7 +180,11 @@ def test_load_stage1_compares_decision_lambda_type_sensitively(tmp_path: Path):
         json.dumps(report, sort_keys=True), encoding="utf-8"
     )
     decision = {
-        key: report[key] for key in ("outcome", "conditions", "selected_lambda")
+        key: report[key]
+        for key in (
+            "schema_version", "method", "fixed_lambdas", "shield_fingerprint",
+            "outcome", "conditions", "selected_lambda",
+        )
     }
     decision["selected_lambda"] = 1
     (root / "decision.json").write_text(
@@ -247,7 +286,7 @@ def test_output_roots_reject_protected_lifecycle_siblings(
 
 def test_diagnostics_reject_trace_record_cross_mismatch_before_writes():
     record = {
-        "schema_version": "minimal-feasibility-action-shield-v1",
+        "schema_version": cli.SCHEMA_VERSION,
         "intervened": False,
         "requested_action": [0.0, 0.0],
         "reference_action": None,
@@ -276,7 +315,7 @@ def test_diagnostics_reject_trace_record_cross_mismatch_before_writes():
 
 def test_real_context_diagnostics_are_mode_aware_and_collision_safe():
     record = {
-        "schema_version": "minimal-feasibility-action-shield-v1", "intervened": False,
+        "schema_version": cli.SCHEMA_VERSION, "intervened": False,
         "requested_action": [0.0], "reference_action": None, "executed_action": [0.0],
         "selected_lambda": 0.0, "candidate_attempts": [], "intervention_l1": 0.0,
         "intervention_l2": 0.0, "intervention_linf": 0.0,
@@ -385,11 +424,13 @@ def test_comparator_requires_explicit_protocol_columns(tmp_path: Path):
         cli.load_unshielded_comparator(root, expected_provenance=provenance)
 
 
-def test_stage2_gate_outcome_mapping_preserves_generic_evidence():
+def test_stage2_gate_outcome_mapping_binds_v2_method_evidence():
     gate = {"outcome": "fail", "conditions": {"zero_ode_failures": False},
             "evidence": {"shielded_ode_failure_count": 1}, "reasons": ["zero_ode_failures"]}
-    decision = cli._stage2_decision(gate)
+    decision = cli._stage2_decision(gate, shield_fingerprint="a" * 64)
     assert decision == {
+        "schema_version": cli.SCHEMA_VERSION, "method": cli.METHOD,
+        "fixed_lambdas": list(cli.DEFAULT_LAMBDAS), "shield_fingerprint": "a" * 64,
         "outcome": "redesign_action_shield", "stage": "stage2_shielded_context_ab",
         "conditions": gate["conditions"], "evidence": gate["evidence"],
         "reasons": gate["reasons"],
@@ -593,7 +634,7 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
         return Env()
 
     record = {
-        "schema_version": "minimal-feasibility-action-shield-v1", "intervened": False,
+        "schema_version": cli.SCHEMA_VERSION, "intervened": False,
         "requested_action": [0.0, 0.0], "reference_action": None,
         "executed_action": [0.0, 0.0], "selected_lambda": 0.0,
         "candidate_attempts": [], "intervention_l1": 0.0, "intervention_l2": 0.0,
@@ -645,11 +686,24 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
     )
     assert len(calls) == len(result) == 32
     assert result["method"].eq(cli.METHOD).all()
+    assert result["schema_version"].eq(cli.SCHEMA_VERSION).all()
+    assert result["fixed_lambdas_json"].eq(
+        json.dumps(list(cli.DEFAULT_LAMBDAS), separators=(",", ":"))
+    ).all()
     assert result["executed_action_trace_path"].str.startswith("traces/").all()
     assert len(list((tmp_path / "shielded" / "traces").glob("*.npy"))) == 64
     assert len(list((tmp_path / "shielded" / "intervention_records").glob("*.json"))) == 32
     decision = json.loads((tmp_path / "shielded" / "decision.json").read_text(encoding="utf-8"))
     assert decision["outcome"] == "continue_to_full_suite"
+    assert decision["schema_version"] == cli.SCHEMA_VERSION
+    assert decision["method"] == cli.METHOD
+    assert decision["fixed_lambdas"] == list(cli.DEFAULT_LAMBDAS)
+    manifest = json.loads((tmp_path / "shielded" / "shield_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == cli.SCHEMA_VERSION
+    assert manifest["method"] == cli.METHOD
+    assert manifest["fixed_lambdas"] == list(cli.DEFAULT_LAMBDAS)
+    assert decision["shield_fingerprint"] == manifest["shield_fingerprint"]
+    assert result["shield_fingerprint"].eq(manifest["shield_fingerprint"]).all()
 
     calls.clear()
     resumed = cli.run_shielded_diagnostic(
