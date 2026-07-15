@@ -55,6 +55,7 @@ from gl_gym.experiments.ode_failure import (
 SHIELD_SCHEMA_VERSION = "conservative-feasibility-action-shield-v2"
 SHIELD_METHOD = "conservative_feasibility_shield_v2"
 SHIELD_SUFFIX = "__conservative_feasibility_shield_v2"
+SHIELD_FIXED_LAMBDAS = (1.0, 0.5, 0.25, 0.125, 0.0625)
 STAGE2_CONDITIONS = (
     "zero_ode_failures",
     "intervention_rate_within_0p5pct",
@@ -393,8 +394,8 @@ def shield_method_fingerprint_components(
     fixed_lambdas: Any, formal_solver_options: Mapping[str, Any],
 ) -> dict[str, Any]:
     ordered_lambdas = list(fixed_lambdas)
-    if ordered_lambdas != sorted(ordered_lambdas, reverse=True):
-        raise ValueError("fixed lambdas must use canonical descending order")
+    if ordered_lambdas != list(SHIELD_FIXED_LAMBDAS):
+        raise ValueError("fixed lambdas must use the canonical v2 fixed lambda grid")
     return {
         "schema_version": SHIELD_SCHEMA_VERSION,
         "method": SHIELD_METHOD,

@@ -424,6 +424,20 @@ def test_stage2_loader_rejects_optional_v1_intervention_schema(tmp_path):
         cli.load_stage2_evidence(decision_path)
 
 
+def test_shield_method_fingerprint_rejects_alternative_descending_grid():
+    cli = _module()
+
+    with pytest.raises(ValueError, match="canonical v2 fixed lambda grid"):
+        cli.shield_method_fingerprint_components(
+            source_inputs={"source": "a" * 64},
+            rule_config_sha256="b" * 64,
+            env_config_sha256="c" * 64,
+            stage2_identity_sha256="d" * 64,
+            fixed_lambdas=[0.9, 0.1],
+            formal_solver_options={"rtol": 1e-6},
+        )
+
+
 def _formal_unshielded_fixture(cli, tmp_path: Path):
     from experiments.scripts import run_shielded_context_ab as stage2_source
 
