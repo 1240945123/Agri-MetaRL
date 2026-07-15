@@ -126,3 +126,21 @@ def test_stage1_passing_report_rejects_invalid_candidate_lambda(value):
     report["candidate_attempts"][0]["lambda"] = value
     with pytest.raises(ValueError, match="lambda"):
         cli._validate_report(report, np.ones(2), np.ones(2))
+
+
+@pytest.mark.parametrize("attempts", [[], "all_failed"])
+def test_stage1_rejects_unsuccessful_candidate_evidence_even_with_failing_conditions(
+    attempts,
+):
+    report = _report()
+    report["conditions"]["legal_candidate_succeeded"] = False
+    report["conditions"]["first_successful_candidate_selected"] = False
+    report["selected_lambda"] = None
+    report["outcome"] = "redesign_action_shield"
+    if attempts == []:
+        report["candidate_attempts"] = []
+    else:
+        _forge_all_failed(report)
+
+    with pytest.raises(ValueError, match="candidate_attempts.*successful|final.*succeed"):
+        cli._validate_report(report, np.ones(2), None)

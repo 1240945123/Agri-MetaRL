@@ -712,12 +712,12 @@ def _validate_stage1_candidate_attempts(
             raise ValueError("failed candidate attempt must contain exception strings")
 
     if require_success:
+        if success_indices != [len(attempts) - 1]:
+            raise ValueError("only the final selected candidate attempt may succeed")
         selected = _stage1_lambda(selected_lambda, name="selected_lambda")
         expected_count = DEFAULT_LAMBDAS.index(selected) + 1 if selected in DEFAULT_LAMBDAS else 0
         if expected_count == 0 or len(attempts) != expected_count:
             raise ValueError("selected_lambda must equal the final descending-prefix candidate")
-        if success_indices != [len(attempts) - 1]:
-            raise ValueError("only the final selected candidate attempt may succeed")
     elif success_indices or selected_lambda is not None:
         raise ValueError("unsuccessful Stage-1 evidence cannot select a successful candidate")
 
@@ -755,7 +755,7 @@ def _validate_report(
     _validate_stage1_candidate_attempts(
         report["candidate_attempts"],
         report.get("selected_lambda"),
-        require_success=selection_succeeded,
+        require_success=True,
     )
     expected = (
         "continue_to_context_ab"

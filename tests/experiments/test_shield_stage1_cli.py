@@ -21,6 +21,23 @@ cli = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cli)
 
 
+def _original_failure_then_success_factory():
+    calls = 0
+
+    def factory(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return lambda **inputs: (_ for _ in ()).throw(RuntimeError("original"))
+        return lambda **inputs: {"xf": np.array([4.0, 5.0, 6.0])}
+
+    return factory
+
+
+def _fixed_controller():
+    return SimpleNamespace(predict=lambda *args: np.array([0.4, 0.6]))
+
+
 def _config(path: Path, *, delta=0.2) -> Path:
     path.write_text(
         "GreenLightEnv:\n"
@@ -255,7 +272,7 @@ def test_failure_then_fixed_candidates_selects_first_success(tmp_path):
         assert np.array_equal(archive["selected_final_state"], [7.0, 8.0, 9.0])
 
 
-def test_original_success_skips_controller_and_candidates(tmp_path):
+def test_original_success_without_candidate_evidence_is_rejected(tmp_path):
     capsule = _capsule(tmp_path)
     config = _config(tmp_path / "env.yml")
     count = 0
@@ -269,19 +286,17 @@ def test_original_success_skips_controller_and_candidates(tmp_path):
         raise AssertionError("controller must not be constructed")
 
     output = tmp_path / "success"
-    cli.run_stage1(
-        capsule.path / "manifest.json",
-        config,
-        output,
-        capsule_loader=lambda _: capsule,
-        integrator_factory=factory,
-        controller_factory=controller_factory,
-    )
+    with pytest.raises(ValueError, match="candidate_attempts.*successful"):
+        cli.run_stage1(
+            capsule.path / "manifest.json",
+            config,
+            output,
+            capsule_loader=lambda _: capsule,
+            integrator_factory=factory,
+            controller_factory=controller_factory,
+        )
     assert count == 1
-    decision = json.loads((output / "decision.json").read_text(encoding="utf-8"))
-    assert decision["outcome"] == "redesign_action_shield"
-    assert decision["conditions"]["original_reproduced"] is False
-    assert decision["selected_lambda"] is None
+    assert not output.exists()
 
 
 def test_invalid_inputs_and_overlap_fail_before_factories(tmp_path):
@@ -331,6 +346,8 @@ def test_float32_capsule_reconstruction_preserves_exact_numpy_semantics(tmp_path
     def factory(**kwargs):
         def integrate(**inputs):
             observed.append(np.array(inputs["u"], copy=True))
+            if len(observed) == 1:
+                raise RuntimeError("original")
             return {"xf": np.array([4.0, 5.0, 6.0])}
 
         return integrate
@@ -342,11 +359,9 @@ def test_float32_capsule_reconstruction_preserves_exact_numpy_semantics(tmp_path
         output,
         capsule_loader=lambda _: capsule,
         integrator_factory=factory,
-        controller_factory=lambda: (_ for _ in ()).throw(
-            AssertionError("controller must not run")
-        ),
+        controller_factory=_fixed_controller,
     )
-    assert len(observed) == 1
+    assert len(observed) == 2
     assert observed[0].dtype == stored.dtype == np.float32
     assert np.array_equal(observed[0], stored)
 
@@ -439,9 +454,16 @@ def test_config_and_rule_hashes_use_pre_execution_byte_snapshots(tmp_path, monke
     env_bytes = env_config.read_bytes()
     rule_bytes = rule_config.read_bytes()
 
+    calls = 0
+
     def factory(**kwargs):
-        env_config.unlink()
+        nonlocal calls
+        calls += 1
+        if env_config.exists():
+            env_config.unlink()
         rule_config.write_text("TomatoEnv:\n  lamps_on: 99\n", encoding="utf-8")
+        if calls == 1:
+            return lambda **inputs: (_ for _ in ()).throw(RuntimeError("original"))
         return lambda **inputs: {"xf": np.array([4.0, 5.0, 6.0])}
 
     output = tmp_path / "snapshot"
@@ -451,9 +473,7 @@ def test_config_and_rule_hashes_use_pre_execution_byte_snapshots(tmp_path, monke
         output,
         capsule_loader=lambda _: capsule,
         integrator_factory=factory,
-        controller_factory=lambda: (_ for _ in ()).throw(
-            AssertionError("controller must not run")
-        ),
+        controller_factory=_fixed_controller,
     )
     payload = json.loads((output / "stage1_results.json").read_text(encoding="utf-8"))
     assert payload["env_config_sha256"] == hashlib.sha256(env_bytes).hexdigest()
@@ -686,7 +706,7 @@ def test_malformed_integrator_output_and_baseexception_propagate_without_output(
     assert not output.exists()
 
 
-def test_candidate_exhaustion_and_controller_error_publish_rules(tmp_path):
+def test_candidate_exhaustion_and_controller_error_do_not_publish(tmp_path):
     capsule = _capsule(tmp_path)
     config = _config(tmp_path / "env.yml")
 
@@ -694,22 +714,18 @@ def test_candidate_exhaustion_and_controller_error_publish_rules(tmp_path):
         return lambda **inputs: (_ for _ in ()).throw(RuntimeError("solver"))
 
     output = tmp_path / "exhausted"
-    cli.run_stage1(
-        capsule.path / "manifest.json",
-        config,
-        output,
-        capsule_loader=lambda _: capsule,
-        integrator_factory=failed_factory,
-        controller_factory=lambda: SimpleNamespace(
-            predict=lambda *args: np.array([0.8, 0.1])
-        ),
-    )
-    decision = json.loads((output / "decision.json").read_text(encoding="utf-8"))
-    assert decision["outcome"] == "redesign_action_shield"
-    assert decision["conditions"]["legal_candidate_succeeded"] is False
-    assert len(
-        json.loads((output / "stage1_results.json").read_text())["candidate_attempts"]
-    ) == len(cli.DEFAULT_LAMBDAS)
+    with pytest.raises(ValueError, match="final selected candidate attempt.*succeed"):
+        cli.run_stage1(
+            capsule.path / "manifest.json",
+            config,
+            output,
+            capsule_loader=lambda _: capsule,
+            integrator_factory=failed_factory,
+            controller_factory=lambda: SimpleNamespace(
+                predict=lambda *args: np.array([0.8, 0.1])
+            ),
+        )
+    assert not output.exists()
 
     error_output = tmp_path / "controller-error"
     with pytest.raises(RuntimeError, match="controller unavailable"):
@@ -749,10 +765,8 @@ def test_publication_failure_restores_prior_root(tmp_path, monkeypatch):
             config,
             output,
             capsule_loader=lambda _: capsule,
-            integrator_factory=lambda **kwargs: lambda **inputs: {
-                "xf": [1.0, 2.0, 3.0]
-            },
-            controller_factory=lambda: None,
+            integrator_factory=_original_failure_then_success_factory(),
+            controller_factory=_fixed_controller,
         )
     assert (output / "old.txt").read_text(encoding="utf-8") == "old"
     assert not list(tmp_path.glob(".existing.stage-*"))
@@ -790,10 +804,8 @@ def test_old_root_rename_then_baseexception_restores_from_filesystem(
             config,
             output,
             capsule_loader=lambda _: capsule,
-            integrator_factory=lambda **kwargs: lambda **inputs: {
-                "xf": [1.0, 2.0, 3.0]
-            },
-            controller_factory=lambda: None,
+            integrator_factory=_original_failure_then_success_factory(),
+            controller_factory=_fixed_controller,
         )
     assert (output / "old.txt").read_text(encoding="utf-8") == "old"
     assert not list(tmp_path.glob(".existing-interrupt.stage-*"))
@@ -815,6 +827,7 @@ def test_output_parent_identity_swap_aborts_before_publication(tmp_path):
             swapped = True
             parent.rename(displaced)
             parent.mkdir()
+            return lambda **inputs: (_ for _ in ()).throw(RuntimeError("original"))
         return lambda **inputs: {"xf": np.array([4.0, 5.0, 6.0])}
 
     with pytest.raises(ValueError, match="output parent identity"):
@@ -824,7 +837,7 @@ def test_output_parent_identity_swap_aborts_before_publication(tmp_path):
             output,
             capsule_loader=lambda _: capsule,
             integrator_factory=factory,
-            controller_factory=lambda: None,
+            controller_factory=_fixed_controller,
         )
     assert not output.exists()
     assert list(parent.iterdir()) == []
