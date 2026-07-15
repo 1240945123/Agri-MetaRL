@@ -161,6 +161,31 @@ def test_canonical_evaluation_row_allows_finite_optional_twb_on_failed_row():
     assert normalized["twb_percent"] == 7.0
 
 
+def test_canonical_evaluation_row_nulls_all_metrics_on_failed_dataframe_row():
+    cli = _module()
+    metrics = {
+        "episode_return": np.nan,
+        "EPI": np.nan,
+        "revenue": np.nan,
+        "heat_cost": np.nan,
+        "co2_cost": np.nan,
+        "elec_cost": np.nan,
+        "temp_violation": np.nan,
+        "co2_violation": np.nan,
+        "rh_violation": np.nan,
+    }
+
+    normalized = cli.canonical_evaluation_row({"completed": False, **metrics})
+
+    assert all(normalized[name] is None for name in metrics)
+
+
+def test_canonical_evaluation_row_rejects_null_derived_metric_on_completed_row():
+    cli = _module()
+    with pytest.raises(ValueError, match="completed evaluation row metrics cannot be null"):
+        cli.canonical_evaluation_row({"completed": True, "EPI": np.nan})
+
+
 def test_shield_resume_rejects_smoke_row_for_formal_run(tmp_path):
     cli = _module()
     row = {"formal_complete": False}

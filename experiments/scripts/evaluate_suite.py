@@ -305,10 +305,11 @@ _ROW_INTEGER_FIELDS = frozenset({
 })
 _ROW_FLOAT_FIELDS = frozenset({
     "uncertainty_scale", "episode_return", "temp_violation", "co2_violation",
-    "rh_violation",
+    "rh_violation", "EPI", "revenue", "heat_cost", "co2_cost", "elec_cost",
 })
 _ROW_NULLABLE_METRICS = frozenset({
     "episode_return", "temp_violation", "co2_violation", "rh_violation",
+    "EPI", "revenue", "heat_cost", "co2_cost", "elec_cost",
 })
 _ROW_OPTIONAL_NULLABLE_FLOAT_METRICS = frozenset({"twb_percent"})
 _ROW_EMPTY_TEXT_FIELDS = frozenset({
