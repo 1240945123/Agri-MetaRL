@@ -54,6 +54,9 @@ def _capsule(tmp_path: Path):
     capsule_dir = (tmp_path / "capsules" / "failure-1").resolve()
     capsule_dir.mkdir(parents=True)
     (capsule_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    captured_source = capsule_dir / "captured_source.py"
+    captured_source.write_text("captured source", encoding="utf-8")
+    captured_sources = {str(captured_source.resolve()): "c" * 64}
     weather = np.array([10.0, 11.0])
     params = np.array([12.0])
     requested = np.array([1.0, -1.0], dtype=np.float32)
@@ -71,7 +74,7 @@ def _capsule(tmp_path: Path):
             "content_identity_sha256": "a" * 64,
             "checkpoint_path": "models/agent.zip",
             "checkpoint_sha256": "b" * 64,
-            "source_checksums": {"tomato_env.py": "c" * 64},
+            "source_checksums": captured_sources,
             "git_head": "d" * 40,
             "dirty": True,
             "solver": {"options": dict(cli.FORMAL_CVODES_OPTIONS)},
@@ -79,7 +82,7 @@ def _capsule(tmp_path: Path):
                 "formal_result_root": str(formal),
                 "checkpoint_path": "models/agent.zip",
                 "checkpoint_sha256": "b" * 64,
-                "source_checksums": {"tomato_env.py": "c" * 64},
+                "source_checksums": captured_sources,
                 "git_head": "d" * 40,
                 "dirty": True,
             },
@@ -902,3 +905,22 @@ def test_new_stage1_commit_preserves_capsule_origin_and_passes_stage2(tmp_path):
         rule_config_sha256=report["rule_config_sha256"],
         env_config_sha256=report["env_config_sha256"],
     )
+
+
+def test_execution_source_checksums_reject_missing_absolute_file(tmp_path):
+    missing = (tmp_path / "missing.py").resolve()
+    with pytest.raises(ValueError, match="regular file"):
+        cli._execution_source_checksums({str(missing): "a" * 64})
+
+
+def test_execution_source_checksums_reject_symlink(tmp_path, monkeypatch):
+    target = tmp_path / "source.py"
+    target.write_text("source", encoding="utf-8")
+    real_is_symlink = Path.is_symlink
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda path: path == target.absolute() or real_is_symlink(path),
+    )
+    with pytest.raises(ValueError, match="symlink|regular file"):
+        cli._execution_source_checksums({str(target.absolute()): "a" * 64})

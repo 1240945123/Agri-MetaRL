@@ -606,16 +606,22 @@ def _execution_source_checksums(
     capsule_sources: Mapping[str, str]
 ) -> dict[str, str]:
     current: dict[str, str] = {}
-    for name, capsule_checksum in capsule_sources.items():
+    for name in capsule_sources:
         path = Path(name).expanduser()
-        if path.is_file() and not path.is_symlink():
-            digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            current[name] = digest.hexdigest()
-        else:
-            current[name] = capsule_checksum
+        if not path.is_absolute():
+            continue
+        path = path.absolute()
+        if path.is_symlink() or not path.is_file() or _is_reparse(path):
+            raise ValueError(
+                f"Stage-1 execution source must be a regular file and not a symlink: {name}"
+            )
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        current[name] = digest.hexdigest()
+    if not current:
+        raise ValueError("Stage-1 execution sources contain no absolute regular files")
     return current
 
 
