@@ -992,6 +992,42 @@ def test_action_shield_v2_rejects_nonprefix_legacy_success():
         suite_evaluation._shielded_executed_action(record, requested)
 
 
+@pytest.mark.parametrize("bad_lambda", ["1.0", True, float("nan")])
+def test_action_shield_v2_rejects_non_real_candidate_lambda_as_value_error(
+    bad_lambda,
+):
+    requested = np.array([0.0], dtype=np.float32)
+    record = {
+        "schema_version": ActionShieldConfig().schema_version,
+        "requested_action": requested.tolist(),
+        "executed_action": [0.25],
+        "selected_lambda": DEFAULT_LAMBDAS[0],
+        "candidate_attempts": [{"lambda": bad_lambda, "success": True}],
+    }
+
+    with pytest.raises(ValueError, match="candidate_attempt lambda"):
+        suite_evaluation._shielded_executed_action(record, requested)
+
+
+@pytest.mark.parametrize("bad_lambda", ["1.0", True, float("nan")])
+def test_action_shield_v2_rejects_non_real_selected_lambda_as_value_error(
+    bad_lambda,
+):
+    requested = np.array([0.0], dtype=np.float32)
+    record = {
+        "schema_version": ActionShieldConfig().schema_version,
+        "requested_action": requested.tolist(),
+        "executed_action": [0.25],
+        "selected_lambda": bad_lambda,
+        "candidate_attempts": [
+            {"lambda": DEFAULT_LAMBDAS[0], "success": True}
+        ],
+    }
+
+    with pytest.raises(ValueError, match="selected_lambda"):
+        suite_evaluation._shielded_executed_action(record, requested)
+
+
 @pytest.mark.parametrize(
     ("record", "message"),
     [

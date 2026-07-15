@@ -8,6 +8,7 @@ import os
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, fields
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -141,6 +142,17 @@ def _validated_action_vector(
     return vector.astype(np.float32)
 
 
+def _validated_finite_real(value: Any, *, name: str) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (Real, np.integer, np.floating)
+    ):
+        raise ValueError(f"action_shield {name} must be a finite real number")
+    numeric_value = float(value)
+    if not np.isfinite(numeric_value):
+        raise ValueError(f"action_shield {name} must be a finite real number")
+    return numeric_value
+
+
 def _shielded_executed_action(
     record: Any, requested_action: np.ndarray
 ) -> tuple[np.ndarray, dict[str, Any]]:
@@ -182,39 +194,31 @@ def _shielded_executed_action(
     for attempt in attempts:
         if not isinstance(attempt, Mapping):
             raise ValueError("action_shield candidate_attempts entries must be mappings")
-        lambda_value = attempt.get("lambda")
-        if (
-            isinstance(lambda_value, (bool, np.bool_))
-            or not np.isscalar(lambda_value)
-            or not np.isfinite(lambda_value)
-        ):
-            raise ValueError("action_shield candidate_attempt lambda must be finite")
+        lambda_value = _validated_finite_real(
+            attempt.get("lambda"), name="candidate_attempt lambda"
+        )
         success = attempt.get("success")
         if not isinstance(success, (bool, np.bool_)):
             raise ValueError("action_shield candidate_attempt success must be boolean")
-        attempt_lambdas.append(float(lambda_value))
+        attempt_lambdas.append(lambda_value)
         attempt_successes.append(bool(success))
 
     if tuple(attempt_lambdas) != DEFAULT_LAMBDAS[: len(attempt_lambdas)]:
         raise ValueError("action_shield candidate_attempts lambdas must be a prefix")
 
-    selected_lambda = record.get("selected_lambda")
-    if (
-        isinstance(selected_lambda, (bool, np.bool_))
-        or not np.isscalar(selected_lambda)
-        or not np.isfinite(selected_lambda)
-    ):
-        raise ValueError("action_shield selected_lambda must be finite")
+    selected_lambda = _validated_finite_real(
+        record.get("selected_lambda"), name="selected_lambda"
+    )
     if attempts:
         if attempt_successes != [False] * (len(attempts) - 1) + [True]:
             raise ValueError(
                 "action_shield only the last candidate attempt may succeed"
             )
-        if float(selected_lambda) != attempt_lambdas[-1]:
+        if selected_lambda != attempt_lambdas[-1]:
             raise ValueError(
                 "action_shield final candidate lambda must equal selected_lambda"
             )
-    elif float(selected_lambda) != 0.0:
+    elif selected_lambda != 0.0:
         raise ValueError(
             "action_shield selected_lambda must be zero without candidate attempts"
         )
