@@ -552,7 +552,7 @@ def _check_frame(frame: pd.DataFrame, *, name: str, duplicate_check: bool) -> pd
         for column in frame.columns
         if column == "first_intervention_step"
         or column.endswith("_first_intervention_step")
-        or (name == "raw" and column == "support_ready_step")
+        or (name == "raw" and column in {"support_ready_step", "twb_percent"})
     }
     validated = frame.copy(deep=True)
     for column in frame.columns:

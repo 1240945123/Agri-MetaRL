@@ -614,3 +614,47 @@ def test_atomic_writer_normalizes_all_nullable_missing_representations(tmp_path)
         paths = write_shield_artifacts_atomic(raw, paired, interventions, {}, {}, root)
         written = pd.read_csv(paths["interventions"])
         assert pd.isna(written.loc[0, "first_intervention_step"])
+
+
+def test_atomic_writer_allows_mixed_finite_and_unavailable_raw_twb_percent(tmp_path):
+    raw, paired, interventions = _artifact_frames()
+    raw = pd.concat([raw, raw.assign(seed=2)], ignore_index=True)
+    raw["twb_percent"] = [12.5, np.nan]
+
+    paths = write_shield_artifacts_atomic(
+        raw, paired, interventions, {}, {}, tmp_path / "raw-twb-unavailable"
+    )
+
+    written = pd.read_csv(paths["eval_raw"])
+    assert written.loc[0, "twb_percent"] == pytest.approx(12.5)
+    assert pd.isna(written.loc[1, "twb_percent"])
+
+
+@pytest.mark.parametrize(
+    ("frame_name", "value"),
+    [
+        ("raw_other_metric", np.nan),
+        ("raw_twb_percent", np.inf),
+        ("paired_twb_percent", np.nan),
+        ("interventions_twb_percent", np.nan),
+    ],
+)
+def test_atomic_writer_keeps_raw_twb_nullable_exception_narrow(tmp_path, frame_name, value):
+    raw, paired, interventions = _artifact_frames()
+    if frame_name == "raw_other_metric":
+        raw["other_metric"] = value
+        qualified_name = "raw.other_metric"
+    elif frame_name == "raw_twb_percent":
+        raw["twb_percent"] = value
+        qualified_name = "raw.twb_percent"
+    elif frame_name == "paired_twb_percent":
+        paired["twb_percent"] = value
+        qualified_name = "paired.twb_percent"
+    else:
+        interventions["twb_percent"] = value
+        qualified_name = "interventions.twb_percent"
+
+    with pytest.raises(ValueError, match=qualified_name):
+        write_shield_artifacts_atomic(
+            raw, paired, interventions, {}, {}, tmp_path / frame_name
+        )
