@@ -22,6 +22,9 @@ def _stage1(root: Path) -> dict:
         "source_checksums": {"source": "c" * 64},
         "git_head": "d" * 40,
         "dirty": False,
+        "capsule_source_checksums": {"source": "0" * 64},
+        "capsule_git_head": "1" * 40,
+        "capsule_dirty": True,
         "formal_solver_options": dict(cli.FORMAL_CVODES_OPTIONS),
         "env_config_sha256": "e" * 64,
         "rule_config_sha256": "f" * 64,
@@ -356,7 +359,7 @@ def test_stage1_rejects_stale_solver_or_lambda_grid(tmp_path: Path, field: str):
         cli.load_stage1_prerequisite(root)
 
 
-@pytest.mark.parametrize("stale", ["checkpoint", "source", "rule"])
+@pytest.mark.parametrize("stale", ["checkpoint", "source", "rule", "git"])
 def test_stage1_provenance_rejects_stale_inputs(tmp_path: Path, stale: str):
     source_manifest = tmp_path / "manifest.json"
     source_tasks = tmp_path / "tasks.csv"
@@ -380,13 +383,15 @@ def test_stage1_provenance_rejects_stale_inputs(tmp_path: Path, stale: str):
         report["checkpoint_sha256"] = "0" * 64
     elif stale == "source":
         report["source_checksums"][str(source_manifest.resolve())] = "0" * 64
-    else:
+    elif stale == "rule":
         report["rule_config_sha256"] = "0" * 64
+    else:
+        report["git_head"] = "0" * 40
     runs = [
         {"seed": 42, "model_path": tmp_path / "model42.zip", "model_sha256": "a" * 64},
         {"seed": 123, "model_path": tmp_path / "model123.zip", "model_sha256": "b" * 64},
     ]
-    with pytest.raises(ValueError, match="checkpoint|source|rule"):
+    with pytest.raises(ValueError, match="checkpoint|source|rule|git"):
         cli.validate_stage1_provenance(
             {"report": report}, runs=runs, source_manifest=source_manifest,
             source_tasks_csv=source_tasks, evaluation_provenance=evaluation,

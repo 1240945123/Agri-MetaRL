@@ -148,6 +148,16 @@ def _lower_sha(value: Any, *, name: str) -> str:
     return value
 
 
+def _git_revision(value: Any, *, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) not in (40, 64)
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be canonical lowercase git hex")
+    return value
+
+
 def _stage1_shield_fingerprint(report: Mapping[str, Any]) -> str:
     return _shared_stage1_shield_fingerprint(report)
 
@@ -213,6 +223,7 @@ def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
     required = {
         "failure_id", "capsule_identity_sha256", "checkpoint_path",
         "checkpoint_sha256", "source_checksums", "git_head", "dirty",
+        "capsule_source_checksums", "capsule_git_head", "capsule_dirty",
         "formal_solver_options", "env_config_sha256", "rule_config_sha256",
         "fixed_lambdas", "method", "shield_fingerprint",
         *STAGE1_MECHANISM_FIELDS,
@@ -226,6 +237,10 @@ def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
     _lower_sha(report["rule_config_sha256"], name="rule config hash")
     if type(report["dirty"]) is not bool:
         raise ValueError("Stage-1 dirty provenance must be boolean")
+    _git_revision(report["git_head"], name="Stage-1 execution git provenance")
+    _git_revision(report["capsule_git_head"], name="Stage-1 capsule git provenance")
+    if type(report["capsule_dirty"]) is not bool:
+        raise ValueError("Stage-1 capsule dirty provenance must be boolean")
     if report["formal_solver_options"] != dict(FORMAL_CVODES_OPTIONS):
         raise ValueError("Stage-1 formal solver options are stale")
     if report["fixed_lambdas"] != list(DEFAULT_LAMBDAS):
@@ -233,13 +248,14 @@ def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
     _lower_sha(report["shield_fingerprint"], name="Stage-1 shield fingerprint")
     if report["shield_fingerprint"] != _stage1_shield_fingerprint(report):
         raise ValueError("Stage-1 shield fingerprint does not bind its provenance")
-    sources = report["source_checksums"]
-    if not isinstance(sources, dict) or not sources:
-        raise ValueError("Stage-1 source checksums must be a nonempty mapping")
-    for name, checksum in sources.items():
-        if not isinstance(name, str) or not name:
-            raise ValueError("Stage-1 source checksum names must be nonempty strings")
-        _lower_sha(checksum, name=f"Stage-1 source checksum {name}")
+    for source_field in ("source_checksums", "capsule_source_checksums"):
+        sources = report[source_field]
+        if not isinstance(sources, dict) or not sources:
+            raise ValueError(f"Stage-1 {source_field} must be a nonempty mapping")
+        for name, checksum in sources.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("Stage-1 source checksum names must be nonempty strings")
+            _lower_sha(checksum, name=f"Stage-1 {source_field} {name}")
     with np.load(root / "stage1_states.npz", allow_pickle=False) as archive:
         if set(archive.files) != {"x0", "selected_final_state", "selected_available"}:
             raise ValueError("Stage-1 states archive has invalid fields")

@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from time import perf_counter
@@ -57,6 +58,11 @@ FINGERPRINT_FIELDS = (
     "method",
     "fixed_lambdas",
     "source_checksums",
+    "capsule_source_checksums",
+    "git_head",
+    "dirty",
+    "capsule_git_head",
+    "capsule_dirty",
     "formal_solver_options",
     "env_config_sha256",
     "rule_config_sha256",
@@ -576,10 +582,55 @@ def _provenance(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "capsule_identity_sha256": identity,
         "checkpoint_path": checkpoint_path,
         "checkpoint_sha256": checkpoint_sha,
-        "source_checksums": dict(sources),
-        "git_head": git_head,
-        "dirty": dirty,
+        "capsule_source_checksums": dict(sources),
+        "capsule_git_head": git_head,
+        "capsule_dirty": dirty,
     }
+
+
+def _repository_provenance() -> dict[str, Any]:
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", *arguments], cwd=ROOT, text=True,
+            capture_output=True, check=True,
+        )
+        return completed.stdout.strip()
+
+    return {
+        "git_commit": git("rev-parse", "HEAD"),
+        "dirty": bool(git("status", "--porcelain")),
+    }
+
+
+def _execution_source_checksums(
+    capsule_sources: Mapping[str, str]
+) -> dict[str, str]:
+    current: dict[str, str] = {}
+    for name, capsule_checksum in capsule_sources.items():
+        path = Path(name).expanduser()
+        if path.is_file() and not path.is_symlink():
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            current[name] = digest.hexdigest()
+        else:
+            current[name] = capsule_checksum
+    return current
+
+
+def _validate_execution_provenance(value: Mapping[str, Any]) -> tuple[str, bool]:
+    git_commit = value.get("git_commit")
+    dirty = value.get("dirty")
+    if (
+        not isinstance(git_commit, str)
+        or len(git_commit) not in (40, 64)
+        or any(character not in "0123456789abcdef" for character in git_commit)
+    ):
+        raise ValueError("Stage-1 execution git_commit must be canonical lowercase hex")
+    if type(dirty) is not bool:
+        raise ValueError("Stage-1 execution dirty provenance must be boolean")
+    return git_commit, dirty
 
 
 def _factory_kwargs(inputs: Mapping[str, Any]) -> dict[str, Any]:
@@ -1075,6 +1126,7 @@ def run_stage1(
     capsule_loader: Callable[[str | Path], Any] = load_failure_capsule,
     integrator_factory: Callable[..., Any] = define_model,
     controller_factory: Callable[[], Any] = build_rule_based_controller,
+    provenance_loader: Callable[[], Mapping[str, Any]] = _repository_provenance,
 ) -> Path:
     manifest_path = Path(capsule_path).expanduser().absolute()
     if manifest_path.name != "manifest.json":
@@ -1099,6 +1151,14 @@ def run_stage1(
             "stored original u does not match configured action-to-control mapping"
         )
     provenance = _provenance(capsule.manifest)
+    git_head, dirty = _validate_execution_provenance(provenance_loader())
+    provenance.update({
+        "source_checksums": _execution_source_checksums(
+            provenance["capsule_source_checksums"]
+        ),
+        "git_head": git_head,
+        "dirty": dirty,
+    })
 
     reproduced, _, original = _run_original(inputs, integrator_factory)
     reference_action = None

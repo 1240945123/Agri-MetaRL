@@ -14,6 +14,11 @@ def _report() -> dict:
         "method": cli.METHOD,
         "fixed_lambdas": list(cli.DEFAULT_LAMBDAS),
         "source_checksums": {"source": "b" * 64},
+        "capsule_source_checksums": {"source": "a" * 64},
+        "git_head": "1" * 40,
+        "dirty": False,
+        "capsule_git_head": "2" * 40,
+        "capsule_dirty": True,
         "formal_solver_options": {"solver": "fixed"},
         "env_config_sha256": "c" * 64,
         "rule_config_sha256": "d" * 64,
@@ -112,6 +117,13 @@ def test_stage1_report_rejects_v1_schema():
 def test_stage1_report_rejects_source_provenance_tampering():
     report = _report()
     report["source_checksums"]["source"] = "0" * 64
+    with pytest.raises(ValueError, match="fingerprint"):
+        cli._validate_report(report, np.ones(2), np.ones(2))
+
+
+def test_stage1_report_rejects_capsule_origin_tampering():
+    report = _report()
+    report["capsule_git_head"] = "0" * 40
     with pytest.raises(ValueError, match="fingerprint"):
         cli._validate_report(report, np.ones(2), np.ones(2))
 

@@ -163,6 +163,7 @@ def test_failure_then_fixed_candidates_selects_first_success(tmp_path):
         capsule_loader=lambda path: capsule,
         integrator_factory=factory,
         controller_factory=lambda: Controller(),
+        provenance_loader=lambda: {"git_commit": "d" * 40, "dirty": True},
     )
 
     assert result == output.resolve()
@@ -213,6 +214,8 @@ def test_failure_then_fixed_candidates_selects_first_success(tmp_path):
     assert "controller_source" not in payload
     assert payload["git_head"] == "d" * 40
     assert payload["dirty"] is True
+    assert payload["capsule_git_head"] == "d" * 40
+    assert payload["capsule_dirty"] is True
     assert payload["reference_control"] == [0.4, 0.6]
     assert payload["selected_lambda"] == cli.DEFAULT_LAMBDAS[2]
     attempts = payload["candidate_attempts"]
@@ -844,3 +847,58 @@ def test_output_parent_identity_swap_aborts_before_publication(tmp_path):
     assert list(displaced.iterdir()) == []
     assert capsule.path.is_dir()
     assert not Path(capsule.manifest["context"]["formal_result_root"]).exists()
+
+
+def test_new_stage1_commit_preserves_capsule_origin_and_passes_stage2(tmp_path):
+    from experiments.scripts import run_shielded_context_ab as stage2
+
+    capsule = _capsule(tmp_path)
+    source_manifest = tmp_path / "suite.json"
+    source_tasks = tmp_path / "tasks.csv"
+    source_manifest.write_text("{}", encoding="utf-8")
+    source_tasks.write_text("task_id\n", encoding="utf-8")
+    source_paths = [source_manifest, source_tasks]
+    source_paths.extend(stage2.ROOT / path for _, path in stage2.RELEVANT_SOURCE_FIELDS)
+    capsule.manifest["source_checksums"] = {
+        str(path.resolve()): "0" * 64 for path in source_paths
+    }
+    capsule.manifest["git_head"] = "2" * 40
+    capsule.manifest["dirty"] = True
+    output = tmp_path / "stage1-new-commit"
+    config = _config(tmp_path / "env.yml")
+
+    cli.run_stage1(
+        capsule.path / "manifest.json",
+        config,
+        output,
+        capsule_loader=lambda _: capsule,
+        integrator_factory=_original_failure_then_success_factory(),
+        controller_factory=_fixed_controller,
+        provenance_loader=lambda: {"git_commit": "b" * 40, "dirty": False},
+    )
+    loaded = stage2.load_stage1_prerequisite(output)
+    report = loaded["report"]
+    assert report["capsule_git_head"] == "2" * 40
+    assert report["capsule_dirty"] is True
+    assert report["git_head"] == "b" * 40
+    assert report["dirty"] is False
+
+    evaluation = {"git_commit": "b" * 40, "dirty": False}
+    for name, path in stage2.RELEVANT_SOURCE_FIELDS:
+        evaluation[name] = stage2.sha256_file(stage2.ROOT / path)
+    stage2.validate_stage1_provenance(
+        loaded,
+        runs=[
+            {"seed": 42, "model_path": "unused", "model_sha256": "a" * 64},
+            {
+                "seed": 123,
+                "model_path": capsule.manifest["checkpoint_path"],
+                "model_sha256": capsule.manifest["checkpoint_sha256"],
+            },
+        ],
+        source_manifest=source_manifest,
+        source_tasks_csv=source_tasks,
+        evaluation_provenance=evaluation,
+        rule_config_sha256=report["rule_config_sha256"],
+        env_config_sha256=report["env_config_sha256"],
+    )
