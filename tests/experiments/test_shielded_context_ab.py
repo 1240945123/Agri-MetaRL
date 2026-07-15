@@ -737,9 +737,10 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
     monkeypatch.setattr(cli, "validate_stage1_provenance", lambda *args, **kwargs: None)
     provenance = {"git_commit": "a" * 40, "dirty": False}
     evaluation = cli._evaluation_provenance(manifest_path, tasks_path, provenance)
+    non_idempotent_return = -2021.9078785034974
     unshielded = pd.DataFrame(
         [{"seed": seed, "task_id": task, "inference_mode": mode, "completed": True,
-          "ode_failure_count": 0, "episode_return": 100.0, "EPI": 1.0,
+          "ode_failure_count": 0, "episode_return": non_idempotent_return, "EPI": 1.0,
           "temp_violation": 1.0, "co2_violation": 1.0, "rh_violation": 1.0}
          for seed in cli.APPROVED_SEEDS for task in cli.DIAGNOSTIC_TASK_IDS for mode in cli.MODES]
     )
@@ -747,6 +748,7 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
     unshielded_root.mkdir()
     (unshielded_root / "diagnostic_manifest.json").write_text("{}", encoding="utf-8")
     unshielded.to_csv(unshielded_root / "eval_raw.csv", index=False)
+    published_unshielded = pd.read_csv(unshielded_root / "eval_raw.csv")
     fake_capsule = unshielded_root / ("f" * 64)
     fake_capsule.mkdir()
     fake_manifest = fake_capsule / "manifest.json"
@@ -755,7 +757,7 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
         cli,
         "load_unshielded_comparator",
         lambda *args, **kwargs: (
-            unshielded,
+            published_unshielded,
             {},
             [{"manifest_path": fake_manifest, "capsule_dir": fake_capsule,
               "capsule_identity_sha256": "4" * 64, "failure_id": "f" * 64}],
@@ -801,7 +803,7 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
 
     def episode_runner(model, env, *, inference_mode, return_diagnostics, failure_recorder):
         assert return_diagnostics and failure_recorder is not None
-        return ({"episode_return": 100.0 - 4.63639323048223e-06,
+        return ({"episode_return": non_idempotent_return - 4.63639323048223e-06,
                  "EPI": 1.0, "temp_violation": 1.0,
                  "co2_violation": 1.0, "rh_violation": 1.0},
                 {"action_trace": np.zeros((3, 2)), "requested_action_trace": np.zeros((3, 2)),

@@ -1122,9 +1122,8 @@ def run_shielded_diagnostic(
     if len(evidence_files) != 3 * len(raw):
         raise RuntimeError("publication evidence destinations must be globally unique")
     raw = _csv_canonical_frame(raw)
-    canonical_unshielded = _csv_canonical_frame(unshielded)
-    gate = evaluate_shield_gate(raw, canonical_unshielded, targets)
-    paired = build_paired_shield_deltas(raw, canonical_unshielded, targets)
+    gate = evaluate_shield_gate(raw, unshielded, targets)
+    paired = build_paired_shield_deltas(raw, unshielded, targets)
     decision = _stage2_decision(gate, shield_fingerprint=shield_fingerprint)
     manifest = {
         **fingerprint_payload, "shield_fingerprint": shield_fingerprint,
