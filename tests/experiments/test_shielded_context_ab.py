@@ -738,6 +738,22 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
     provenance = {"git_commit": "a" * 40, "dirty": False}
     evaluation = cli._evaluation_provenance(manifest_path, tasks_path, provenance)
     non_idempotent_return = -2021.9078785034974
+    shielded_regression_return = -193.77402710574154
+    probe_path = tmp_path / "shielded_roundtrip_probe.csv"
+    pd.DataFrame({"episode_return": [shielded_regression_return]}).to_csv(
+        probe_path, index=False
+    )
+    roundtrip_one = pd.read_csv(probe_path)
+    roundtrip_one.to_csv(probe_path, index=False)
+    roundtrip_two = pd.read_csv(probe_path)
+    assert roundtrip_one.at[0, "episode_return"] != roundtrip_two.at[0, "episode_return"]
+    canonical_probe = cli._csv_canonical_frame(
+        pd.DataFrame({"episode_return": [shielded_regression_return]})
+    )
+    canonical_probe.to_csv(probe_path, index=False)
+    pd.testing.assert_frame_equal(
+        canonical_probe, pd.read_csv(probe_path), check_exact=True
+    )
     unshielded = pd.DataFrame(
         [{"seed": seed, "task_id": task, "inference_mode": mode, "completed": True,
           "ode_failure_count": 0, "episode_return": non_idempotent_return, "EPI": 1.0,
@@ -803,7 +819,7 @@ def test_injectable_runner_executes_exact_32_with_shield_params_and_publishes_re
 
     def episode_runner(model, env, *, inference_mode, return_diagnostics, failure_recorder):
         assert return_diagnostics and failure_recorder is not None
-        return ({"episode_return": non_idempotent_return - 4.63639323048223e-06,
+        return ({"episode_return": shielded_regression_return,
                  "EPI": 1.0, "temp_violation": 1.0,
                  "co2_violation": 1.0, "rh_violation": 1.0},
                 {"action_trace": np.zeros((3, 2)), "requested_action_trace": np.zeros((3, 2)),

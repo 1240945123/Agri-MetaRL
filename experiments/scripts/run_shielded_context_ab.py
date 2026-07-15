@@ -789,12 +789,20 @@ def _write_progress(rows: list[dict[str, Any]], path: Path) -> None:
     os.replace(temporary, path)
 
 
-def _csv_canonical_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    """Return the values pandas' default CSV writer/reader will publish and load."""
-    buffer = StringIO()
-    frame.to_csv(buffer, index=False)
-    buffer.seek(0)
-    return pd.read_csv(buffer)
+def _csv_canonical_frame(frame: pd.DataFrame, *, max_roundtrips: int = 10) -> pd.DataFrame:
+    """Reach an exact fixed point under pandas' default CSV write/read cycle."""
+    current = frame
+    for _ in range(max_roundtrips):
+        buffer = StringIO()
+        current.to_csv(buffer, index=False)
+        buffer.seek(0)
+        parsed = pd.read_csv(buffer)
+        if current.equals(parsed):
+            return current
+        current = parsed
+    raise RuntimeError(
+        f"CSV evidence did not reach a fixed point after {max_roundtrips} roundtrips"
+    )
 
 
 def _validated_context_diagnostics(
