@@ -110,6 +110,52 @@ def test_load_stage1_rejects_invalid_condition_mapping(
         cli.load_stage1_prerequisite(root)
 
 
+@pytest.mark.parametrize("invalid", ["integer", "string", "missing", "extra"])
+def test_load_stage1_rejects_invalid_decision_condition_mapping(
+    tmp_path: Path, invalid: str
+):
+    root = tmp_path / "stage1"
+    report = _stage1(root)
+    decision = {
+        key: report[key] for key in ("outcome", "conditions", "selected_lambda")
+    }
+    conditions = dict(decision["conditions"])
+    decision["conditions"] = conditions
+    if invalid == "integer":
+        conditions[cli.STAGE1_CONDITIONS[0]] = 1
+    elif invalid == "string":
+        conditions[cli.STAGE1_CONDITIONS[0]] = "true"
+    elif invalid == "missing":
+        conditions.pop(cli.STAGE1_CONDITIONS[0])
+    else:
+        conditions["unexpected"] = True
+    (root / "decision.json").write_text(
+        json.dumps(decision, sort_keys=True), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="conditions|decision"):
+        cli.load_stage1_prerequisite(root)
+
+
+def test_load_stage1_compares_decision_lambda_type_sensitively(tmp_path: Path):
+    root = tmp_path / "stage1"
+    report = _stage1(root)
+    report["selected_lambda"] = 1.0
+    (root / "stage1_results.json").write_text(
+        json.dumps(report, sort_keys=True), encoding="utf-8"
+    )
+    decision = {
+        key: report[key] for key in ("outcome", "conditions", "selected_lambda")
+    }
+    decision["selected_lambda"] = 1
+    (root / "decision.json").write_text(
+        json.dumps(decision, sort_keys=True), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="decision"):
+        cli.load_stage1_prerequisite(root)
+
+
 @pytest.mark.parametrize("field", ["formal_solver_options", "fixed_lambdas"])
 def test_stage1_rejects_stale_solver_or_lambda_grid(tmp_path: Path, field: str):
     root = tmp_path / "stage1"

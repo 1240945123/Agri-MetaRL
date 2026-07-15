@@ -174,12 +174,26 @@ def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
         or float(selected) not in DEFAULT_LAMBDAS
     ):
         raise ValueError("Stage-1 selected_lambda must be a positive fixed-grid value")
+    decision_conditions = decision.get("conditions")
+    if (
+        not isinstance(decision_conditions, dict)
+        or set(decision_conditions) != set(STAGE1_CONDITIONS)
+        or any(value is not True for value in decision_conditions.values())
+    ):
+        raise ValueError("Stage-1 decision conditions must be the four exact passing conditions")
     expected_decision = {
         "outcome": "continue_to_context_ab",
         "conditions": conditions,
         "selected_lambda": selected,
     }
-    if report.get("outcome") != "continue_to_context_ab" or decision != expected_decision:
+    if (
+        report.get("outcome") != "continue_to_context_ab"
+        or type(decision["outcome"]) is not type(expected_decision["outcome"])
+        or decision["outcome"] != expected_decision["outcome"]
+        or decision_conditions != conditions
+        or type(decision["selected_lambda"]) is not type(selected)
+        or decision["selected_lambda"] != expected_decision["selected_lambda"]
+    ):
         raise ValueError("Stage-1 outcome/decision is inconsistent with passing evidence")
     required = {
         "failure_id", "capsule_identity_sha256", "checkpoint_path",
