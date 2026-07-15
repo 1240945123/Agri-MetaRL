@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 import gl_gym.experiments.suite_evaluation as suite_evaluation
+from gl_gym.environments.action_shield import ActionShieldConfig, DEFAULT_LAMBDAS
 from gl_gym.experiments.suite_schema import create_default_suite_config, write_suite_manifest
 from gl_gym.experiments.suite_evaluation import (
     EvaluationMetricRow,
@@ -898,9 +899,14 @@ def test_shielded_episode_uses_executed_action_and_returns_detached_provenance()
             obs, rewards, dones, infos = super().step(actions)
             requested = np.asarray(actions[0], dtype=np.float32).copy()
             record = {
+                "schema_version": ActionShieldConfig().schema_version,
                 "requested_action": requested.tolist(),
                 "executed_action": [0.25],
                 "selected_lambda": 0.5,
+                "candidate_attempts": [
+                    {"lambda": DEFAULT_LAMBDAS[0], "success": False},
+                    {"lambda": DEFAULT_LAMBDAS[1], "success": True},
+                ],
                 "nested": {"attempts": [1]},
             }
             infos[0]["action_shield"] = record
@@ -934,9 +940,11 @@ def test_no_intervention_action_shield_record_still_marks_episode_as_shielded():
             obs, rewards, dones, infos = super().step(actions)
             requested = np.asarray(actions[0], dtype=np.float32).copy()
             infos[0]["action_shield"] = {
+                "schema_version": ActionShieldConfig().schema_version,
                 "requested_action": requested.tolist(),
                 "executed_action": requested.tolist(),
-                "selected_lambda": 1.0,
+                "selected_lambda": 0.0,
+                "candidate_attempts": [],
             }
             return obs, rewards, dones, infos
 
@@ -950,6 +958,38 @@ def test_no_intervention_action_shield_record_still_marks_episode_as_shielded():
         "action_shield_records",
     }
     assert len(diagnostics["action_shield_records"]) == 3
+
+
+def test_action_shield_v2_accepts_conservative_prefix_ending_in_success():
+    requested = np.array([0.0], dtype=np.float32)
+    record = {
+        "schema_version": ActionShieldConfig().schema_version,
+        "requested_action": requested.tolist(),
+        "executed_action": [0.25],
+        "selected_lambda": 0.5,
+        "candidate_attempts": [
+            {"lambda": DEFAULT_LAMBDAS[0], "success": False},
+            {"lambda": DEFAULT_LAMBDAS[1], "success": True},
+        ],
+    }
+
+    executed, _ = suite_evaluation._shielded_executed_action(record, requested)
+
+    np.testing.assert_array_equal(executed, np.array([0.25], dtype=np.float32))
+
+
+def test_action_shield_v2_rejects_nonprefix_legacy_success():
+    requested = np.array([0.0], dtype=np.float32)
+    record = {
+        "schema_version": ActionShieldConfig().schema_version,
+        "requested_action": requested.tolist(),
+        "executed_action": [0.25],
+        "selected_lambda": DEFAULT_LAMBDAS[-1],
+        "candidate_attempts": [{"lambda": DEFAULT_LAMBDAS[-1], "success": True}],
+    }
+
+    with pytest.raises(ValueError, match="prefix"):
+        suite_evaluation._shielded_executed_action(record, requested)
 
 
 @pytest.mark.parametrize(
@@ -1034,8 +1074,11 @@ def test_valid_early_terminal_transition_is_observed_once_before_horizon_error()
                     {
                         "terminal_observation": np.array([9.0], dtype=np.float32),
                         "action_shield": {
+                            "schema_version": ActionShieldConfig().schema_version,
                             "requested_action": requested.tolist(),
                             "executed_action": [0.25],
+                            "selected_lambda": 0.0,
+                            "candidate_attempts": [],
                         },
                     }
                 ],
@@ -1090,8 +1133,11 @@ def test_mixed_shield_presence_is_rejected_as_provenance_corruption():
             if self.step_count == 1:
                 requested = np.asarray(actions[0], dtype=np.float32).copy()
                 infos[0]["action_shield"] = {
+                    "schema_version": ActionShieldConfig().schema_version,
                     "requested_action": requested.tolist(),
                     "executed_action": requested.tolist(),
+                    "selected_lambda": 0.0,
+                    "candidate_attempts": [],
                 }
             return obs, rewards, dones, infos
 

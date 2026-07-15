@@ -13,7 +13,11 @@ from typing import Any
 
 import numpy as np
 
+from gl_gym.environments.action_shield import ActionShieldConfig, DEFAULT_LAMBDAS
 from gl_gym.experiments.suite_schema import EvaluationTaskRecord
+
+
+_ACTION_SHIELD_SCHEMA_VERSION = ActionShieldConfig().schema_version
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +166,58 @@ def _shielded_executed_action(
             raise ValueError(
                 "action_shield requested_action does not match the policy action"
             )
+
+    if record.get("schema_version") != _ACTION_SHIELD_SCHEMA_VERSION:
+        raise ValueError(
+            "action_shield schema_version must match the canonical v2 schema"
+        )
+    attempts = record.get("candidate_attempts")
+    if not isinstance(attempts, (list, tuple)):
+        raise ValueError("action_shield candidate_attempts must be a sequence")
+    if len(attempts) > len(DEFAULT_LAMBDAS):
+        raise ValueError("action_shield candidate_attempts lambdas must be a prefix")
+
+    attempt_lambdas: list[float] = []
+    attempt_successes: list[bool] = []
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            raise ValueError("action_shield candidate_attempts entries must be mappings")
+        lambda_value = attempt.get("lambda")
+        if (
+            isinstance(lambda_value, (bool, np.bool_))
+            or not np.isscalar(lambda_value)
+            or not np.isfinite(lambda_value)
+        ):
+            raise ValueError("action_shield candidate_attempt lambda must be finite")
+        success = attempt.get("success")
+        if not isinstance(success, (bool, np.bool_)):
+            raise ValueError("action_shield candidate_attempt success must be boolean")
+        attempt_lambdas.append(float(lambda_value))
+        attempt_successes.append(bool(success))
+
+    if tuple(attempt_lambdas) != DEFAULT_LAMBDAS[: len(attempt_lambdas)]:
+        raise ValueError("action_shield candidate_attempts lambdas must be a prefix")
+
+    selected_lambda = record.get("selected_lambda")
+    if (
+        isinstance(selected_lambda, (bool, np.bool_))
+        or not np.isscalar(selected_lambda)
+        or not np.isfinite(selected_lambda)
+    ):
+        raise ValueError("action_shield selected_lambda must be finite")
+    if attempts:
+        if attempt_successes != [False] * (len(attempts) - 1) + [True]:
+            raise ValueError(
+                "action_shield only the last candidate attempt may succeed"
+            )
+        if float(selected_lambda) != attempt_lambdas[-1]:
+            raise ValueError(
+                "action_shield final candidate lambda must equal selected_lambda"
+            )
+    elif float(selected_lambda) != 0.0:
+        raise ValueError(
+            "action_shield selected_lambda must be zero without candidate attempts"
+        )
     return executed_action, deepcopy(dict(record))
 
 

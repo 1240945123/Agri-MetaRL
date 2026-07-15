@@ -198,6 +198,7 @@ def test_original_success_samples_once_and_never_constructs_recovery(shield_env,
     assert reward == 4.0 and not terminated and not truncated
     assert shield_env.reward.calls == 1 and shield_env.timestep == 2
     record = info["action_shield"]
+    assert record["schema_version"] == shield_env.action_shield_config.schema_version
     assert record["intervened"] is False
     assert record["selected_lambda"] == 0.0
     assert record["reference_action"] is None
@@ -270,6 +271,7 @@ def test_retry_uses_fixed_order_fresh_integrators_and_reuses_selected_state(
     np.testing.assert_array_equal(observation, [40, 41, 42])
     assert not terminated and shield_env.reward.calls == 1
     record = info["action_shield"]
+    assert record["schema_version"] == shield_env.action_shield_config.schema_version
     assert record["selected_lambda"] == DEFAULT_LAMBDAS[2]
     assert [item["lambda"] for item in record["candidate_attempts"]] == list(DEFAULT_LAMBDAS[:3])
     assert [item["success"] for item in record["candidate_attempts"]] == [False, False, True]
