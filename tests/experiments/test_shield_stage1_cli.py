@@ -190,7 +190,9 @@ def test_failure_then_fixed_candidates_selects_first_success(tmp_path):
         "decision.json",
     }
     payload = json.loads((result / "stage1_results.json").read_text(encoding="utf-8"))
-    assert payload["schema_version"] == "action-shield-stage1-v1"
+    assert payload["schema_version"] == "conservative-feasibility-action-shield-v2"
+    assert payload["method"] == "conservative_feasibility_shield_v2"
+    assert payload["fixed_lambdas"] == list(cli.DEFAULT_LAMBDAS)
     assert "controller_source" not in payload
     assert payload["git_head"] == "d" * 40
     assert payload["dirty"] is True
@@ -204,7 +206,19 @@ def test_failure_then_fixed_candidates_selects_first_success(tmp_path):
     assert payload["outcome"] == "continue_to_context_ab"
     assert payload["delta_u_max"] == delta.tolist()
     decision = json.loads((result / "decision.json").read_text(encoding="utf-8"))
-    assert set(decision) == {"outcome", "conditions", "selected_lambda"}
+    assert set(decision) == {
+        "schema_version",
+        "method",
+        "fixed_lambdas",
+        "shield_fingerprint",
+        "outcome",
+        "conditions",
+        "selected_lambda",
+    }
+    assert decision["schema_version"] == payload["schema_version"]
+    assert decision["method"] == payload["method"]
+    assert decision["fixed_lambdas"] == payload["fixed_lambdas"]
+    assert decision["shield_fingerprint"] == payload["shield_fingerprint"]
     assert all(decision["conditions"].values())
     with np.load(result / "stage1_states.npz", allow_pickle=False) as archive:
         assert set(archive.files) == {
