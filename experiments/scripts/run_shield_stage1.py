@@ -62,6 +62,28 @@ FINGERPRINT_FIELDS = (
     "rule_config_sha256",
     "capsule_identity_sha256",
     "checkpoint_sha256",
+    "failure_timestep",
+    "delta_u_max",
+    "original_outcome",
+    "candidate_attempts",
+    "reference_action",
+    "reference_control",
+    "requested_action",
+    "requested_control",
+    "executed_action",
+    "executed_control",
+    "selected_lambda",
+    "conditions",
+    "outcome",
+)
+
+MECHANISM_FIELDS = frozenset(
+    {
+        "original_outcome", "candidate_attempts", "reference_action",
+        "reference_control", "requested_action", "requested_control",
+        "executed_action", "executed_control", "selected_lambda",
+        "delta_u_max", "conditions", "outcome",
+    }
 )
 
 
@@ -722,6 +744,109 @@ def _validate_stage1_candidate_attempts(
         raise ValueError("unsuccessful Stage-1 evidence cannot select a successful candidate")
 
 
+def _validate_stage1_mechanism(report: Mapping[str, Any]) -> dict[str, bool]:
+    missing = sorted(MECHANISM_FIELDS.difference(report))
+    if missing:
+        raise ValueError(f"stage-1 mechanism evidence is missing fields: {missing}")
+
+    original = report["original_outcome"]
+    outcome_fields = {
+        "success", "exception_type", "exception_message", "elapsed_seconds",
+    }
+    if not isinstance(original, Mapping) or set(original) != outcome_fields:
+        raise ValueError("original_outcome must contain exact mechanism fields")
+    if type(original["success"]) is not bool:
+        raise ValueError("original_outcome success must be a strict bool")
+    if original["success"]:
+        raise ValueError("original_outcome must record the original action failure")
+    if not isinstance(original["exception_type"], str) or not isinstance(
+        original["exception_message"], str
+    ):
+        raise ValueError("original_outcome failure must contain exception strings")
+    elapsed = original["elapsed_seconds"]
+    if isinstance(elapsed, (bool, np.bool_)) or not isinstance(elapsed, Real):
+        raise ValueError("original_outcome elapsed_seconds must be finite and nonnegative")
+    try:
+        finite_elapsed = float(elapsed)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(
+            "original_outcome elapsed_seconds must be finite and nonnegative"
+        ) from error
+    if not math.isfinite(finite_elapsed) or finite_elapsed < 0.0:
+        raise ValueError("original_outcome elapsed_seconds must be finite and nonnegative")
+
+    _validate_stage1_candidate_attempts(
+        report["candidate_attempts"], report["selected_lambda"], require_success=True
+    )
+    selected = _stage1_lambda(report["selected_lambda"], name="selected_lambda")
+    vectors = {
+        name: _stage1_attempt_vector(report[name], name=f"stage-1 {name}")
+        for name in (
+            "requested_action", "reference_action", "executed_action",
+            "requested_control", "reference_control", "executed_control",
+            "delta_u_max",
+        )
+    }
+    action_shape = vectors["requested_action"].shape
+    if any(vectors[name].shape != action_shape for name in vectors):
+        raise ValueError("stage-1 mechanism action/control shapes must match")
+    if np.any(vectors["delta_u_max"] <= 0.0):
+        raise ValueError("stage-1 delta_u_max must be strictly positive")
+
+    for attempt in report["candidate_attempts"]:
+        lam = _stage1_lambda(attempt["lambda"], name="candidate attempt lambda")
+        expected_action = (
+            (1.0 - lam) * vectors["requested_action"]
+            + lam * vectors["reference_action"]
+        )
+        action = _stage1_attempt_vector(
+            attempt["action"], name="candidate attempt action"
+        )
+        if not np.array_equal(action, expected_action):
+            raise ValueError("candidate attempt action is inconsistent with mechanism")
+
+    selected_attempt = report["candidate_attempts"][-1]
+    selected_action = _stage1_attempt_vector(
+        selected_attempt["action"], name="selected candidate action"
+    )
+    selected_control = _stage1_attempt_vector(
+        selected_attempt["control"], name="selected candidate control"
+    )
+    if not np.array_equal(selected_action, vectors["executed_action"]):
+        raise ValueError("executed_action must equal the selected candidate attempt")
+    if not np.array_equal(selected_control, vectors["executed_control"]):
+        raise ValueError("executed_control must equal the selected candidate attempt")
+
+    conditions = report["conditions"]
+    if (
+        not isinstance(conditions, dict)
+        or set(conditions) != set(CONDITION_NAMES)
+        or any(type(value) is not bool for value in conditions.values())
+    ):
+        raise ValueError("invalid stage-1 decision conditions")
+    expected_conditions = {
+        "original_reproduced": True,
+        "legal_candidate_succeeded": True,
+        "first_successful_candidate_selected": True,
+        "intervention_recorded": bool(
+            selected > 0.0
+            and not np.array_equal(
+                vectors["requested_action"], vectors["executed_action"]
+            )
+        ),
+    }
+    if conditions != expected_conditions:
+        raise ValueError("stage-1 conditions do not match recomputed mechanism evidence")
+    expected_outcome = (
+        "continue_to_context_ab"
+        if all(expected_conditions.values())
+        else "redesign_action_shield"
+    )
+    if report["outcome"] != expected_outcome:
+        raise ValueError("stage-1 outcome is inconsistent with mechanism conditions")
+    return expected_conditions
+
+
 def _validate_report(
     report: Mapping[str, Any], x0: np.ndarray, selected_state: np.ndarray | None
 ) -> None:
@@ -738,32 +863,9 @@ def _validate_report(
         or any(character not in "0123456789abcdef" for character in fingerprint)
     ):
         raise ValueError("invalid stage-1 shield fingerprint")
+    _validate_stage1_mechanism(report)
     if fingerprint != _shield_fingerprint(report):
         raise ValueError("stage-1 shield fingerprint does not bind its provenance")
-    conditions = report.get("conditions")
-    if (
-        not isinstance(conditions, dict)
-        or tuple(conditions) != CONDITION_NAMES
-        or any(type(value) is not bool for value in conditions.values())
-    ):
-        raise ValueError("invalid stage-1 decision conditions")
-    selection_succeeded = conditions["legal_candidate_succeeded"]
-    if conditions["first_successful_candidate_selected"] is not selection_succeeded:
-        raise ValueError("stage-1 candidate success conditions are inconsistent")
-    if "candidate_attempts" not in report:
-        raise ValueError("stage-1 report is missing candidate_attempts")
-    _validate_stage1_candidate_attempts(
-        report["candidate_attempts"],
-        report.get("selected_lambda"),
-        require_success=True,
-    )
-    expected = (
-        "continue_to_context_ab"
-        if all(conditions.values())
-        else "redesign_action_shield"
-    )
-    if report.get("outcome") != expected:
-        raise ValueError("stage-1 outcome is inconsistent with conditions")
     if selected_state is not None and selected_state.shape != x0.shape:
         raise ValueError("selected final state dimension is inconsistent with x0")
     json.dumps(report, allow_nan=False)

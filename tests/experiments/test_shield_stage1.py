@@ -19,12 +19,26 @@ def _report() -> dict:
         "rule_config_sha256": "d" * 64,
         "capsule_identity_sha256": "e" * 64,
         "checkpoint_sha256": "f" * 64,
+        "failure_timestep": 17,
+        "delta_u_max": [0.2, 0.2],
+        "original_outcome": {
+            "success": False,
+            "exception_type": "RuntimeError",
+            "exception_message": "original failed",
+            "elapsed_seconds": 0.01,
+        },
+        "requested_action": [1.0, 1.0],
+        "requested_control": [0.3, 0.3],
+        "reference_action": [-1.0, -1.0],
+        "reference_control": [0.4, 0.4],
+        "executed_action": [0.0, 0.0],
+        "executed_control": [0.2, 0.2],
         "selected_lambda": cli.DEFAULT_LAMBDAS[1],
         "candidate_attempts": [
             {
                 "lambda": cli.DEFAULT_LAMBDAS[0],
-                "action": [0.0, 0.0],
-                "control": [0.0, 0.0],
+                "action": [-1.0, -1.0],
+                "control": [0.1, 0.1],
                 "success": False,
                 "exception_type": "RuntimeError",
                 "exception_message": "failed",
@@ -33,7 +47,7 @@ def _report() -> dict:
             {
                 "lambda": cli.DEFAULT_LAMBDAS[1],
                 "action": [0.0, 0.0],
-                "control": [0.0, 0.0],
+                "control": [0.2, 0.2],
                 "success": True,
                 "exception_type": None,
                 "exception_message": None,
@@ -43,7 +57,8 @@ def _report() -> dict:
         "conditions": conditions,
         "outcome": "continue_to_context_ab",
     }
-    report["shield_fingerprint"] = cli._shield_fingerprint(report)
+    if "original_outcome" in report:
+        report["shield_fingerprint"] = cli._shield_fingerprint(report)
     return report
 
 
@@ -128,6 +143,15 @@ def test_stage1_passing_report_rejects_invalid_candidate_lambda(value):
         cli._validate_report(report, np.ones(2), np.ones(2))
 
 
+@pytest.mark.parametrize("value", ["1.0", True, np.nan, 10**309])
+def test_stage1_normalizes_invalid_selected_lambda_to_value_error(value):
+    report = _report()
+    report["selected_lambda"] = value
+
+    with pytest.raises(ValueError, match="lambda"):
+        cli._validate_report(report, np.ones(2), np.ones(2))
+
+
 @pytest.mark.parametrize("attempts", [[], "all_failed"])
 def test_stage1_rejects_unsuccessful_candidate_evidence_even_with_failing_conditions(
     attempts,
@@ -144,3 +168,36 @@ def test_stage1_rejects_unsuccessful_candidate_evidence_even_with_failing_condit
 
     with pytest.raises(ValueError, match="candidate_attempts.*successful|final.*succeed"):
         cli._validate_report(report, np.ones(2), None)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda report: report.pop("original_outcome"),
+        lambda report: report["original_outcome"].__setitem__("success", True),
+        lambda report: report["conditions"].__setitem__("original_reproduced", False),
+        lambda report: report["conditions"].__setitem__("intervention_recorded", False),
+        lambda report: report.__setitem__("executed_action", [0.25, 0.25]),
+        lambda report: report.__setitem__("executed_control", [0.25, 0.25]),
+    ],
+    ids=(
+        "missing_mechanism",
+        "original_succeeded",
+        "forged_original_condition",
+        "forged_intervention_condition",
+        "executed_action",
+        "executed_control",
+    ),
+)
+def test_stage1_recomputes_conditions_from_mechanism_evidence(mutate):
+    report = _report()
+    mutate(report)
+    if report.get("conditions", {}).get("original_reproduced") is False or report.get(
+        "conditions", {}
+    ).get("intervention_recorded") is False:
+        report["outcome"] = "redesign_action_shield"
+    if "original_outcome" in report:
+        report["shield_fingerprint"] = cli._shield_fingerprint(report)
+
+    with pytest.raises(ValueError, match="mechanism|original|condition|executed|attempt"):
+        cli._validate_report(report, np.ones(2), np.ones(2))

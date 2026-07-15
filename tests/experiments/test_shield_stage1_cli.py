@@ -286,7 +286,7 @@ def test_original_success_without_candidate_evidence_is_rejected(tmp_path):
         raise AssertionError("controller must not be constructed")
 
     output = tmp_path / "success"
-    with pytest.raises(ValueError, match="candidate_attempts.*successful"):
+    with pytest.raises(ValueError, match="original_outcome.*original action failure"):
         cli.run_stage1(
             capsule.path / "manifest.json",
             config,

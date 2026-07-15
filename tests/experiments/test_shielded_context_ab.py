@@ -26,11 +26,25 @@ def _stage1(root: Path) -> dict:
         "env_config_sha256": "e" * 64,
         "rule_config_sha256": "f" * 64,
         "fixed_lambdas": list(cli.DEFAULT_LAMBDAS),
+        "failure_timestep": 17,
+        "delta_u_max": [0.2, 0.2],
+        "original_outcome": {
+            "success": False,
+            "exception_type": "RuntimeError",
+            "exception_message": "original failed",
+            "elapsed_seconds": 0.01,
+        },
+        "requested_action": [1.0, 1.0],
+        "requested_control": [0.3, 0.3],
+        "reference_action": [-1.0, -1.0],
+        "reference_control": [0.0, 0.0],
+        "executed_action": [-1.0, -1.0],
+        "executed_control": [0.0, 0.0],
         "selected_lambda": cli.DEFAULT_LAMBDAS[0],
         "candidate_attempts": [
             {
                 "lambda": cli.DEFAULT_LAMBDAS[0],
-                "action": [0.0, 0.0],
+                "action": [-1.0, -1.0],
                 "control": [0.0, 0.0],
                 "success": True,
                 "exception_type": None,
@@ -41,7 +55,8 @@ def _stage1(root: Path) -> dict:
         "conditions": {name: True for name in cli.STAGE1_CONDITIONS},
         "outcome": "continue_to_context_ab",
     }
-    report["shield_fingerprint"] = cli._stage1_shield_fingerprint(report)
+    if "original_outcome" in report:
+        report["shield_fingerprint"] = cli._stage1_shield_fingerprint(report)
     (root / "stage1_results.json").write_text(json.dumps(report), encoding="utf-8")
     (root / "decision.json").write_text(
         json.dumps(
@@ -174,6 +189,53 @@ def test_load_stage1_rejects_invalid_candidate_lambda(tmp_path: Path, value):
     root = tmp_path / "stage1"
     report = _stage1(root)
     report["candidate_attempts"][0]["lambda"] = value
+    (root / "stage1_results.json").write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lambda|strict JSON"):
+        cli.load_stage1_prerequisite(root)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda report: report.pop("original_outcome"),
+        lambda report: report["original_outcome"].__setitem__("success", True),
+        lambda report: report.__setitem__("executed_action", [0.25, 0.25]),
+        lambda report: report.__setitem__("executed_control", [0.25, 0.25]),
+        lambda report: report.__setitem__("executed_action", report["requested_action"]),
+    ],
+    ids=(
+        "missing_mechanism",
+        "forged_original_condition",
+        "executed_action",
+        "executed_control",
+        "forged_intervention_condition",
+    ),
+)
+def test_load_stage1_recomputes_mechanism_conditions(tmp_path: Path, mutate):
+    root = tmp_path / "stage1"
+    report = _stage1(root)
+    mutate(report)
+    if "original_outcome" in report:
+        report["shield_fingerprint"] = cli._stage1_shield_fingerprint(report)
+    (root / "stage1_results.json").write_text(json.dumps(report), encoding="utf-8")
+    decision = json.loads((root / "decision.json").read_text(encoding="utf-8"))
+    decision["shield_fingerprint"] = report["shield_fingerprint"]
+    (root / "decision.json").write_text(json.dumps(decision), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="mechanism|original|condition|executed|attempt"):
+        cli.load_stage1_prerequisite(root)
+
+
+@pytest.mark.parametrize("value", ["1.0", True, float("nan"), 10**309])
+def test_load_stage1_normalizes_invalid_selected_lambda_to_value_error(
+    tmp_path: Path, value,
+):
+    root = tmp_path / "stage1"
+    report = _stage1(root)
+    report["selected_lambda"] = value
+    if value == value:
+        report["shield_fingerprint"] = cli._stage1_shield_fingerprint(report)
     (root / "stage1_results.json").write_text(json.dumps(report), encoding="utf-8")
 
     with pytest.raises(ValueError, match="lambda|strict JSON"):

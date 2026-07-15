@@ -33,7 +33,13 @@ from experiments.scripts.run_context_ab import (
     build_diagnostic_runs,
     sha256_file,
 )
-from experiments.scripts.run_shield_stage1 import _validate_stage1_candidate_attempts
+from experiments.scripts.run_shield_stage1 import (
+    FINGERPRINT_FIELDS as STAGE1_FINGERPRINT_FIELDS,
+    MECHANISM_FIELDS as STAGE1_MECHANISM_FIELDS,
+    _shield_fingerprint as _shared_stage1_shield_fingerprint,
+    _stage1_lambda,
+    _validate_stage1_mechanism,
+)
 from gl_gym.RL.agri_metarl import AgriMetaRL
 from gl_gym.environments.action_shield import ActionShieldConfig, DEFAULT_LAMBDAS
 from gl_gym.environments.models.utils import FORMAL_CVODES_OPTIONS
@@ -73,11 +79,6 @@ STAGE1_CONDITIONS = (
 )
 STAGE1_OUTPUTS = frozenset(
     {"stage1_results.json", "stage1_states.npz", "decision.json"}
-)
-STAGE1_FINGERPRINT_FIELDS = (
-    "schema_version", "method", "fixed_lambdas", "source_checksums",
-    "formal_solver_options", "env_config_sha256", "rule_config_sha256",
-    "capsule_identity_sha256", "checkpoint_sha256",
 )
 RULE_CONFIG_PATH = ROOT / "configs" / "agents" / "rule_based.yml"
 ENV_CONFIG_PATH = ROOT / "configs" / "envs" / "TomatoEnv.yml"
@@ -148,16 +149,7 @@ def _lower_sha(value: Any, *, name: str) -> str:
 
 
 def _stage1_shield_fingerprint(report: Mapping[str, Any]) -> str:
-    missing = [name for name in STAGE1_FINGERPRINT_FIELDS if name not in report]
-    if missing:
-        raise ValueError(f"Stage-1 shield fingerprint inputs are missing: {missing}")
-    payload = {name: report[name] for name in STAGE1_FINGERPRINT_FIELDS}
-    return hashlib.sha256(
-        json.dumps(
-            payload, sort_keys=True, separators=(",", ":"),
-            ensure_ascii=False, allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    return _shared_stage1_shield_fingerprint(report)
 
 
 def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
@@ -190,20 +182,12 @@ def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
         or any(value is not True for value in conditions.values())
     ):
         raise ValueError("Stage-1 conditions must be the four exact passing conditions")
-    selected = report.get("selected_lambda")
-    if (
-        isinstance(selected, bool)
-        or not isinstance(selected, (int, float))
-        or not np.isfinite(selected)
-        or float(selected) <= 0.0
-        or float(selected) not in DEFAULT_LAMBDAS
-    ):
-        raise ValueError("Stage-1 selected_lambda must be a positive fixed-grid value")
-    if "candidate_attempts" not in report:
-        raise ValueError("Stage-1 results are missing candidate_attempts")
-    _validate_stage1_candidate_attempts(
-        report["candidate_attempts"], selected, require_success=True
+    selected = _stage1_lambda(
+        report.get("selected_lambda"), name="Stage-1 selected_lambda"
     )
+    if selected <= 0.0 or selected not in DEFAULT_LAMBDAS:
+        raise ValueError("Stage-1 selected_lambda must be a positive fixed-grid value")
+    _validate_stage1_mechanism(report)
     decision_conditions = decision.get("conditions")
     if (
         not isinstance(decision_conditions, dict)
@@ -231,6 +215,7 @@ def load_stage1_prerequisite(stage1_root: str | Path) -> dict[str, Any]:
         "checkpoint_sha256", "source_checksums", "git_head", "dirty",
         "formal_solver_options", "env_config_sha256", "rule_config_sha256",
         "fixed_lambdas", "method", "shield_fingerprint",
+        *STAGE1_MECHANISM_FIELDS,
     }
     missing = sorted(required.difference(report))
     if missing:
