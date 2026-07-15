@@ -31,6 +31,7 @@ from gl_gym.experiments.suite_schema import load_suite_manifest
 from gl_gym.experiments.suite_tasks import build_evaluation_tasks
 from gl_gym.experiments.ode_failure import load_failure_capsule
 from experiments.scripts.evaluate_suite import (
+    SHIELD_SCHEMA_VERSION,
     canonical_evaluation_row,
     evaluation_row_identity,
     load_stage2_evidence,
@@ -39,8 +40,8 @@ from experiments.scripts.evaluate_suite import (
 
 
 BASE_ALGORITHM = "agri_metarl"
-SHIELD_ALGORITHM = "agri_metarl__minimal_feasibility_shield_v1"
-SHIELD_METHOD = "minimal_feasibility_shield_v1"
+SHIELD_ALGORITHM = "agri_metarl__conservative_feasibility_shield_v2"
+SHIELD_METHOD = "conservative_feasibility_shield_v2"
 STAGE3 = "stage3_full_suite_action_shield"
 
 
@@ -312,12 +313,13 @@ def _validate_shield_method_provenance(
     ):
         raise ValueError("shield method fingerprint is stale")
     required = {
-        "rule_config_sha256", "env_config_sha256", "fixed_lambdas_json",
+        "schema_version", "rule_config_sha256", "env_config_sha256", "fixed_lambdas_json",
         "formal_solver_options_json", "shield_method_fingerprint_sha256",
     }
     if not required.issubset(frame.columns):
         raise ValueError("shield rows lack method fingerprint components")
     expected = {
+        "schema_version": SHIELD_SCHEMA_VERSION,
         "rule_config_sha256": components["rule_config_sha256"],
         "env_config_sha256": components["env_config_sha256"],
         "fixed_lambdas_json": json.dumps(components["fixed_lambdas"], sort_keys=True, separators=(",", ":")),
@@ -482,7 +484,7 @@ def _validate_intervention_evidence(
         metric = metric_match.iloc[0]
         identity_payload = {
             name: getattr(row, name) for name in (
-                "algorithm", "method", "model_sha256", "vecnormalize_sha256", "checkpoint_steps",
+                "schema_version", "algorithm", "method", "model_sha256", "vecnormalize_sha256", "checkpoint_steps",
                 "source_fingerprint_sha256", "stage2_identity_sha256", "suite_id", "seed", "task_id",
                 "runtime_source_tree_sha256", "source_manifest_sha256", "runs_csv_sha256",
                 "tasks_csv_sha256",
@@ -529,6 +531,13 @@ def _publish(output: Path, paired: pd.DataFrame, summary: pd.DataFrame, manifest
 def audit_stage3_artifacts(root: str | Path) -> dict[str, Any]:
     result_root = Path(root).resolve()
     manifest = _strict_json(result_root / "shield_manifest.json")
+    if (
+        manifest.get("schema_version") != SHIELD_SCHEMA_VERSION
+        or manifest.get("algorithm") != SHIELD_ALGORITHM
+        or manifest.get("method") != SHIELD_METHOD
+        or manifest.get("stage") != STAGE3
+    ):
+        raise ValueError("Stage-3 manifest schema/method/stage identity is invalid")
     if Path(str(manifest.get("result_root", ""))).resolve() != result_root:
         raise ValueError("Stage-3 manifest result_root is invalid")
     for name, field in (
@@ -591,7 +600,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         or stage2.get("source_tasks_sha256") not in (None, expected_tasks_sha)
     ):
         raise ValueError("Stage-2 manifest/tasks source hashes do not match Stage-3 inputs")
-    if shield_manifest.get("schema_version") != "full-suite-shield-evaluation-v1" or shield_manifest.get("method") != SHIELD_METHOD:
+    if (
+        shield_manifest.get("schema_version") != SHIELD_SCHEMA_VERSION
+        or shield_manifest.get("algorithm") != SHIELD_ALGORITHM
+        or shield_manifest.get("method") != SHIELD_METHOD
+    ):
         raise ValueError("shielded evaluation manifest schema/method is invalid")
     from experiments.scripts.evaluate_suite import FORMAL_UNSHIELDED_METHOD
     if (
@@ -656,9 +669,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     input_hashes = {name: _sha(getattr(args, name)) for name in ("manifest", "tasks_csv", "unshielded_eval", "shielded_eval", "interventions", "stage2_decision")}
     from experiments.scripts.run_shielded_context_ab import _runtime_source_tree_sha256
     manifest = {
-        "schema_version": "full-suite-action-shield-stage3-v1", "stage": STAGE3,
+        "schema_version": SHIELD_SCHEMA_VERSION, "stage": STAGE3,
         "suite_id": suite.suite_id, "approved_seeds": sorted(seeds), "task_count": 91,
-        "expected_pair_count": 182, "method": SHIELD_METHOD,
+        "expected_pair_count": 182, "algorithm": SHIELD_ALGORITHM,
+        "method": SHIELD_METHOD,
         "input_sha256": input_hashes,
         "stage2_identity_sha256": stage2["stage2_identity_sha256"],
         "runtime_source_tree_sha256": _runtime_source_tree_sha256(),

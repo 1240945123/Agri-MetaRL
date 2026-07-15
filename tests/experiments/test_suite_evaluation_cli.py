@@ -232,8 +232,22 @@ def _stage2_fixture(cli, root: Path) -> Path:
         })
     unshielded = pd.DataFrame(common)
     summary = aggregate_episode_interventions([record], 1)
-    raw = pd.DataFrame([{**row, "total_steps": 1, "intervention_count": 0} for row in common])
-    interventions = pd.DataFrame([{**{key: row[key] for key in ("seed", "task_id", "inference_mode")}, **summary} for row in common])
+    shield_identity = {
+        "schema_version": SHIELD_SCHEMA_VERSION,
+        "method": "conservative_feasibility_shield_v2",
+    }
+    raw = pd.DataFrame([
+        {**row, **shield_identity, "total_steps": 1, "intervention_count": 0}
+        for row in common
+    ])
+    interventions = pd.DataFrame([
+        {
+            **{key: row[key] for key in ("seed", "task_id", "inference_mode")},
+            **shield_identity,
+            **summary,
+        }
+        for row in common
+    ])
     expected = set(keys)
     paired = build_paired_shield_deltas(raw, unshielded, expected)
     gate = evaluate_shield_gate(raw, unshielded, expected)
@@ -242,7 +256,7 @@ def _stage2_fixture(cli, root: Path) -> Path:
     unshielded_manifest = {"schema_version": "context-ab-v1", "result_root": str(unshielded_root.resolve())}
     (unshielded_root / "diagnostic_manifest.json").write_text(json.dumps(unshielded_manifest), encoding="utf-8")
     manifest = {
-        "schema_version": "shielded-context-ab-stage2-v1", "method": cli.SHIELD_METHOD,
+        "schema_version": SHIELD_SCHEMA_VERSION, "method": cli.SHIELD_METHOD,
         "result_root": str(root.resolve()), "unshielded_result_root": str(unshielded_root.resolve()),
         "unshielded_manifest_sha256": cli._sha(unshielded_root / "diagnostic_manifest.json"),
         "seeds": list(APPROVED_SEEDS), "task_ids": list(DIAGNOSTIC_TASK_IDS),
@@ -259,6 +273,41 @@ def _stage2_fixture(cli, root: Path) -> Path:
     decision_path = root / "decision.json"
     decision_path.write_text(json.dumps(decision), encoding="utf-8")
     return decision_path
+
+
+def test_stage2_loader_rejects_internally_consistent_v1_manifest(tmp_path):
+    cli = _module()
+    decision = _stage2_fixture(cli, tmp_path / "stage2")
+    manifest_path = decision.parent / "shield_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update({
+        "schema_version": "shielded-context-ab-stage2-v1",
+        "method": "minimal_feasibility_shield_v1",
+    })
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    for name in ("eval_raw.csv", "interventions.csv"):
+        path = decision.parent / name
+        frame = pd.read_csv(path)
+        frame["schema_version"] = manifest["schema_version"]
+        frame["method"] = manifest["method"]
+        frame.to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match="schema/method"):
+        cli.load_stage2_evidence(decision)
+
+
+def test_stage2_loader_rejects_v1_rows_under_v2_manifest(tmp_path):
+    cli = _module()
+    decision = _stage2_fixture(cli, tmp_path / "stage2")
+    for name in ("eval_raw.csv", "interventions.csv"):
+        path = decision.parent / name
+        frame = pd.read_csv(path)
+        frame["schema_version"] = "shielded-context-ab-stage2-v1"
+        frame["method"] = "minimal_feasibility_shield_v1"
+        frame.to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match="row schema/method"):
+        cli.load_stage2_evidence(decision)
 
 
 def _formal_unshielded_fixture(cli, tmp_path: Path):

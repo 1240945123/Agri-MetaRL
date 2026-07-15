@@ -52,8 +52,9 @@ from gl_gym.experiments.ode_failure import (
 )
 
 
-SHIELD_METHOD = "minimal_feasibility_shield_v1"
-SHIELD_SUFFIX = "__minimal_feasibility_shield_v1"
+SHIELD_SCHEMA_VERSION = "conservative-feasibility-action-shield-v2"
+SHIELD_METHOD = "conservative_feasibility_shield_v2"
+SHIELD_SUFFIX = "__conservative_feasibility_shield_v2"
 STAGE2_CONDITIONS = (
     "zero_ode_failures",
     "intervention_rate_within_0p5pct",
@@ -391,12 +392,16 @@ def shield_method_fingerprint_components(
     env_config_sha256: str, stage2_identity_sha256: str,
     fixed_lambdas: Any, formal_solver_options: Mapping[str, Any],
 ) -> dict[str, Any]:
+    ordered_lambdas = list(fixed_lambdas)
+    if ordered_lambdas != sorted(ordered_lambdas, reverse=True):
+        raise ValueError("fixed lambdas must use canonical descending order")
     return {
+        "schema_version": SHIELD_SCHEMA_VERSION,
         "method": SHIELD_METHOD,
         "rule_config_sha256": rule_config_sha256,
         "env_config_sha256": env_config_sha256,
         "stage2_identity_sha256": stage2_identity_sha256,
-        "fixed_lambdas": list(fixed_lambdas),
+        "fixed_lambdas": ordered_lambdas,
         "formal_solver_options": dict(formal_solver_options),
         "source_fingerprint_inputs": dict(source_inputs),
     }
@@ -414,7 +419,7 @@ def load_stage2_evidence(decision_path: str | Path) -> dict[str, Any]:
         raise FileNotFoundError("Stage-2 requires all five canonical regular artifacts")
     manifest = _strict_json(paths["shield_manifest.json"])
     decision = _strict_json(paths["decision.json"])
-    if manifest.get("schema_version") != "shielded-context-ab-stage2-v1" or manifest.get("method") != SHIELD_METHOD:
+    if manifest.get("schema_version") != SHIELD_SCHEMA_VERSION or manifest.get("method") != SHIELD_METHOD:
         raise ValueError("Stage-2 manifest schema/method is invalid")
     if Path(str(manifest.get("result_root", ""))).resolve() != root:
         raise ValueError("Stage-2 manifest result_root does not bind the artifact root")
@@ -433,6 +438,13 @@ def load_stage2_evidence(decision_path: str | Path) -> dict[str, Any]:
             raise ValueError(f"Stage-2 {label} keys are invalid")
         if set(frame[key_columns].itertuples(index=False, name=None)) != expected:
             raise ValueError(f"Stage-2 {label} keys do not match its manifest protocol")
+        if (
+            "schema_version" not in frame
+            or "method" not in frame
+            or set(frame["schema_version"]) != {SHIELD_SCHEMA_VERSION}
+            or set(frame["method"]) != {SHIELD_METHOD}
+        ):
+            raise ValueError(f"Stage-2 {label} row schema/method is invalid")
     trace_columns = (
         "executed_action_trace_path", "requested_action_trace_path", "intervention_records_path"
     )
@@ -697,6 +709,7 @@ def _read_shield_progress(work: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         return pd.DataFrame(), pd.DataFrame()
     required = {
         "algorithm", "method", "seed", "task_id", "model_sha256", "vecnormalize_sha256",
+        "schema_version",
         "checkpoint_steps", "source_fingerprint_sha256", "stage2_identity_sha256",
         "executed_action_trace_path", "requested_action_trace_path", "intervention_records_path",
         "executed_action_trace_sha256", "requested_action_trace_sha256",
@@ -791,7 +804,7 @@ def _publish_shield_final(
         published_raw.to_csv(stage / "eval_raw.csv", index=False)
         published_interventions.to_csv(stage / "interventions.csv", index=False)
         manifest = {
-            **dict(manifest_base), "schema_version": "full-suite-shield-evaluation-v1",
+            **dict(manifest_base), "schema_version": SHIELD_SCHEMA_VERSION,
             "result_root": str(root), "eval_raw_sha256": _sha(stage / "eval_raw.csv"),
             "interventions_sha256": _sha(stage / "interventions.csv"),
             "evidence_sha256": evidence_hashes,
@@ -824,7 +837,8 @@ def prepare_shield_resume(
             key = (str(row.algorithm), int(row.seed), str(row.task_id))
             try:
                 if (
-                    row.method != SHIELD_METHOD or row.algorithm != "agri_metarl" + SHIELD_SUFFIX
+                    row.schema_version != SHIELD_SCHEMA_VERSION
+                    or row.method != SHIELD_METHOD or row.algorithm != "agri_metarl" + SHIELD_SUFFIX
                     or row.completed not in (True, 1) or row.stage2_manifest_sha256 != stage2_manifest_sha256
                 ):
                     raise ValueError("stale evidence provenance")
@@ -935,6 +949,7 @@ def run_shield_evaluation(
         ):
             raise ValueError("shield checkpoint provenance does not match authentic Stage-2")
         expected_common = {
+            "schema_version": SHIELD_SCHEMA_VERSION,
             "algorithm": "agri_metarl" + SHIELD_SUFFIX, "method": SHIELD_METHOD,
             "model_sha256": model_sha, "vecnormalize_sha256": vec_sha,
             "checkpoint_steps": int(checkpoint_steps), "source_fingerprint_sha256": source_fingerprint,
@@ -1034,7 +1049,8 @@ def run_shield_evaluation(
     raw = pd.DataFrame([completed[key][0] for key in sorted(completed)])
     interventions = pd.DataFrame([completed[key][1] for key in sorted(completed)])
     manifest_base = {
-        "suite_id": suite.suite_id, "method": SHIELD_METHOD, "formal_complete": True,
+        "suite_id": suite.suite_id, "algorithm": "agri_metarl" + SHIELD_SUFFIX,
+        "method": SHIELD_METHOD, "formal_complete": True,
         "approved_seeds": sorted(approved_seeds), "task_count": 91, "episode_count": len(raw),
         "checkpoints": [published_checkpoints[seed] for seed in sorted(published_checkpoints)],
         "stage2_identity_sha256": stage2_identity,

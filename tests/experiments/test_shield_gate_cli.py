@@ -222,7 +222,8 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
             "intervention_records_sha256": evaluator._sha(records_path),
         }
         common = {
-            **row, "algorithm": cli.SHIELD_ALGORITHM, "method": cli.SHIELD_METHOD,
+            **row, "schema_version": SHIELD_SCHEMA_VERSION,
+            "algorithm": cli.SHIELD_ALGORITHM, "method": cli.SHIELD_METHOD,
             "model_sha256": checkpoint_map[row["seed"]]["model_sha256"],
             "vecnormalize_sha256": checkpoint_map[row["seed"]]["vecnormalize_sha256"],
             "checkpoint_steps": 10, "source_fingerprint_sha256": source_fingerprint,
@@ -246,7 +247,7 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
             "intervention_records_path": str(records_path), **hashes,
         }
         identity_payload = {name: common[name] for name in (
-            "algorithm", "method", "model_sha256", "vecnormalize_sha256", "checkpoint_steps",
+            "schema_version", "algorithm", "method", "model_sha256", "vecnormalize_sha256", "checkpoint_steps",
             "source_fingerprint_sha256", "stage2_identity_sha256", "suite_id", "seed", "task_id",
             "runtime_source_tree_sha256",
             "source_manifest_sha256", "runs_csv_sha256", "tasks_csv_sha256",
@@ -265,7 +266,8 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
     evaluator._publish_shield_final(
         shield_root, work, pd.DataFrame(shield_rows), pd.DataFrame(intervention_rows),
         manifest_base={
-            "suite_id": suite.suite_id, "method": cli.SHIELD_METHOD, "formal_complete": True,
+            "suite_id": suite.suite_id, "algorithm": cli.SHIELD_ALGORITHM,
+            "method": cli.SHIELD_METHOD, "formal_complete": True,
             "checkpoints": [{**item, "checkpoint_steps": 10} for item in stage2_manifest["checkpoints"]],
             "stage2_identity_sha256": stage2_identity, "source_fingerprint_sha256": source_fingerprint,
             "runtime_source_tree_sha256": stage2_source._runtime_source_tree_sha256(),
@@ -301,6 +303,10 @@ def test_full_91_by_2_gate_ready_and_writes_only_stage3_artifacts(tmp_path, monk
         "paired_deltas.csv", "summary.csv", "shield_manifest.json", "decision.json"
     }
     assert len(pd.read_csv(output / "paired_deltas.csv")) == 182
+    manifest = cli.audit_stage3_artifacts(output)
+    assert manifest["schema_version"] == SHIELD_SCHEMA_VERSION
+    assert manifest["method"] == "conservative_feasibility_shield_v2"
+    assert manifest["algorithm"] == "agri_metarl__conservative_feasibility_shield_v2"
 
 
 def test_gate_accepts_a_real_capsule_backed_integration_failure(tmp_path, monkeypatch):
@@ -392,7 +398,13 @@ def test_stage3_artifact_audit_rejects_each_tamper(tmp_path, artifact):
     cli = _module()
     output = tmp_path / "stage3"
     frame = pd.DataFrame([{"seed": 42, "task_id": "t", "value": 1.0}])
-    cli._publish(output, frame, frame, {"input_sha256": {"source": "a" * 64}}, {"outcome": "pass"})
+    cli._publish(output, frame, frame, {
+        "schema_version": SHIELD_SCHEMA_VERSION,
+        "algorithm": cli.SHIELD_ALGORITHM,
+        "method": cli.SHIELD_METHOD,
+        "stage": cli.STAGE3,
+        "input_sha256": {"source": "a" * 64},
+    }, {"outcome": "pass"})
     manifest = cli.audit_stage3_artifacts(output)
     assert manifest["result_root"] == str(output.resolve())
     with (output / artifact).open("ab") as handle:
@@ -405,7 +417,13 @@ def test_stage3_artifact_audit_rejects_manifest_identity_tamper(tmp_path):
     cli = _module()
     output = tmp_path / "stage3"
     frame = pd.DataFrame([{"seed": 42, "task_id": "t", "value": 1.0}])
-    cli._publish(output, frame, frame, {"input_sha256": {"source": "a" * 64}}, {"outcome": "pass"})
+    cli._publish(output, frame, frame, {
+        "schema_version": SHIELD_SCHEMA_VERSION,
+        "algorithm": cli.SHIELD_ALGORITHM,
+        "method": cli.SHIELD_METHOD,
+        "stage": cli.STAGE3,
+        "input_sha256": {"source": "a" * 64},
+    }, {"outcome": "pass"})
     manifest_path = output / "shield_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["input_sha256"]["source"] = "b" * 64
@@ -442,6 +460,21 @@ def test_gate_rejects_recomputed_shield_method_config_tamper(tmp_path, monkeypat
             manifest["shield_method_fingerprint_components"]
         )
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="method fingerprint"):
+        _gate_case(cli, tmp_path, monkeypatch, tamper=tamper)
+
+
+def test_gate_rejects_recomputed_fixed_lambda_order_tamper(tmp_path, monkeypatch):
+    cli = _module()
+
+    def tamper(paths):
+        manifest_path = paths["shielded_eval"].parent / "evaluation_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        components = manifest["shield_method_fingerprint_components"]
+        components["fixed_lambdas"] = list(reversed(components["fixed_lambdas"]))
+        manifest["shield_method_fingerprint_sha256"] = evaluator._canonical_hash(components)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
     with pytest.raises(ValueError, match="method fingerprint"):
         _gate_case(cli, tmp_path, monkeypatch, tamper=tamper)
 
