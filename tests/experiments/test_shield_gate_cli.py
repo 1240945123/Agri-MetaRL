@@ -13,7 +13,10 @@ from gl_gym.experiments.shield_evaluation import (
     SCHEMA_VERSION as SHIELD_SCHEMA_VERSION,
     aggregate_episode_interventions,
 )
-from tests.experiments.test_suite_evaluation_cli import _stage2_fixture
+from tests.experiments.test_suite_evaluation_cli import (
+    _refresh_stage2_fingerprint,
+    _stage2_fixture,
+)
 from experiments.scripts import evaluate_suite as evaluator
 from experiments.scripts import run_shielded_context_ab as stage2_source
 
@@ -94,10 +97,14 @@ def _gate_case(cli, tmp_path: Path, monkeypatch, *, intervention_count=0, shield
         vec_paths[seed] = tmp_path / f"vec-{seed}.pkl"; vec_paths[seed].write_bytes(f"vec{seed}".encode())
     stage2_manifest["checkpoints"] = [
         {"seed": seed, "model_sha256": evaluator._sha(model_paths[seed]),
+         "model_path": str(model_paths[seed].resolve()),
+         "vecnormalize_path": str(vec_paths[seed].resolve()),
          "vecnormalize_sha256": evaluator._sha(vec_paths[seed]), "checkpoint_steps": 10}
         for seed in (42, 123)
     ]
     stage2_manifest_path.write_text(json.dumps(stage2_manifest), encoding="utf-8")
+    _refresh_stage2_fingerprint(evaluator, stage2_decision)
+    stage2_manifest = json.loads(stage2_manifest_path.read_text(encoding="utf-8"))
     stage2_identity = evaluator.load_stage2_evidence(stage2_decision)["stage2_identity_sha256"]
     seeds = (42, 123)
     checkpoint_map = {int(item["seed"]): item for item in stage2_manifest["checkpoints"]}

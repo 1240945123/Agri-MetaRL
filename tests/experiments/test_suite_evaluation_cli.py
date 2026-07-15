@@ -253,7 +253,55 @@ def _stage2_fixture(cli, root: Path) -> Path:
     expected = set(keys)
     paired = build_paired_shield_deltas(raw, unshielded, expected)
     gate = evaluate_shield_gate(raw, unshielded, expected)
-    shield_fingerprint = producer._fingerprint({"fixture": "producer-shaped-v2"})
+    checkpoint_records = [
+        {
+            "seed": seed,
+            "model_path": str((root.parent / f"producer-model-{seed}.zip").resolve()),
+            "vecnormalize_path": str((root.parent / f"producer-vec-{seed}.pkl").resolve()),
+            "model_sha256": model_sha,
+            "vecnormalize_sha256": vec_sha,
+            "checkpoint_steps": 10,
+        }
+        for seed, model_sha, vec_sha in (
+            (42, "a" * 64, "b" * 64),
+            (123, "c" * 64, "d" * 64),
+        )
+    ]
+    fingerprint_payload = {
+        "schema_version": SHIELD_SCHEMA_VERSION,
+        "method": producer.METHOD,
+        "checkpoints": [
+            {
+                name: str(item[name])
+                for name in (
+                    "seed", "model_path", "vecnormalize_path",
+                    "model_sha256", "vecnormalize_sha256",
+                )
+            }
+            for item in checkpoint_records
+        ],
+        "git_commit": "fixture-commit",
+        "dirty": False,
+        "source_manifest_sha256": "1" * 64,
+        "source_tasks_sha256": "2" * 64,
+        **{name: "3" * 64 for name, _ in producer.RELEVANT_SOURCE_FIELDS},
+        "evaluation_provenance_sha256": "4" * 64,
+        "rule_config_sha256": "5" * 64,
+        "env_config_sha256": "6" * 64,
+        **{name: "7" * 64 for name, _ in producer.BEHAVIOR_SOURCE_FIELDS},
+        "runtime_source_tree_sha256": "8" * 64,
+        "formal_solver_options": dict(producer.FORMAL_CVODES_OPTIONS),
+        "fixed_lambdas": list(producer.DEFAULT_LAMBDAS),
+        "stage1_results_sha256": "9" * 64,
+        "stage1_selected_lambda": producer.DEFAULT_LAMBDAS[0],
+        "stage1_states_sha256": "a" * 64,
+        "stage1_decision_sha256": "b" * 64,
+        "task_ids": list(DIAGNOSTIC_TASK_IDS),
+        "inference_modes": list(MODES),
+        "seeds": list(APPROVED_SEEDS),
+        "device": "cpu",
+    }
+    shield_fingerprint = producer._fingerprint(fingerprint_payload)
     decision = producer._stage2_decision(
         gate, shield_fingerprint=shield_fingerprint
     )
@@ -261,17 +309,11 @@ def _stage2_fixture(cli, root: Path) -> Path:
     unshielded_manifest = {"schema_version": "context-ab-v1", "result_root": str(unshielded_root.resolve())}
     (unshielded_root / "diagnostic_manifest.json").write_text(json.dumps(unshielded_manifest), encoding="utf-8")
     manifest = {
-        "schema_version": SHIELD_SCHEMA_VERSION, "method": cli.SHIELD_METHOD,
-        "fixed_lambdas": list(producer.DEFAULT_LAMBDAS),
+        **fingerprint_payload,
+        "checkpoints": checkpoint_records,
         "shield_fingerprint": shield_fingerprint,
         "result_root": str(root.resolve()), "unshielded_result_root": str(unshielded_root.resolve()),
         "unshielded_manifest_sha256": cli._sha(unshielded_root / "diagnostic_manifest.json"),
-        "seeds": list(APPROVED_SEEDS), "task_ids": list(DIAGNOSTIC_TASK_IDS),
-        "inference_modes": list(MODES),
-        "checkpoints": [
-            {"seed": 42, "model_sha256": "a" * 64, "vecnormalize_sha256": "b" * 64, "checkpoint_steps": 10},
-            {"seed": 123, "model_sha256": "c" * 64, "vecnormalize_sha256": "d" * 64, "checkpoint_steps": 10},
-        ],
     }
     raw.to_csv(root / "eval_raw.csv", index=False)
     paired.to_csv(root / "paired_deltas.csv", index=False)
@@ -280,6 +322,21 @@ def _stage2_fixture(cli, root: Path) -> Path:
     decision_path = root / "decision.json"
     decision_path.write_text(json.dumps(decision), encoding="utf-8")
     return decision_path
+
+
+def _refresh_stage2_fingerprint(cli, decision_path: Path) -> None:
+    from experiments.scripts import run_shielded_context_ab as producer
+
+    manifest_path = decision_path.parent / "shield_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    fingerprint = producer._fingerprint(
+        cli._stage2_fingerprint_payload(manifest, producer)
+    )
+    manifest["shield_fingerprint"] = fingerprint
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    decision["shield_fingerprint"] = fingerprint
+    decision_path.write_text(json.dumps(decision), encoding="utf-8")
 
 
 def test_stage2_loader_rejects_internally_consistent_v1_manifest(tmp_path):
@@ -340,6 +397,33 @@ def test_stage2_loader_accepts_authentic_producer_shaped_v2_artifacts(tmp_path):
     assert set(evidence["interventions"]["method"]) == {producer.METHOD}
 
 
+def test_stage2_loader_rejects_self_declared_shield_fingerprint_tamper(tmp_path):
+    cli = _module()
+    decision_path = _stage2_fixture(cli, tmp_path / "stage2")
+    manifest_path = decision_path.parent / "shield_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    manifest["shield_fingerprint"] = "b" * 64
+    decision["shield_fingerprint"] = "b" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        cli.load_stage2_evidence(decision_path)
+
+
+def test_stage2_loader_rejects_optional_v1_intervention_schema(tmp_path):
+    cli = _module()
+    decision_path = _stage2_fixture(cli, tmp_path / "stage2")
+    interventions_path = decision_path.parent / "interventions.csv"
+    interventions = pd.read_csv(interventions_path)
+    interventions["schema_version"] = "shielded-context-ab-stage2-v1"
+    interventions.to_csv(interventions_path, index=False)
+
+    with pytest.raises(ValueError, match="schema/method"):
+        cli.load_stage2_evidence(decision_path)
+
+
 def _formal_unshielded_fixture(cli, tmp_path: Path):
     from experiments.scripts import run_shielded_context_ab as stage2_source
 
@@ -387,6 +471,8 @@ def _formal_unshielded_fixture(cli, tmp_path: Path):
         "checkpoints": [
             {
                 "seed": seed,
+                "model_path": str(models[seed].resolve()),
+                "vecnormalize_path": str(vecs[seed].resolve()),
                 "model_sha256": cli._sha(models[seed]),
                 "vecnormalize_sha256": cli._sha(vecs[seed]),
                 "checkpoint_steps": 10,
@@ -396,6 +482,7 @@ def _formal_unshielded_fixture(cli, tmp_path: Path):
         **stage2_source._behavior_source_hashes(),
     })
     stage2_manifest_path.write_text(json.dumps(stage2_manifest), encoding="utf-8")
+    _refresh_stage2_fingerprint(cli, decision)
     root = tmp_path / "formal-unshielded"
     args = SimpleNamespace(
         manifest=str(manifest_path),
@@ -694,11 +781,14 @@ def test_real_shield_smoke_runs_only_in_work_with_provenance(tmp_path):
         "fixed_lambdas": list(stage2_source.DEFAULT_LAMBDAS),
         "formal_solver_options": dict(stage2_source.FORMAL_CVODES_OPTIONS),
         "checkpoints": [{"seed": seed, "model_sha256": cli._sha(model_paths[seed]),
+                         "model_path": str(model_paths[seed].resolve()),
+                         "vecnormalize_path": str(vec_paths[seed].resolve()),
                          "vecnormalize_sha256": cli._sha(vec_paths[seed]),
                          "checkpoint_steps": 77} for seed in (42, 123)],
         **stage2_source._behavior_source_hashes(),
     })
     stage2_manifest_path.write_text(json.dumps(stage2_manifest), encoding="utf-8")
+    _refresh_stage2_fingerprint(cli, decision_path)
     result_root = tmp_path / "shield-final"
     args = SimpleNamespace(
         manifest=str(manifest_path), runs_csv=str(runs_path), tasks_csv=str(tasks_path),

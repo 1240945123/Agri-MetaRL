@@ -407,6 +407,54 @@ def shield_method_fingerprint_components(
     }
 
 
+def _stage2_fingerprint_payload(
+    manifest: Mapping[str, Any], stage2_source: Any
+) -> dict[str, Any]:
+    """Rebuild the exact payload hashed by the authentic Stage-2 producer."""
+    checkpoint_fields = (
+        "seed", "model_path", "vecnormalize_path", "model_sha256", "vecnormalize_sha256"
+    )
+    checkpoints = manifest.get("checkpoints")
+    if not isinstance(checkpoints, list):
+        raise ValueError("Stage-2 fingerprint checkpoints are missing")
+    try:
+        fingerprint_checkpoints = [
+            {name: str(item[name]) for name in checkpoint_fields}
+            for item in checkpoints
+        ]
+        evaluation_fields = (
+            "git_commit", "dirty", "source_manifest_sha256", "source_tasks_sha256",
+            *(name for name, _ in stage2_source.RELEVANT_SOURCE_FIELDS),
+            "evaluation_provenance_sha256",
+        )
+        behavior_fields = tuple(
+            name for name, _ in stage2_source.BEHAVIOR_SOURCE_FIELDS
+        )
+        payload = {
+            "schema_version": manifest["schema_version"],
+            "method": manifest["method"],
+            "checkpoints": fingerprint_checkpoints,
+            **{name: manifest[name] for name in evaluation_fields},
+            "rule_config_sha256": manifest["rule_config_sha256"],
+            "env_config_sha256": manifest["env_config_sha256"],
+            **{name: manifest[name] for name in behavior_fields},
+            "runtime_source_tree_sha256": manifest["runtime_source_tree_sha256"],
+            "formal_solver_options": manifest["formal_solver_options"],
+            "fixed_lambdas": manifest["fixed_lambdas"],
+            "stage1_results_sha256": manifest["stage1_results_sha256"],
+            "stage1_selected_lambda": manifest["stage1_selected_lambda"],
+            "stage1_states_sha256": manifest["stage1_states_sha256"],
+            "stage1_decision_sha256": manifest["stage1_decision_sha256"],
+            "task_ids": manifest["task_ids"],
+            "inference_modes": manifest["inference_modes"],
+            "seeds": manifest["seeds"],
+            "device": manifest["device"],
+        }
+    except (KeyError, TypeError) as error:
+        raise ValueError("Stage-2 fingerprint payload is incomplete") from error
+    return payload
+
+
 def load_stage2_evidence(decision_path: str | Path) -> dict[str, Any]:
     """Authenticate the complete Stage-2 artifact set and recompute its gate."""
     decision_file = Path(decision_path).resolve()
@@ -438,6 +486,11 @@ def load_stage2_evidence(decision_path: str | Path) -> dict[str, Any]:
     seeds, task_ids, modes = manifest.get("seeds"), manifest.get("task_ids"), manifest.get("inference_modes")
     if seeds != list(APPROVED_SEEDS) or task_ids != list(DIAGNOSTIC_TASK_IDS) or modes != list(MODES):
         raise ValueError("Stage-2 manifest is not the exact approved diagnostic protocol")
+    authentic_fingerprint = stage2_source._fingerprint(
+        _stage2_fingerprint_payload(manifest, stage2_source)
+    )
+    if shield_fingerprint != authentic_fingerprint:
+        raise ValueError("Stage-2 manifest shield fingerprint is not authentic")
     expected = {(seed, task, mode) for seed in seeds for task in task_ids for mode in modes}
     raw = pd.read_csv(paths["eval_raw.csv"])
     stored_paired = pd.read_csv(paths["paired_deltas.csv"])
@@ -449,6 +502,11 @@ def load_stage2_evidence(decision_path: str | Path) -> dict[str, Any]:
         if set(frame[key_columns].itertuples(index=False, name=None)) != expected:
             raise ValueError(f"Stage-2 {label} keys do not match its manifest protocol")
         if "method" not in frame or set(frame["method"]) != {SHIELD_METHOD}:
+            raise ValueError(f"Stage-2 {label} row schema/method is invalid")
+        if (
+            "schema_version" in frame
+            and set(frame["schema_version"]) != {SHIELD_SCHEMA_VERSION}
+        ):
             raise ValueError(f"Stage-2 {label} row schema/method is invalid")
     if "schema_version" not in raw or set(raw["schema_version"]) != {SHIELD_SCHEMA_VERSION}:
         raise ValueError("Stage-2 shielded row schema/method is invalid")
