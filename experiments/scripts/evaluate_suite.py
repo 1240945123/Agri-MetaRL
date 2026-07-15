@@ -419,8 +419,18 @@ def load_stage2_evidence(decision_path: str | Path) -> dict[str, Any]:
         raise FileNotFoundError("Stage-2 requires all five canonical regular artifacts")
     manifest = _strict_json(paths["shield_manifest.json"])
     decision = _strict_json(paths["decision.json"])
+    from experiments.scripts import run_shielded_context_ab as stage2_source
     if manifest.get("schema_version") != SHIELD_SCHEMA_VERSION or manifest.get("method") != SHIELD_METHOD:
         raise ValueError("Stage-2 manifest schema/method is invalid")
+    if manifest.get("fixed_lambdas") != list(stage2_source.DEFAULT_LAMBDAS):
+        raise ValueError("Stage-2 manifest fixed lambda order is invalid")
+    shield_fingerprint = manifest.get("shield_fingerprint")
+    if (
+        not isinstance(shield_fingerprint, str)
+        or len(shield_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in shield_fingerprint)
+    ):
+        raise ValueError("Stage-2 manifest shield fingerprint is invalid")
     if Path(str(manifest.get("result_root", ""))).resolve() != root:
         raise ValueError("Stage-2 manifest result_root does not bind the artifact root")
     from experiments.scripts.run_context_ab import APPROVED_SEEDS
@@ -438,13 +448,10 @@ def load_stage2_evidence(decision_path: str | Path) -> dict[str, Any]:
             raise ValueError(f"Stage-2 {label} keys are invalid")
         if set(frame[key_columns].itertuples(index=False, name=None)) != expected:
             raise ValueError(f"Stage-2 {label} keys do not match its manifest protocol")
-        if (
-            "schema_version" not in frame
-            or "method" not in frame
-            or set(frame["schema_version"]) != {SHIELD_SCHEMA_VERSION}
-            or set(frame["method"]) != {SHIELD_METHOD}
-        ):
+        if "method" not in frame or set(frame["method"]) != {SHIELD_METHOD}:
             raise ValueError(f"Stage-2 {label} row schema/method is invalid")
+    if "schema_version" not in raw or set(raw["schema_version"]) != {SHIELD_SCHEMA_VERSION}:
+        raise ValueError("Stage-2 shielded row schema/method is invalid")
     trace_columns = (
         "executed_action_trace_path", "requested_action_trace_path", "intervention_records_path"
     )
@@ -464,11 +471,9 @@ def load_stage2_evidence(decision_path: str | Path) -> dict[str, Any]:
     if set(unshielded[key_columns].itertuples(index=False, name=None)) != expected:
         raise ValueError("Stage-2 unshielded keys do not match the shielded protocol")
     recomputed_gate = evaluate_shield_gate(raw, unshielded, expected)
-    recomputed_decision = {
-        **recomputed_gate,
-        "stage": "stage2_shielded_context_ab",
-        "outcome": "continue_to_full_suite" if recomputed_gate["outcome"] == "pass" else "redesign_action_shield",
-    }
+    recomputed_decision = stage2_source._stage2_decision(
+        recomputed_gate, shield_fingerprint=shield_fingerprint
+    )
     if decision != recomputed_decision:
         raise ValueError("Stage-2 decision is not authentic to the recomputed gate evidence")
     recomputed_paired = build_paired_shield_deltas(raw, unshielded, expected)
@@ -546,8 +551,19 @@ def _validate_shield_prerequisite(
         raise FileNotFoundError("Stage-2 decision must be a regular file")
     stage2_evidence = load_stage2_evidence(decision_path)
     decision = stage2_evidence["decision"]
-    if set(decision) != {"outcome", "stage", "conditions", "evidence", "reasons"}:
+    manifest = stage2_evidence["manifest"]
+    if set(decision) != {
+        "schema_version", "method", "fixed_lambdas", "shield_fingerprint",
+        "outcome", "stage", "conditions", "evidence", "reasons",
+    }:
         raise ValueError("Stage-2 decision has invalid exact schema")
+    if (
+        decision["schema_version"] != SHIELD_SCHEMA_VERSION
+        or decision["method"] != SHIELD_METHOD
+        or decision["fixed_lambdas"] != manifest["fixed_lambdas"]
+        or decision["shield_fingerprint"] != manifest["shield_fingerprint"]
+    ):
+        raise ValueError("Stage-2 decision v2 identity is inconsistent")
     if decision["stage"] != "stage2_shielded_context_ab" or decision["outcome"] != "continue_to_full_suite":
         raise ValueError("Stage-2 did not approve continuation to the full suite")
     conditions = decision["conditions"]
@@ -559,7 +575,6 @@ def _validate_shield_prerequisite(
     manifest_path = stage2_root / "shield_manifest.json"
     if not manifest_path.is_file() or manifest_path.is_symlink():
         raise FileNotFoundError("Stage-2 shield_manifest.json is required")
-    manifest = stage2_evidence["manifest"]
     if manifest.get("method") != SHIELD_METHOD:
         raise ValueError("Stage-2 shield method is stale")
     # Reuse the Stage-2 implementation's canonical, source-sensitive values.

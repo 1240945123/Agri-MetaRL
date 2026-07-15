@@ -197,6 +197,8 @@ def test_shield_resume_rejects_smoke_row_for_formal_run(tmp_path):
 
 
 def _stage2_fixture(cli, root: Path) -> Path:
+    from experiments.scripts import run_shielded_context_ab as producer
+
     root.mkdir()
     unshielded_root = root.parent / f"{root.name}-unshielded"
     unshielded_root.mkdir()
@@ -243,7 +245,7 @@ def _stage2_fixture(cli, root: Path) -> Path:
     interventions = pd.DataFrame([
         {
             **{key: row[key] for key in ("seed", "task_id", "inference_mode")},
-            **shield_identity,
+            "method": shield_identity["method"],
             **summary,
         }
         for row in common
@@ -251,12 +253,17 @@ def _stage2_fixture(cli, root: Path) -> Path:
     expected = set(keys)
     paired = build_paired_shield_deltas(raw, unshielded, expected)
     gate = evaluate_shield_gate(raw, unshielded, expected)
-    decision = {**gate, "stage": "stage2_shielded_context_ab", "outcome": "continue_to_full_suite"}
+    shield_fingerprint = producer._fingerprint({"fixture": "producer-shaped-v2"})
+    decision = producer._stage2_decision(
+        gate, shield_fingerprint=shield_fingerprint
+    )
     unshielded.to_csv(unshielded_root / "eval_raw.csv", index=False)
     unshielded_manifest = {"schema_version": "context-ab-v1", "result_root": str(unshielded_root.resolve())}
     (unshielded_root / "diagnostic_manifest.json").write_text(json.dumps(unshielded_manifest), encoding="utf-8")
     manifest = {
         "schema_version": SHIELD_SCHEMA_VERSION, "method": cli.SHIELD_METHOD,
+        "fixed_lambdas": list(producer.DEFAULT_LAMBDAS),
+        "shield_fingerprint": shield_fingerprint,
         "result_root": str(root.resolve()), "unshielded_result_root": str(unshielded_root.resolve()),
         "unshielded_manifest_sha256": cli._sha(unshielded_root / "diagnostic_manifest.json"),
         "seeds": list(APPROVED_SEEDS), "task_ids": list(DIAGNOSTIC_TASK_IDS),
@@ -299,15 +306,38 @@ def test_stage2_loader_rejects_internally_consistent_v1_manifest(tmp_path):
 def test_stage2_loader_rejects_v1_rows_under_v2_manifest(tmp_path):
     cli = _module()
     decision = _stage2_fixture(cli, tmp_path / "stage2")
-    for name in ("eval_raw.csv", "interventions.csv"):
-        path = decision.parent / name
-        frame = pd.read_csv(path)
-        frame["schema_version"] = "shielded-context-ab-stage2-v1"
-        frame["method"] = "minimal_feasibility_shield_v1"
-        frame.to_csv(path, index=False)
+    raw_path = decision.parent / "eval_raw.csv"
+    raw = pd.read_csv(raw_path)
+    raw["schema_version"] = "shielded-context-ab-stage2-v1"
+    raw["method"] = "minimal_feasibility_shield_v1"
+    raw.to_csv(raw_path, index=False)
+    interventions_path = decision.parent / "interventions.csv"
+    interventions = pd.read_csv(interventions_path)
+    interventions["method"] = "minimal_feasibility_shield_v1"
+    interventions.to_csv(interventions_path, index=False)
 
     with pytest.raises(ValueError, match="row schema/method"):
         cli.load_stage2_evidence(decision)
+
+
+def test_stage2_loader_accepts_authentic_producer_shaped_v2_artifacts(tmp_path):
+    cli = _module()
+    from experiments.scripts import run_shielded_context_ab as producer
+
+    decision_path = _stage2_fixture(cli, tmp_path / "stage2")
+    evidence = cli.load_stage2_evidence(decision_path)
+    expected = producer._stage2_decision(
+        evaluate_shield_gate(
+            evidence["raw"],
+            evidence["unshielded"],
+            set(evidence["raw"][["seed", "task_id", "inference_mode"]].itertuples(index=False, name=None)),
+        ),
+        shield_fingerprint=evidence["manifest"]["shield_fingerprint"],
+    )
+
+    assert evidence["decision"] == expected
+    assert "schema_version" not in evidence["interventions"].columns
+    assert set(evidence["interventions"]["method"]) == {producer.METHOD}
 
 
 def _formal_unshielded_fixture(cli, tmp_path: Path):

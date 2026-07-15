@@ -132,7 +132,14 @@ def _prerequisites(args: argparse.Namespace) -> tuple[Any, pd.DataFrame, dict[st
         "paired_return_loss_within_2pct", "paired_violation_burden_within_5pct",
     }
     if (
-        set(decision) != {"outcome", "stage", "conditions", "evidence", "reasons"}
+        set(decision) != {
+            "schema_version", "method", "fixed_lambdas", "shield_fingerprint",
+            "outcome", "stage", "conditions", "evidence", "reasons",
+        }
+        or decision["schema_version"] != SHIELD_SCHEMA_VERSION
+        or decision["method"] != SHIELD_METHOD
+        or decision["fixed_lambdas"] != stage2.get("fixed_lambdas")
+        or decision["shield_fingerprint"] != stage2.get("shield_fingerprint")
         or decision["outcome"] != "continue_to_full_suite"
         or decision["stage"] != "stage2_shielded_context_ab"
         or set(decision["conditions"]) != expected_conditions
