@@ -73,15 +73,52 @@ def test_canonical_evaluation_row_identity_survives_csv_roundtrip(tmp_path, comp
         "temp_violation": 2.0 if completed else None,
         "co2_violation": 3.0 if completed else None,
         "rh_violation": 4.0 if completed else None,
+        "twb_percent": float("nan"),
         "future_schema_column": "preserved",
     }
     normalized = cli.canonical_evaluation_row(row)
+    assert normalized["twb_percent"] is None
     normalized["episode_evidence_identity_sha256"] = cli.evaluation_row_identity(normalized)
     path = tmp_path / "row.csv"
     pd.DataFrame([normalized]).to_csv(path, index=False)
     roundtrip = cli.canonical_evaluation_row(pd.read_csv(path).iloc[0].to_dict())
     assert roundtrip["future_schema_column"] == "preserved"
+    assert roundtrip["twb_percent"] is None
     assert roundtrip["episode_evidence_identity_sha256"] == cli.evaluation_row_identity(roundtrip)
+
+
+@pytest.mark.parametrize("value", [0, 12.5, np.float32(37.25)])
+def test_canonical_evaluation_row_accepts_finite_optional_twb(value):
+    cli = _module()
+    normalized = cli.canonical_evaluation_row({"completed": True, "twb_percent": value})
+    assert normalized["twb_percent"] == float(value)
+    assert isinstance(normalized["twb_percent"], float)
+
+
+@pytest.mark.parametrize("value", [True, "12.5"])
+def test_canonical_evaluation_row_rejects_non_numeric_optional_twb(value):
+    cli = _module()
+    with pytest.raises(TypeError, match="twb_percent.*numeric"):
+        cli.canonical_evaluation_row({"completed": True, "twb_percent": value})
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf")])
+def test_canonical_evaluation_row_rejects_infinite_optional_twb(value):
+    cli = _module()
+    with pytest.raises(ValueError, match="twb_percent.*finite"):
+        cli.canonical_evaluation_row({"completed": True, "twb_percent": value})
+
+
+def test_canonical_evaluation_row_still_rejects_missing_required_completed_metric():
+    cli = _module()
+    with pytest.raises(ValueError, match="completed evaluation row metrics cannot be null"):
+        cli.canonical_evaluation_row({"completed": True, "episode_return": float("nan")})
+
+
+def test_canonical_evaluation_row_allows_finite_optional_twb_on_failed_row():
+    cli = _module()
+    normalized = cli.canonical_evaluation_row({"completed": False, "twb_percent": 7})
+    assert normalized["twb_percent"] == 7.0
 
 
 def test_shield_resume_rejects_smoke_row_for_formal_run(tmp_path):

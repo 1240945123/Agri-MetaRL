@@ -309,6 +309,7 @@ _ROW_FLOAT_FIELDS = frozenset({
 _ROW_NULLABLE_METRICS = frozenset({
     "episode_return", "temp_violation", "co2_violation", "rh_violation",
 })
+_ROW_OPTIONAL_NULLABLE_FLOAT_METRICS = frozenset({"twb_percent"})
 _ROW_EMPTY_TEXT_FIELDS = frozenset({
     "failure_evidence_path", "failure_evidence_identity_sha256",
 })
@@ -338,6 +339,18 @@ def canonical_evaluation_row(row: Mapping[str, Any]) -> dict[str, Any]:
                 result[name] = int(value)
         elif name in _ROW_NULLABLE_METRICS and missing:
             result[name] = None
+        elif name in _ROW_OPTIONAL_NULLABLE_FLOAT_METRICS:
+            if missing:
+                result[name] = None
+            elif isinstance(value, (bool, np.bool_)) or not isinstance(
+                value, (int, float, np.integer, np.floating)
+            ):
+                raise TypeError(f"evaluation row {name} must be numeric")
+            else:
+                scalar = float(value)
+                if not np.isfinite(scalar):
+                    raise ValueError(f"evaluation row {name} must be finite")
+                result[name] = scalar
         elif name in _ROW_INTEGER_FIELDS:
             if missing or isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
                 raise TypeError(f"evaluation row {name} must be a strict integer")
