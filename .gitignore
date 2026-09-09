@@ -1,33 +1,28 @@
 .vscode/
 .idea/
+.pytest_cache/
 __pycache__/
+*.py[cod]
+
 build/
-data/
-gl_gym.egg-info/
-figures/
-results/
-train_data/
-wandb/
-*weather/
-jit_*.c
-*.pyc
+dist/
+*.egg-info/
 *.so
-# LaTeX build artifacts
+jit_*.c
+
+# Local migration audit, private materials, and generated experiment outputs
+.reorganization/
+archive/
+artifacts/
+datasets/weather/
+wandb/
+tmp/
+
+# LaTeX build artifacts (the canonical bibliography output is retained)
 *.aux
 *.log
 *.out
 *.bbl
 *.blg
 *.spl
-
-# Paper files and figures (not needed for training)
-images/
-plots/
-visual/*
-!visual/Figure_1.pdf
-!visual/Figure_1.png
-visualisations/
-processing/
-*.tex
-*.bib
-refe.bib
+!paper/manuscript/main.bbl

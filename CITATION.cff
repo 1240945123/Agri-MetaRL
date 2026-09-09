@@ -1,22 +1,38 @@
-# CITATION.cff
 cff-version: 1.2.0
-message: "If you use this software or refer to this paper in your work, please cite it as below."
+message: "If you use Agri-MetaRL, please cite the software and the preferred article below."
+title: "Agri-MetaRL"
+type: software
+version: 0.2.0
+authors:
+  - family-names: "Xie"
+    given-names: "Tianchen"
+  - family-names: "Huang"
+    given-names: "Qiang"
+  - family-names: "Yu"
+    given-names: "Chengkai"
+  - family-names: "Chen"
+    given-names: "Qi"
+  - family-names: "Ma"
+    given-names: "Zhaoxiong"
+  - family-names: "Wang"
+    given-names: "Mantao"
+repository-code: "https://github.com/1240945123/Agri-MetaRL"
+license: AGPL-3.0-or-later
 preferred-citation:
-  type: Preprint
-  title: "GreenLight-Gym: Reinforcement learning benchmark environment for control of greenhouse production systems"
+  type: article
+  title: "Agri-MetaRL: An Agricultural Meta-Reinforcement Learning Algorithm for Greenhouse Climate Control"
   authors:
-    - family-names: "van Laatum"
-      given-names: "Bart"
-    - family-names: "van Henten"
-      given-names: "Eldert J."
-    - family-names: "Boersma"
-      given-names: "Sjoerd"
-  year: 2025
-  month: 5
-  date-published: 2025-05-10
-  eprint: "2410.05336"
-  archive-prefix: "arXiv"
-  primary-class: "eess.SY"
-  url: "https://arxiv.org/abs/2410.05336"
-  languages:
-    - en
+    - family-names: "Xie"
+      given-names: "Tianchen"
+    - family-names: "Huang"
+      given-names: "Qiang"
+    - family-names: "Yu"
+      given-names: "Chengkai"
+    - family-names: "Chen"
+      given-names: "Qi"
+    - family-names: "Ma"
+      given-names: "Zhaoxiong"
+    - family-names: "Wang"
+      given-names: "Mantao"
+  journal: "Computers and Electronics in Agriculture"
+  year: 2026

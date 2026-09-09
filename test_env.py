@@ -270,7 +270,7 @@ def init_default_params(nparams):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env_id", type=str, default="TomatoEnv")
-    parser.add_argument("--env_config_path", type=str, default="gl_gym/configs/envs/")
+    parser.add_argument("--env_config_path", type=str, default="configs/envs/")
     args = parser.parse_args()
 
     env_base_params, env_specific_params = load_env_params(args.env_id, args.env_config_path)

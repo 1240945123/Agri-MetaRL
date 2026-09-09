@@ -1,0 +1,201 @@
+\begin{thebibliography}{10}
+\expandafter\ifx\csname url\endcsname\relax
+  \def\url#1{\texttt{#1}}\fi
+\expandafter\ifx\csname urlprefix\endcsname\relax\def\urlprefix{URL }\fi
+\expandafter\ifx\csname href\endcsname\relax
+  \def\href#1#2{#2} \def\path#1{#1}\fi
+
+\bibitem{vanhenten2006greenhouse}
+E.~J. Van~Henten, Greenhouse climate control: an approach for integration of climate and crop models, Acta Horticulturae 718 (2006) 215--224.
+\newblock \href {https://doi.org/10.17660/ActaHortic.2006.718.24} {\path{doi:10.17660/ActaHortic.2006.718.24}}.
+
+\bibitem{li2023smart}
+Z.~Li, J.~Liu, Y.~Wang, Smart agriculture: Review of intelligent control and decision-making for precision agriculture, Agriculture 13~(8) (2023) 1591.
+\newblock \href {https://doi.org/10.3390/agriculture13081591} {\path{doi:10.3390/agriculture13081591}}.
+
+\bibitem{morcego2023reinforcement}
+B.~Morcego, W.~Yin, S.~Boersma, E.~Van~Henten, V.~Puig, C.~Sun, Reinforcement learning versus model predictive control on greenhouse climate control, Computers and Electronics in Agriculture 215 (2023) 108372.
+\newblock \href {https://doi.org/10.1016/j.compag.2023.108372} {\path{doi:10.1016/j.compag.2023.108372}}.
+
+\bibitem{van2025greenlight}
+B.~Van~Laatum, E.~J. Van~Henten, S.~Boersma, Greenlight-gym: Reinforcement learning benchmark environment for control of greenhouse production systems, IFAC-PapersOnLine 59~(23) (2025) 437--442.
+\newblock \href {https://doi.org/10.1016/j.ifacol.2025.11.827} {\path{doi:10.1016/j.ifacol.2025.11.827}}.
+
+\bibitem{berenguel1997temperature}
+M.~Berenguel, F.~Rodr{\'\i}guez, F.~Aci{\'e}n, J.~Garc{\'\i}a, Temperature control of a solar greenhouse, IFAC Proceedings Volumes 30~(6) (1997) 159--164.
+\newblock \href {https://doi.org/10.1016/S1474-6670(17)42800-6} {\path{doi:10.1016/S1474-6670(17)42800-6}}.
+
+\bibitem{vanstraten2010optimal}
+G.~Van~Straten, G.~Van~Willigenburg, E.~Van~Henten, R.~Van~Ooteghem, Optimal control of greenhouse cultivation, CRC Press, Boca Raton, FL, 2010.
+\newblock \href {https://doi.org/10.1201/b10321} {\path{doi:10.1201/b10321}}.
+
+\bibitem{camacho2013mpc}
+E.~F. Camacho, C.~Bordons~Alba, Model predictive control, Springer, London, 2013.
+\newblock \href {https://doi.org/10.1007/978-0-85729-398-5} {\path{doi:10.1007/978-0-85729-398-5}}.
+
+\bibitem{panagopoulos2025cascaded}
+I.~Panagopoulos, R.~D. McAllister, S.~Van~Mourik, T.~Keviczky, A cascaded economic model predictive control approach to greenhouse climate control, IFAC-PapersOnLine 59~(23) (2025) 443--448.
+\newblock \href {https://doi.org/10.1016/j.ifacol.2025.11.828} {\path{doi:10.1016/j.ifacol.2025.11.828}}.
+
+\bibitem{garcia2023multi}
+F.~Garcia-Manas, F.~Rodr{\'\i}guez, M.~Berenguel, J.~M. Maestre, Multi-scenario model predictive control for greenhouse crop production considering market price uncertainty, IEEE Transactions on Automation Science and Engineering 21~(3) (2023) 2936--2948.
+\newblock \href {https://doi.org/10.1109/TASE.2023.3339999} {\path{doi:10.1109/TASE.2023.3339999}}.
+
+\bibitem{van2025optimal}
+S.~van Mourik, B.~van’t Ooster, M.~Vellekoop, Optimal temperature setpoint control for a complete greenhouse crop cycle under growth uncertainty, Biosystems Engineering 258 (2025) 104250.
+\newblock \href {https://doi.org/10.1016/j.biosystemseng.2025.104250} {\path{doi:10.1016/j.biosystemseng.2025.104250}}.
+
+\bibitem{msaad2025rl}
+S.~Msaad, M.~Harraway, R.~D. McAllister, Rl-guided mpc for autonomous greenhouse control, IFAC-PapersOnLine 59~(23) (2025) 449--454.
+\newblock \href {https://doi.org/10.1016/j.ifacol.2025.11.829} {\path{doi:10.1016/j.ifacol.2025.11.829}}.
+
+\bibitem{mallick2025reinforcement}
+S.~Mallick, F.~Airaldi, A.~Dabiri, C.~Sun, B.~De~Schutter, Reinforcement learning-based model predictive control for greenhouse climate control, Smart Agricultural Technology 10 (2025) 100751.
+\newblock \href {https://doi.org/10.48550/arXiv.2409.12789} {\path{doi:10.48550/arXiv.2409.12789}}.
+
+\bibitem{sutton2018reinforcement}
+R.~S. Sutton, A.~G. Barto, \href{https://incompleteideas.net/book/the-book-2nd.html}{Reinforcement learning: An introduction}, 2nd Edition, MIT Press, Cambridge, MA, 2018.
+\newline\urlprefix\url{https://incompleteideas.net/book/the-book-2nd.html}
+
+\bibitem{brockman2016gym}
+G.~Brockman, V.~Cheung, L.~Pettersson, J.~Schneider, J.~Schulman, J.~Tang, W.~Zaremba, Openai gym, arXiv preprint arXiv:1606.01540 (2016).
+\newblock \href {https://doi.org/10.48550/arXiv.1606.01540} {\path{doi:10.48550/arXiv.1606.01540}}.
+
+\bibitem{mnih2015dqn}
+V.~Mnih, K.~Kavukcuoglu, D.~Silver, A.~A. Rusu, J.~Veness, M.~G. Bellemare, A.~Graves, M.~Riedmiller, A.~K. Fidjeland, G.~Ostrovski, et~al., Human-level control through deep reinforcement learning, Nature 518~(7540) (2015) 529--533.
+\newblock \href {https://doi.org/10.1038/nature14236} {\path{doi:10.1038/nature14236}}.
+
+\bibitem{arulkumaran2017brief}
+K.~Arulkumaran, M.~P. Deisenroth, M.~Brundage, A.~A. Bharath, A brief survey of deep reinforcement learning, IEEE Signal Processing Magazine 34~(6) (2017) 26--38.
+\newblock \href {https://doi.org/10.1109/MSP.2017.2743240} {\path{doi:10.1109/MSP.2017.2743240}}.
+
+\bibitem{lillicrap2015ddpg}
+T.~P. Lillicrap, J.~J. Hunt, A.~Pritzel, N.~Heess, T.~Erez, Y.~Tassa, D.~Silver, D.~Wierstra, Continuous control with deep reinforcement learning, arXiv preprint arXiv:1509.02971 (2015).
+\newblock \href {https://doi.org/10.48550/arXiv.1509.02971} {\path{doi:10.48550/arXiv.1509.02971}}.
+
+\bibitem{haarnoja2018sac}
+T.~Haarnoja, A.~Zhou, P.~Abbeel, S.~Levine, Soft actor-critic: Off-policy maximum entropy deep reinforcement learning with a stochastic actor, in: International Conference on Machine Learning, PMLR, 2018, pp. 1861--1870.
+\newblock \href {https://doi.org/10.48550/arXiv.1801.01290} {\path{doi:10.48550/arXiv.1801.01290}}.
+
+\bibitem{duan2016benchmark}
+Y.~Duan, X.~Chen, R.~Houthooft, J.~Schulman, P.~Abbeel, Benchmarking deep reinforcement learning for continuous control, in: International Conference on Machine Learning, PMLR, 2016, pp. 1329--1338.
+\newblock \href {https://doi.org/10.48550/arXiv.1604.06778} {\path{doi:10.48550/arXiv.1604.06778}}.
+
+\bibitem{ajagekar2023energy}
+A.~Ajagekar, N.~S. Mattson, F.~You, Energy-efficient ai-based control of semi-closed greenhouses leveraging robust optimization in deep reinforcement learning, Advances in Applied Energy 9 (2023) 100119.
+\newblock \href {https://doi.org/10.1016/j.adapen.2022.100119} {\path{doi:10.1016/j.adapen.2022.100119}}.
+
+\bibitem{xiao2026grower}
+M.~Xiao, J.~Lan, J.~Yu, W.~Ma, Q.~Xie, C.~Sun, Grower-in-the-loop interactive reinforcement learning for greenhouse climate control, Computers and Electronics in Agriculture 242 (2026) 111312.
+\newblock \href {https://doi.org/10.1016/j.compag.2025.111312} {\path{doi:10.1016/j.compag.2025.111312}}.
+
+\bibitem{finn2017maml}
+C.~Finn, P.~Abbeel, S.~Levine, Model-agnostic meta-learning for fast adaptation of deep networks, in: International Conference on Machine Learning, PMLR, 2017, pp. 1126--1135.
+\newblock \href {https://doi.org/10.48550/arXiv.1703.03400} {\path{doi:10.48550/arXiv.1703.03400}}.
+
+\bibitem{duan2016rl2}
+Y.~Duan, J.~Schulman, X.~Chen, P.~L. Bartlett, I.~Sutskever, P.~Abbeel, {RL}$^2$: Fast reinforcement learning via slow reinforcement learning, arXiv preprint arXiv:1611.02779 (2016).
+\newblock \href {https://doi.org/10.48550/arXiv.1611.02779} {\path{doi:10.48550/arXiv.1611.02779}}.
+
+\bibitem{wang2020survey}
+Y.~Wang, Q.~Yao, J.~T. Kwok, L.~M. Ni, A survey on meta-learning for few-shot learning, ACM Computing Surveys 54~(3) (2021) 1--34.
+\newblock \href {https://doi.org/10.1145/3386252} {\path{doi:10.1145/3386252}}.
+
+\bibitem{ravi2017optimization}
+S.~Ravi, H.~Larochelle, Optimization as a model for few-shot learning, in: International Conference on Learning Representations, 2017, pp. 1--11.
+\newblock \href {https://doi.org/10.48550/arXiv.1611.01787} {\path{doi:10.48550/arXiv.1611.01787}}.
+
+\bibitem{xu2020meta}
+Z.~Xu, H.~P. van Hasselt, M.~Hessel, J.~Oh, S.~Singh, D.~Silver, Meta-gradient reinforcement learning with an objective discovered online, Advances in Neural Information Processing Systems 33 (2020) 15254--15264.
+\newblock \href {https://doi.org/10.48550/arXiv.2007.08433} {\path{doi:10.48550/arXiv.2007.08433}}.
+
+\bibitem{yin2023distributional}
+H.~Yin, S.~Yan, Z.~Xu, Distributional meta-gradient reinforcement learning, in: The Eleventh International Conference on Learning Representations, 2023, pp. 1--18, iCLR 2023 poster.
+\newblock \href {https://doi.org/10.48550/arXiv.2301.03236} {\path{doi:10.48550/arXiv.2301.03236}}.
+
+\bibitem{zhao2022effectiveness}
+M.~Zhao, P.~Abbeel, S.~James, On the effectiveness of fine-tuning versus meta-reinforcement learning, Advances in Neural Information Processing Systems 35 (2022) 26519--26531.
+\newblock \href {https://doi.org/10.48550/arXiv.2206.03271} {\path{doi:10.48550/arXiv.2206.03271}}.
+
+\bibitem{nichol2018reptile}
+A.~Nichol, J.~Achiam, J.~Schulman, On first-order meta-learning algorithms, arXiv preprint arXiv:1803.02999 (2018).
+\newblock \href {https://doi.org/10.48550/arXiv.1803.02999} {\path{doi:10.48550/arXiv.1803.02999}}.
+
+\bibitem{lu2022discovered}
+C.~Lu, J.~Kuba, A.~Letcher, L.~Metz, C.~Schroeder~de Witt, J.~Foerster, Discovered policy optimisation, Advances in Neural Information Processing Systems 35 (2022) 16455--16468.
+\newblock \href {https://doi.org/10.48550/arXiv.2210.05639} {\path{doi:10.48550/arXiv.2210.05639}}.
+
+\bibitem{oh2025discovering}
+J.~Oh, G.~Farquhar, I.~Kemaev, D.~A. Calian, M.~Hessel, L.~Zintgraf, S.~Singh, H.~Van~Hasselt, D.~Silver, Discovering state-of-the-art reinforcement learning algorithms, Nature 648~(8093) (2025) 312--319.
+\newblock \href {https://doi.org/10.1038/s41586-025-09761-x} {\path{doi:10.1038/s41586-025-09761-x}}.
+
+\bibitem{vinyals2016matching}
+O.~Vinyals, C.~Blundell, T.~Lillicrap, D.~Wierstra, Matching networks for one shot learning, Advances in Neural Information Processing Systems 29 (2016) 3630--3638.
+\newblock \href {https://doi.org/10.48550/arXiv.1606.04080} {\path{doi:10.48550/arXiv.1606.04080}}.
+
+\bibitem{snell2017prototypical}
+J.~Snell, K.~Swersky, R.~Zemel, Prototypical networks for few-shot learning, Advances in Neural Information Processing Systems 30 (2017) 4077--4087.
+\newblock \href {https://doi.org/10.48550/arXiv.1703.05175} {\path{doi:10.48550/arXiv.1703.05175}}.
+
+\bibitem{rakelly2019pearl}
+K.~Rakelly, A.~Zhou, C.~Finn, S.~Levine, D.~Quillen, Efficient off-policy meta-reinforcement learning via probabilistic context variables, in: International Conference on Machine Learning, PMLR, 2019, pp. 5331--5340.
+\newblock \href {https://doi.org/10.48550/arXiv.1903.08254} {\path{doi:10.48550/arXiv.1903.08254}}.
+
+\bibitem{taksen2024gymnasium}
+{Farama Foundation}, \href{https://gymnasium.farama.org/}{Gymnasium [software]}, Zenodo, accessed 2024 (2024).
+\newblock \href {https://doi.org/10.5281/zenodo.8127025} {\path{doi:10.5281/zenodo.8127025}}.
+\newline\urlprefix\url{https://gymnasium.farama.org/}
+
+\bibitem{achiam2017constrained}
+J.~Achiam, D.~Held, A.~Tamar, P.~Abbeel, Constrained policy optimization, in: International Conference on Machine Learning, PMLR, 2017, pp. 22--31.
+\newblock \href {https://doi.org/10.48550/arXiv.1705.10528} {\path{doi:10.48550/arXiv.1705.10528}}.
+
+\bibitem{tessler2018reward}
+C.~Tessler, D.~J. Mankowitz, S.~Mannor, Reward constrained policy optimization, arXiv preprint arXiv:1805.11074 (2018).
+\newblock \href {https://doi.org/10.48550/arXiv.1805.11074} {\path{doi:10.48550/arXiv.1805.11074}}.
+
+\bibitem{gu2024review}
+S.~Gu, L.~Yang, Y.~Du, G.~Chen, F.~Walter, J.~Wang, A.~Knoll, A review of safe reinforcement learning: Methods, theories, and applications, IEEE Transactions on Pattern Analysis and Machine Intelligence 46~(12) (2024) 11216--11235.
+\newblock \href {https://doi.org/10.1109/TPAMI.2024.3457538} {\path{doi:10.1109/TPAMI.2024.3457538}}.
+
+\bibitem{schulman2015trpo}
+J.~Schulman, S.~Levine, P.~Abbeel, M.~Jordan, P.~Moritz, Trust region policy optimization, in: International Conference on Machine Learning, PMLR, 2015, pp. 1889--1897.
+\newblock \href {https://doi.org/10.48550/arXiv.1502.05477} {\path{doi:10.48550/arXiv.1502.05477}}.
+
+\bibitem{schulman2017proximal}
+J.~Schulman, F.~Wolski, P.~Dhariwal, A.~Radford, O.~Klimov, Proximal policy optimization algorithms, arXiv preprint arXiv:1707.06347 (2017).
+\newblock \href {https://doi.org/10.48550/arXiv.1707.06347} {\path{doi:10.48550/arXiv.1707.06347}}.
+
+\bibitem{schulman2015high}
+J.~Schulman, P.~Moritz, S.~Levine, M.~Jordan, P.~Abbeel, High-dimensional continuous control using generalized advantage estimation, arXiv preprint arXiv:1506.02438 (2015).
+\newblock \href {https://doi.org/10.48550/arXiv.1506.02438} {\path{doi:10.48550/arXiv.1506.02438}}.
+
+\bibitem{ni2022recurrent}
+T.~Ni, B.~Eysenbach, R.~Salakhutdinov, Recurrent model-free {RL} is a strong baseline for many {POMDP}s, in: International Conference on Machine Learning, PMLR, 2022, pp. 16691--16723.
+\newblock \href {https://doi.org/10.48550/arXiv.2110.05038} {\path{doi:10.48550/arXiv.2110.05038}}.
+
+\bibitem{recurrentppo}
+{SB3-Contrib Contributors}, \href{https://github.com/Stable-Baselines-Team/stable-baselines3-contrib}{Recurrent {PPO} in {SB3}-contrib [software]}, \url{https://sb3-contrib.readthedocs.io/}, accessed 2024 (2024).
+\newline\urlprefix\url{https://github.com/Stable-Baselines-Team/stable-baselines3-contrib}
+
+\bibitem{hausknecht2015drqn}
+M.~Hausknecht, P.~Stone, Deep recurrent q-learning for partially observable mdps, in: AAAI Fall Symposium on Sequential Decision Making for Intelligent Agents, AAAI, 2015, pp. 29--37.
+\newblock \href {https://doi.org/10.48550/arXiv.1507.06527} {\path{doi:10.48550/arXiv.1507.06527}}.
+
+\bibitem{pleines2022recurrent}
+M.~Pleines, M.~Pallasch, F.~Zimmer, M.~Preuss, Generalization, mayhems and limits in recurrent proximal policy optimization, arXiv preprint arXiv:2205.11104 (2022).
+\newblock \href {https://doi.org/10.48550/arXiv.2205.11104} {\path{doi:10.48550/arXiv.2205.11104}}.
+
+\bibitem{raffin2021sb3}
+A.~Raffin, A.~Hill, A.~Gleave, A.~Kanervisto, M.~Ernestus, N.~Dormann, \href{https://jmlr.org/papers/v22/20-1364.html}{Stable-baselines3: Reliable reinforcement learning implementations}, Journal of Machine Learning Research 22 (2021) 1--8.
+\newline\urlprefix\url{https://jmlr.org/papers/v22/20-1364.html}
+
+\bibitem{sb3}
+A.~Raffin, A.~Hill, A.~Gleave, A.~Kanervisto, M.~Ernestus, N.~Dormann, \href{https://github.com/DLR-RM/stable-baselines3}{Stable-baselines3: Reliable reinforcement learning implementations [software]}, \url{https://github.com/DLR-RM/stable-baselines3}, accessed 2024 (2021).
+\newline\urlprefix\url{https://github.com/DLR-RM/stable-baselines3}
+
+\bibitem{paszke2019pytorch}
+A.~Paszke, S.~Gross, F.~Massa, A.~Lerer, J.~Bradbury, G.~Chanan, T.~Killeen, Z.~Lin, N.~Gimelshein, L.~Antiga, et~al., Pytorch: An imperative style, high-performance deep learning library, Advances in Neural Information Processing Systems 32 (2019) 8026--8037, software: \url{https://pytorch.org/}.
+\newblock \href {https://doi.org/10.48550/arXiv.1912.01703} {\path{doi:10.48550/arXiv.1912.01703}}.
+
+\end{thebibliography}

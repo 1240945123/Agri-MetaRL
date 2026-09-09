@@ -1,143 +1,107 @@
 # Agri-MetaRL
 
-Agricultural Meta-Reinforcement Learning for Greenhouse Climate Control
+Agri-MetaRL is a meta-reinforcement learning method for greenhouse climate control. It extends Recurrent PPO with a `MetaAdvantageHead` that performs task-adaptive advantage correction across weather years, start dates, and scenario conditions.
 
-Agri-MetaRL is a meta-reinforcement learning algorithm that improves advantage estimation for greenhouse climate control. It introduces **MetaAdvantageHead** on Recurrent PPO, performing task-adaptive advantage correction through support-query partitioning. Experiments show that Agri-MetaRL achieves higher training return and EPI than PPO and Recurrent PPO baselines.
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+[![Python 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
+[![CI](https://github.com/1240945123/Agri-MetaRL/actions/workflows/ci.yml/badge.svg)](https://github.com/1240945123/Agri-MetaRL/actions/workflows/ci.yml)
 
-<p align="center">
-  <img src="./visual/Figure_1.png" alt="System Architecture (Figure 1)" width="600"/>
-</p>
+## Repository layout
 
-## Table of Contents
-
-- [Summary](#summary)
-- [Installation](#installation)
-- [Repository Structure](#repository-structure)
-- [Paper Figures](#paper-figures)
-- [Usage](#usage)
-- [Citation](#citation)
-
-## Summary
-
-### Key Features
-
-- **Task-distribution modeling**: Greenhouse control is formulated as a set of related tasks defined by weather year, start date, and scenario conditions.
-- **MetaAdvantageHead**: A custom module that encodes task context from support trajectories and performs task-adaptive correction on query trajectories.
-- **Lightweight design**: No extra policy branches or heavy bi-level optimizers; compatible with standard Recurrent PPO training flow.
-- **Evaluation protocol**: Unified protocol with training-distribution and held-out-distribution testing.
-
-### Main Results
-
-- Final mean training return: **3955** (vs Recurrent PPO 3886, PPO 3811)
-- Highest EPI: **3.46 €/m²** under the fixed protocol
-- Lowest violation steps for temperature, humidity, and CO₂
+| Path | Purpose |
+|---|---|
+| `src/gl_gym/` | Environment, RL algorithms, and reusable Python package code |
+| `configs/` | Agent, environment, and sweep configurations |
+| `experiments/scripts/` | Training, evaluation, trajectory, and reporting entry points |
+| `datasets/` | Dataset documentation; local weather CSVs are ignored |
+| `artifacts/` | Local models, results, generated figures, and tracking data; ignored |
+| `paper/` | Canonical manuscript source, public figures, and latest standalone PDF |
+| `archive/` | Local private and legacy materials; ignored |
+| `tests/` | Automated checks |
 
 ## Installation
 
-### Requirements
+Requirements:
 
-- Python >= 3.10 (tested on 3.11)
-- Greenhouse simulation environment (compatible with standard gym interfaces)
-- Stable-Baselines3, sb3-contrib, PyTorch
+- Python 3.11 or newer
+- A local environment capable of installing the dependencies declared in `pyproject.toml`
+- Weather CSV files placed as described in [`datasets/README.md`](datasets/README.md)
 
-### Steps
+From the repository root:
 
-1. **Clone the repository**
+```bash
+python -m venv .venv
+python -m pip install -e .
+```
 
-   ```bash
-   git clone https://github.com/1240945123/Agri-MetaRL.git
-   cd Agri-MetaRL
-   ```
-
-2. **Create a virtual environment**
-
-   ```bash
-   conda create -n agri_metarl python=3.11
-   conda activate agri_metarl
-   ```
-
-3. **Install dependencies**
-
-   ```bash
-   pip install -e .
-   pip install stable-baselines3 sb3-contrib torch
-   ```
-
-## Repository Structure
-
-| Folder | Description |
-|--------|-------------|
-| [`gl_gym/RL/agri_metarl/`](./gl_gym/RL/agri_metarl/) | Agri-MetaRL implementation: MetaAdvantageHead, buffer, training logic |
-| [`gl_gym/configs/agents/`](./gl_gym/configs/agents/) | Agent configs including `agri_metarl.yml` |
-| [`run_scripts/`](./run_scripts/) | Training and evaluation scripts |
-| [`visualisations/`](./visualisations/) | Plotting scripts for paper figures |
-| [`visual/`](./visual/) | Paper figures (Figure_1–5.pdf) |
-
-## Paper Figures
-
-- [Figure 1](visual/Figure_1.pdf)
-- [Figure 2](visual/Figure_2.pdf)
-- [Figure 3](visual/Figure_3.pdf)
-- [Figure 4](visual/Figure_4.pdf)
-- [Figure 5](visual/Figure_5.pdf)
+Use a virtual environment and package cache on the workspace drive rather than the C: drive when working on this machine.
 
 ## Usage
-
-### 1. Training
 
 Train PPO, Recurrent PPO, and Agri-MetaRL:
 
 ```bash
-python run_scripts/train_paper_experiments.py --device cpu
+python experiments/scripts/train_paper_experiments.py --device cpu
 ```
 
-### 2. Evaluation Pipeline
-
-Run the full paper pipeline (fixed protocol, generalization, figures):
+Run the paper evaluation pipeline using existing trained models:
 
 ```bash
-python run_scripts/run_paper_pipeline_after_train.py --skip-train
+python experiments/scripts/run_paper_pipeline_after_train.py --skip-train
 ```
 
-(Use `--skip-train` if models are already trained.)
-
-### 3. Generate Paper Figures
+Record a 60-day Agri-MetaRL trajectory:
 
 ```bash
-python visualisations/plot_paper_figures.py
+python experiments/scripts/record_trajectory_60d.py --algorithm agri_metarl
 ```
 
-Outputs: visual/Figure_1.pdf–Figure_5.pdf
-
-### 4. Record 60d Trajectory
+Run lightweight automated checks:
 
 ```bash
-python run_scripts/record_trajectory_60d.py --algorithm agri_metarl
+set PYTHONPATH=src
+python -m pytest -q
 ```
+
+PowerShell users can set the import path with:
+
+```powershell
+$env:PYTHONPATH = (Join-Path (Resolve-Path '.') 'src')
+python -m pytest -q
+```
+
+Training outputs are written beneath `artifacts/models/`; evaluation CSVs are written beneath `artifacts/results/`.
+
+## Paper
+
+- [Canonical manuscript source](paper/manuscript/main.tex)
+- [Figure 1](paper/figures/Figure_1.pdf)
+- [Figure 2](paper/figures/Figure_2.pdf)
+- [Figure 3](paper/figures/Figure_3.pdf)
+- [Figure 4](paper/figures/Figure_4.pdf)
+- [Figure 5](paper/figures/Figure_5.pdf)
+- [Latest available standalone PDF](paper/published/Agri-MetaRL-2026-03-19.pdf)
+
+The canonical source and figures are dated 2026-03-23. The standalone PDF is dated 2026-03-19 and may not exactly match the later source revision. See [`paper/README.md`](paper/README.md).
 
 ## Citation
 
-If you use Agri-MetaRL in your research, please cite:
+Citation metadata is provided in [`CITATION.cff`](CITATION.cff). The preferred article citation is:
 
 ```bibtex
-@article{huang2025agrimetarl,
-  title={Agri-MetaRL: An Agricultural Meta-Reinforcement Learning Algorithm for Greenhouse Climate Control},
-  author={Huang, Qiang and Xie, Tianchen and Yu, Chengkai and Ma, Zhaoxiong},
-  journal={Knowledge-Based Systems},
-  year={2025},
-  note={Submitted}
+@article{xie2026agrimetarl,
+  title   = {Agri-MetaRL: An Agricultural Meta-Reinforcement Learning Algorithm for Greenhouse Climate Control},
+  author  = {Xie, Tianchen and Huang, Qiang and Yu, Chengkai and Chen, Qi and Ma, Zhaoxiong and Wang, Mantao},
+  journal = {Computers and Electronics in Agriculture},
+  year    = {2026},
+  note    = {Submitted}
 }
 ```
 
-## Data Availability
+## Contributing
 
-The source code and evaluation pipeline are available at [https://github.com/1240945123/Agri-MetaRL](https://github.com/1240945123/Agri-MetaRL).
-
-## Authors
-
-- **Qiang Huang** (黄强), **Tianchen Xie** (谢添臣) — College of Information Engineering, Sichuan Agricultural University
-- Chengkai Yu (喻成凯), Zhaoxiong Ma (马照雄)
+Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development setup, coding conventions, and pull request process.
 
 ## License
 
-See [LICENSE](./LICENSE).
+This project is licensed under the GNU Affero General Public License v3.0. See [`LICENSE`](LICENSE).

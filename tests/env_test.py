@@ -2,13 +2,16 @@ import unittest
 import numpy as np
 from gl_gym.environments.tomato_env import TomatoEnv
 from gl_gym.RL.utils import load_env_params
+from gl_gym.paths import CONFIG_DIR
 
 class TestTomatoEnv(unittest.TestCase):
     def setUp(self):
         # Set up environment parameters
         self.env_id = "TomatoEnv"
-        self.env_config_path = "gl_gym/configs/envs/"
+        self.env_config_path = str(CONFIG_DIR / "envs")
         self.env_base_params, self.env_specific_params = load_env_params(self.env_id, self.env_config_path)
+        self.heldout_options = self.env_specific_params.pop("eval_options_heldout", None)
+        self.assertIsNotNone(self.heldout_options)
 
         # Initialize environment
         self.env = TomatoEnv(base_env_params=self.env_base_params, **self.env_specific_params)
